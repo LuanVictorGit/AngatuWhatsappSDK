@@ -15,7 +15,7 @@
         Bridge Node.js isolado e comunicação por WebSocket local. Este é o POM agregador
         do projeto; o artefato consumido pelas aplicações é o módulo "sdk" (angatu-whatsapp).
     </description>
-    <url>https://github.com/angatusistemas/angatu-whatsapp</url>
+    <url>https://github.com/LuanVictorGit/AngatuWhatsappSDK</url>
     <inceptionYear>2026</inceptionYear>
 
     <licenses>
@@ -40,9 +40,9 @@
     </developers>
 
     <scm>
-        <connection>scm:git:https://github.com/angatusistemas/angatu-whatsapp.git</connection>
-        <developerConnection>scm:git:git@github.com:angatusistemas/angatu-whatsapp.git</developerConnection>
-        <url>https://github.com/angatusistemas/angatu-whatsapp</url>
+        <connection>scm:git:https://github.com/LuanVictorGit/AngatuWhatsappSDK.git</connection>
+        <developerConnection>scm:git:git@github.com:LuanVictorGit/AngatuWhatsappSDK.git</developerConnection>
+        <url>https://github.com/LuanVictorGit/AngatuWhatsappSDK</url>
         <tag>HEAD</tag>
     </scm>
 

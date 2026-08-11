@@ -178,7 +178,7 @@ de consumir o SDK:
 </repositories>
 
 <dependency>
-    <groupId>com.github.angatusistemas</groupId>
+    <groupId>com.github.LuanVictorGit</groupId>
     <artifactId>angatu-whatsapp</artifactId>
     <version><!-- tag, branch ou commit hash do GitHub --></version>
 </dependency>
@@ -191,7 +191,7 @@ Sonatype/Central Portal.
 ### Opção 3 — instalar localmente a partir do código-fonte
 
 ```bash
-git clone https://github.com/angatusistemas/angatu-whatsapp.git
+git clone https://github.com/LuanVictorGit/AngatuWhatsappSDK.git
 cd angatu-whatsapp
 mvn clean install
 ```
@@ -580,7 +580,7 @@ módulo, evita o problema.)
 ## Desenvolvimento
 
 ```bash
-git clone https://github.com/angatusistemas/angatu-whatsapp.git
+git clone https://github.com/LuanVictorGit/AngatuWhatsappSDK.git
 cd angatu-whatsapp
 
 # Build completo (compila o bridge via npm install && npm run build, depois o Java)
