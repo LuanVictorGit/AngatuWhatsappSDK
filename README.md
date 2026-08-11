@@ -33,6 +33,7 @@ escrever, ler ou entender uma linha de Node.js/TypeScript**.
 - [Encerrando o cliente](#encerrando-o-cliente)
 - [CLI opcional](#cli-opcional)
 - [Exemplos](#exemplos)
+- [Referência completa de exemplos (EXAMPLES.md)](EXAMPLES.md)
 - [Desenvolvimento](#desenvolvimento)
 - [Como testar](#como-testar)
 - [Como publicar](#como-publicar)
@@ -576,6 +577,12 @@ mvn -pl examples/multi-instance exec:java -Dexec.args="loja-1 loja-2"
 de vida, faz o Maven tentar rodá-lo em todo o subconjunto do reactor incluído por `-am` — inclusive
 no POM agregador, que não tem esse plugin configurado. Rodar `exec:java` sozinho, contra um único
 módulo, evita o problema.)
+
+Para uma referência exaustiva — todo método público, todo listener, todo builder de requisição,
+todo campo de cada modelo de dados, com um exemplo de código para cada um — veja
+[**EXAMPLES.md**](EXAMPLES.md). Esse documento foi escrito para servir tanto como guia para
+desenvolvedores quanto como referência precisa para outras IAs gerarem código correto contra
+esta API.
 
 ## Desenvolvimento
 
