@@ -1,0 +1,216 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.angatusistemas</groupId>
+        <artifactId>angatu-whatsapp-parent</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>angatu-whatsapp</artifactId>
+    <packaging>jar</packaging>
+
+    <name>Angatu WhatsApp SDK</name>
+    <description>
+        API Java para integracao com WhatsApp via Baileys. Esconde por completo o Node.js/Baileys
+        do consumidor: gerencia o runtime Node, o processo Bridge e a comunicacao WebSocket local.
+    </description>
+
+    <properties>
+        <bridge.dir>${project.basedir}/../bridge</bridge.dir>
+        <!-- Set -Dskip.bridge.build=true to reuse whatever is already in
+             src/main/resources/bridge/ (e.g. CI stage that built it once). -->
+        <skip.bridge.build>false</skip.bridge.build>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.google.zxing</groupId>
+            <artifactId>core</artifactId>
+        </dependency>
+        <!--
+            Java-WebSocket (classic blocking-socket client, no NIO Selector) rather
+            than the JDK-builtin java.net.http.WebSocket: constructing the built-in
+            client requires opening a java.nio.channels.Selector, whose internal
+            wakeup mechanism opens a loopback Unix-domain-socket pipe - which fails
+            with "Unable to establish loopback connection" in some restricted/
+            sandboxed Windows environments (reproduced during development on this
+            project, even after forcing the legacy WindowsSelectorProvider). Since
+            this client carries every byte of Java<->Bridge traffic, that risk is not
+            worth taking for a dependency that was already pinned in this project
+            anyway (previously test-scope only, for the mock bridge server).
+        -->
+        <dependency>
+            <groupId>org.java-websocket</groupId>
+            <artifactId>Java-WebSocket</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-core</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <excludes>
+                        <exclude>**/*IT.java</exclude>
+                    </excludes>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>integration-test</goal>
+                            <goal>verify</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <configuration>
+                    <archive>
+                        <manifestEntries>
+                            <Implementation-Title>${project.name}</Implementation-Title>
+                            <Implementation-Version>${project.version}</Implementation-Version>
+                            <Automatic-Module-Name>com.angatusistemas.whatsapp</Automatic-Module-Name>
+                        </manifestEntries>
+                    </archive>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+    <profiles>
+        <!--
+            Builds the Node.js bridge (npm install + esbuild bundle) as part of
+            the normal Maven lifecycle, so "mvn clean install" from a fresh
+            clone produces a fully self-contained sdk jar with no manual npm
+            step. This requires Node.js/npm on the BUILD machine only - the
+            resulting jar does not require them at runtime for consumers (see
+            NodeRuntimeLocator/NodeRuntimeDownloader).
+
+            Split into two OS-specific profiles because Windows resolves the
+            "npm" command as npm.cmd, which the JVM's process launcher (unlike
+            a real shell) does not resolve on its own.
+        -->
+        <profile>
+            <id>build-bridge-windows</id>
+            <activation>
+                <os><family>windows</family></os>
+                <property><name>!skip.bridge.build</name></property>
+            </activation>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>npm-install</id>
+                                <phase>generate-resources</phase>
+                                <goals><goal>exec</goal></goals>
+                                <configuration>
+                                    <executable>npm.cmd</executable>
+                                    <workingDirectory>${bridge.dir}</workingDirectory>
+                                    <arguments><argument>install</argument></arguments>
+                                </configuration>
+                            </execution>
+                            <execution>
+                                <id>npm-build</id>
+                                <phase>generate-resources</phase>
+                                <goals><goal>exec</goal></goals>
+                                <configuration>
+                                    <executable>npm.cmd</executable>
+                                    <workingDirectory>${bridge.dir}</workingDirectory>
+                                    <arguments>
+                                        <argument>run</argument>
+                                        <argument>build</argument>
+                                    </arguments>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <profile>
+            <id>build-bridge-unix</id>
+            <activation>
+                <os><family>unix</family></os>
+                <property><name>!skip.bridge.build</name></property>
+            </activation>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>npm-install</id>
+                                <phase>generate-resources</phase>
+                                <goals><goal>exec</goal></goals>
+                                <configuration>
+                                    <executable>npm</executable>
+                                    <workingDirectory>${bridge.dir}</workingDirectory>
+                                    <arguments><argument>install</argument></arguments>
+                                </configuration>
+                            </execution>
+                            <execution>
+                                <id>npm-build</id>
+                                <phase>generate-resources</phase>
+                                <goals><goal>exec</goal></goals>
+                                <configuration>
+                                    <executable>npm</executable>
+                                    <workingDirectory>${bridge.dir}</workingDirectory>
+                                    <arguments>
+                                        <argument>run</argument>
+                                        <argument>build</argument>
+                                    </arguments>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+</project>

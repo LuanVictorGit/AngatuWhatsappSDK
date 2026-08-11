@@ -1,0 +1,59 @@
+import { childLogger } from './util/logger.js';
+import { readExpectedToken } from './server/AuthToken.js';
+import { BridgeServer } from './server/WebSocketServer.js';
+
+const bridgeVersion = typeof __BRIDGE_VERSION__ !== 'undefined' ? __BRIDGE_VERSION__ : 'dev';
+const baileysVersion = typeof __BAILEYS_VERSION__ !== 'undefined' ? __BAILEYS_VERSION__ : 'dev';
+
+async function main(): Promise<void> {
+    // pino already includes pid/hostname on every line by default.
+    const logger = childLogger({ component: 'bridge' });
+    const token = readExpectedToken();
+    const host = process.env.ANGATU_BRIDGE_HOST ?? '127.0.0.1';
+    const requestedPort = process.env.ANGATU_BRIDGE_PORT ? Number.parseInt(process.env.ANGATU_BRIDGE_PORT, 10) : 0;
+
+    if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') {
+        logger.warn({ host }, 'bridge esta escutando fora de loopback - configuracao explicita, garanta que a rede e confiavel');
+    }
+
+    const server = new BridgeServer(host, requestedPort, token, logger, { bridgeVersion, baileysVersion });
+    await server.waitUntilListening();
+
+    // Sentinel log line the Java BridgeProcessManager watches for on stdout
+    // to learn which port the OS actually assigned (avoids any pre-allocate
+    // then hand off race between two separate processes).
+    logger.info({ port: server.actualPort, bridgeVersion, baileysVersion }, 'bridge_ready');
+
+    let shuttingDown = false;
+    const shutdown = async (signal: string) => {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        logger.info({ signal }, 'shutting down');
+        try {
+            await server.close();
+            process.exit(0);
+        } catch (err) {
+            logger.error({ err }, 'error during shutdown');
+            process.exit(1);
+        }
+    };
+
+    process.on('SIGINT', () => void shutdown('SIGINT'));
+    process.on('SIGTERM', () => void shutdown('SIGTERM'));
+
+    process.on('uncaughtException', (err) => {
+        logger.fatal({ err }, 'uncaught exception - terminating process');
+        process.exit(1);
+    });
+    process.on('unhandledRejection', (reason) => {
+        logger.fatal({ err: reason }, 'unhandled rejection - terminating process');
+        process.exit(1);
+    });
+}
+
+main().catch((err) => {
+    // Logger may not be available yet if construction itself failed
+    // (e.g. missing token), so fall back to stderr for this one case.
+    console.error('[bridge] fatal startup error:', err);
+    process.exit(1);
+});

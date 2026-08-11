@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.angatusistemas</groupId>
+        <artifactId>angatu-whatsapp-parent</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>angatu-whatsapp-cli</artifactId>
+    <packaging>jar</packaging>
+
+    <name>Angatu WhatsApp SDK - CLI</name>
+    <description>
+        CLI opcional (connect/status/send/logout) construida sobre o modulo "sdk".
+        Nao e uma dependencia do SDK principal - existe apenas por conveniencia de
+        linha de comando e nunca e necessaria para usar a biblioteca em uma aplicacao Java.
+    </description>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.angatusistemas</groupId>
+            <artifactId>angatu-whatsapp</artifactId>
+        </dependency>
+        <!-- Binds SLF4J so the SDK's own internal logs (bridge lifecycle, reconnection,
+             heartbeat) are actually visible when running the CLI as a standalone jar. -->
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!--
+                Produces a single executable angatu-whatsapp-cli.jar with every
+                dependency (SDK, Jackson, Java-WebSocket, zxing, logback, ...) bundled
+                in, plus the embedded Node bridge resources the sdk module already
+                carries - so "java -jar angatu-whatsapp-cli.jar" works with no other
+                classpath setup.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>com.angatusistemas.whatsapp.cli.Main</mainClass>
+                                </transformer>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer" />
+                            </transformers>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>module-info.class</exclude>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.angatusistemas</groupId>
+        <artifactId>angatu-whatsapp-parent</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+        <relativePath>../../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>angatu-whatsapp-example-simple-bot</artifactId>
+    <packaging>jar</packaging>
+
+    <name>Angatu WhatsApp SDK - Exemplo: bot simples</name>
+    <description>
+        Exemplo minimo de uso do SDK: conectar uma unica instancia, exibir o QR Code
+        e responder a mensagens recebidas.
+    </description>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.angatusistemas</groupId>
+            <artifactId>angatu-whatsapp</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- Lets "mvn -pl examples/simple-bot exec:java" (after a top-level "mvn install")
+                 run without having to pass -Dexec.mainClass every time. -->
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+                <configuration>
+                    <mainClass>com.angatusistemas.whatsapp.examples.simplebot.SimpleBotExample</mainClass>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

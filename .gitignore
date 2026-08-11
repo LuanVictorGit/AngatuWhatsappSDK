@@ -1,0 +1,48 @@
+# Java / Maven
+target/
+*.class
+*.jar
+!.mvn/wrapper/maven-wrapper.jar
+.mvn/timing.properties
+
+# maven-shade-plugin writes this next to the module's pom.xml, not into target/
+dependency-reduced-pom.xml
+
+# Node / bridge
+bridge/node_modules/
+bridge/dist/
+bridge/*.tsbuildinfo
+npm-debug.log*
+
+# Bundled bridge artifact copied into the SDK jar at build time
+sdk/src/main/resources/bridge/*.mjs
+sdk/src/main/resources/bridge/*.mjs.map
+sdk/src/main/resources/bridge/BUILD_INFO.json
+
+# WhatsApp session data / auth state (never commit credentials)
+sessions/
+**/sessions/
+*.session/
+
+# Angatu SDK runtime cache (downloaded Node runtimes, extracted bridge)
+.angatu-whatsapp-sdk/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.settings/
+.project
+.classpath
+.factorypath
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Test output
+sdk/src/test/resources/tmp/
