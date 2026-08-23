@@ -1,5 +1,6 @@
 import type { InstanceManager } from '../instance/InstanceManager.js';
 import { BridgeCommandError, ErrorCode } from '../protocol/errors.js';
+import type { WAPresence } from 'baileys';
 
 type Payload = Record<string, unknown>;
 type Handler = (instances: InstanceManager, instanceId: string | undefined, payload: Payload) => Promise<unknown>;
@@ -43,6 +44,9 @@ function requireStringArray(payload: Payload, field: string): string[] {
 }
 
 const PARTICIPANT_ACTIONS = new Set(['add', 'remove', 'promote', 'demote']);
+
+/** Presencas que o WhatsApp aceita em sendPresenceUpdate. */
+const PRESENCES: ReadonlySet<string> = new Set(['unavailable', 'available', 'composing', 'recording', 'paused']);
 
 export const handlers: Record<string, Handler> = {
     async create_instance(instances, instanceId, payload) {
@@ -212,9 +216,24 @@ export const handlers: Record<string, Handler> = {
         return {};
     },
 
+    async send_presence(instances, instanceId, payload) {
+        const instance = instances.get(requireInstanceId(instanceId));
+        const presence = requireString(payload, 'presence');
+        if (!PRESENCES.has(presence)) {
+            throw new BridgeCommandError(ErrorCode.INVALID_PAYLOAD, `presence invalida: ${presence}`);
+        }
+        await instance.adapter.sendPresence(requireString(payload, 'chatId'), presence as WAPresence);
+        return {};
+    },
+
     async download_media(instances, instanceId, payload) {
         const instance = instances.get(requireInstanceId(instanceId));
         return instance.adapter.downloadMedia(requireString(payload, 'chatId'), requireString(payload, 'messageId'));
+    },
+
+    async get_me(instances, instanceId) {
+        const instance = instances.get(requireInstanceId(instanceId));
+        return instance.adapter.getMe();
     },
 
     async get_contact(instances, instanceId, payload) {

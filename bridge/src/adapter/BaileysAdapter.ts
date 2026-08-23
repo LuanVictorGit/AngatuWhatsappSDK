@@ -7,11 +7,13 @@ import makeWASocket, {
     type WAMessage,
     type GroupMetadata,
     type Contact as BaileysContact,
-    type AnyMessageContent
+    type AnyMessageContent,
+    type WAPresence
 } from 'baileys';
 import { Boom } from '@hapi/boom';
 import type { Logger } from '../util/logger.js';
 import { MessageCache } from './MessageCache.js';
+import { LidDirectory } from './LidDirectory.js';
 import { toAbstractMessage, type AbstractMessage } from './MessageMapper.js';
 import { BridgeCommandError, ErrorCode } from '../protocol/errors.js';
 import * as Content from './ContentBuilder.js';
@@ -64,6 +66,28 @@ const DISCONNECT_CAUSE_BY_STATUS_CODE: Record<number, DisconnectCause> = {
 };
 
 /**
+ * Closures after which the credentials on disk are unusable and must be
+ * discarded.
+ *
+ * Baileys only emits a QR code when it starts with no valid credentials. If a
+ * dead session is left on disk, every subsequent connect() reloads it, gets
+ * rejected by WhatsApp for the same reason, and returns to LOGGED_OUT without
+ * ever producing a QR - leaving the operator with a "reconnect" button that
+ * can never work. Clearing the directory is what makes the next connect()
+ * fall back to pairing.
+ *
+ * `connectionReplaced` is deliberately absent: there the credentials are still
+ * valid, another socket simply took over the session, so reconnecting later
+ * works and wiping them would force a pointless re-pairing.
+ */
+const CREDENTIALS_INVALIDATED_STATUS_CODES: ReadonlySet<number> = new Set([
+    DisconnectReason.loggedOut,
+    DisconnectReason.badSession,
+    DisconnectReason.multideviceMismatch,
+    DisconnectReason.forbidden
+]);
+
+/**
  * Owns exactly one WhatsApp connection (one Baileys socket) and translates
  * between Baileys' native API/events and the abstract shapes the rest of
  * the bridge (and, through it, the Java SDK) speak. Nothing outside this
@@ -88,7 +112,18 @@ export class BaileysAdapter {
      * must therefore agree on the same outcome regardless of which runs first.
      */
     private closedByUser: false | 'disconnect' | 'logout' = false;
+    /**
+     * In-flight deletion of an invalidated session, awaited by openSocket().
+     *
+     * handleClose() reacts to a synchronous Baileys event, so it cannot await
+     * the removal itself; without this gate a fast reconnect could read the
+     * credentials back while they are still being deleted.
+     */
+    private sessionCleanup: Promise<void> | null = null;
     private readonly messageCache = new MessageCache();
+
+    /** Traducao LID -> telefone; ver LidDirectory para o porque. */
+    private readonly lids = new LidDirectory();
 
     constructor(
         private readonly options: AdapterOptions,
@@ -116,6 +151,14 @@ export class BaileysAdapter {
     private async openSocket(): Promise<void> {
         this.setState('CONNECTING', null, null);
 
+        // A session invalidated by WhatsApp is deleted asynchronously; reading
+        // the credentials before that finishes would load the very files that
+        // are on their way out.
+        if (this.sessionCleanup) {
+            await this.sessionCleanup;
+            this.sessionCleanup = null;
+        }
+
         const { state, saveCreds } = await useMultiFileAuthState(this.options.sessionDirectory);
         this.saveCreds = saveCreds;
 
@@ -138,11 +181,24 @@ export class BaileysAdapter {
         socket.ev.on('messages.upsert', ({ messages, type }) => {
             if (type !== 'notify' && type !== 'append') return;
             for (const msg of messages) {
+                // O par LID/telefone vem no proprio stanza: aprender antes de
+                // mapear e o que faz a PRIMEIRA mensagem ja cair na conversa
+                // certa, e nao so a segunda.
+                this.learnLids(msg);
                 this.messageCache.put(msg);
                 if (!msg.message) continue;
-                this.callbacks.onMessage(toAbstractMessage(msg));
+                this.callbacks.onMessage(toAbstractMessage(msg, this.lids));
             }
         });
+
+        // Contatos trazem os dois enderecos do mesmo contato de uma vez.
+        const aprenderContatos = (contatos: { id?: string; lid?: string; jid?: string }[]) => {
+            for (const c of contatos ?? []) {
+                this.lids.remember(c.lid ?? c.id, c.jid ?? c.id);
+            }
+        };
+        socket.ev.on('contacts.upsert', aprenderContatos);
+        socket.ev.on('contacts.update', aprenderContatos);
 
         socket.ev.on('messages.update', (updates) => {
             for (const update of updates) {
@@ -233,6 +289,9 @@ export class BaileysAdapter {
         }
 
         if (cause === 'USER_LOGOUT' || cause === 'AUTH_FAILURE') {
+            if (statusCode !== undefined && CREDENTIALS_INVALIDATED_STATUS_CODES.has(statusCode)) {
+                this.discardInvalidatedSession(statusCode);
+            }
             this.setState(cause === 'USER_LOGOUT' ? 'LOGGED_OUT' : 'FAILED', cause, detail);
             this.logger.warn({ cause, detail }, 'connection closed without automatic reconnect');
             return;
@@ -240,6 +299,23 @@ export class BaileysAdapter {
 
         this.setState('RECONNECTING', cause, detail);
         this.scheduleReconnect(cause === 'WHATSAPP_RESTART');
+    }
+
+    /**
+     * Drops credentials WhatsApp has just rejected, so the next connect()
+     * starts a fresh pairing and emits a QR code instead of replaying the same
+     * rejection forever.
+     *
+     * Fire-and-forget by necessity (the caller reacts to a synchronous event),
+     * but the promise is kept in `sessionCleanup` so openSocket() waits for it.
+     * A failure here is logged rather than thrown: the connection is already
+     * down, and the state change still has to reach the operator.
+     */
+    private discardInvalidatedSession(statusCode: number): void {
+        this.logger.warn({ statusCode }, 'credenciais invalidadas pelo WhatsApp; limpando sessao para permitir novo pareamento');
+        this.sessionCleanup = rm(this.options.sessionDirectory, { recursive: true, force: true }).catch((err) => {
+            this.logger.error({ err }, 'falha ao limpar a sessao invalidada; o proximo connect pode continuar sendo recusado');
+        });
     }
 
     private scheduleReconnect(immediate: boolean): void {
@@ -314,6 +390,23 @@ export class BaileysAdapter {
         this.setState('LOGGED_OUT', 'USER_LOGOUT', 'logout() chamado explicitamente');
     }
 
+    /**
+     * Extrai do stanza os pares LID/telefone que o Baileys expoe em
+     * `senderPn`/`participantPn`.
+     */
+    private learnLids(msg: WAMessage): void {
+        const key = msg.key as {
+            remoteJid?: string | null;
+            participant?: string | null;
+            senderLid?: string;
+            senderPn?: string;
+            participantLid?: string;
+            participantPn?: string;
+        };
+        this.lids.remember(key.senderLid ?? key.remoteJid, key.senderPn);
+        this.lids.remember(key.participantLid ?? key.participant, key.participantPn);
+    }
+
     private requireSocket(): WASocket {
         if (!this.socket || this.state !== 'CONNECTED') {
             throw new BridgeCommandError(ErrorCode.NOT_CONNECTED, `Instancia ${this.options.instanceId} nao esta conectada`);
@@ -380,6 +473,44 @@ export class BaileysAdapter {
         return this.send(to, Content.buildContactContent(payload), quotedMessageId);
     }
 
+    /**
+     * Publishes our own presence in a chat ('composing' shows the recipient
+     * the "typing..." indicator, 'recording' the voice-note one, 'paused'
+     * clears it, 'available'/'unavailable' set online/offline).
+     *
+     * WhatsApp only routes a chat presence to clients that have subscribed to
+     * it, so `presenceSubscribe` is issued first - without it the indicator is
+     * silently dropped by the server for a chat the recipient is not already
+     * watching.
+     *
+     * Best-effort by design: presence is decoration around a send, never the
+     * point of it, so a failure here is reported but must not be able to abort
+     * the message that follows.
+     */
+    /**
+     * Publishes a presence ("composing", "paused", ...) into a conversation.
+     *
+     * The `available` step is not optional. Instances usually connect with
+     * `markOnlineOnConnect: false` so the number does not sit online all day,
+     * but WhatsApp will not relay a typing indicator from a client that has
+     * declared itself unavailable — the update is accepted and silently
+     * dropped. Announcing availability first is what makes "digitando..."
+     * actually appear on the recipient's screen; the caller can return to
+     * `unavailable` afterwards.
+     */
+    async sendPresence(chatId: string, presence: WAPresence): Promise<void> {
+        const socket = this.requireSocket();
+        try {
+            if (presence === 'composing' || presence === 'recording') {
+                await socket.sendPresenceUpdate('available');
+                await socket.presenceSubscribe(chatId);
+            }
+            await socket.sendPresenceUpdate(presence, chatId);
+        } catch (err) {
+            throw new BridgeCommandError(ErrorCode.SEND_FAILED, (err as Error).message);
+        }
+    }
+
     async sendReaction(payload: Content.SendReactionPayload): Promise<void> {
         const socket = this.requireSocket();
         try {
@@ -419,11 +550,36 @@ export class BaileysAdapter {
         );
     }
 
+    /**
+     * Identity of the account this instance is logged in as.
+     *
+     * Baileys exposes it as `socket.user`, whose `id` carries the device
+     * suffix ("5562999...:12@s.whatsapp.net"); the suffix is stripped here so
+     * callers get the same JID shape every other command uses. `name` is the
+     * WhatsApp profile name, which may legitimately be absent.
+     */
+    async getMe(): Promise<{ jid: string | null; phoneNumber: string | null; name: string | null }> {
+        const socket = this.requireSocket();
+        const user = socket.user;
+        if (!user?.id) {
+            return { jid: null, phoneNumber: null, name: null };
+        }
+        const digits = (user.id.split(':')[0] ?? '').split('@')[0]?.replace(/[^0-9]/g, '') ?? '';
+        return {
+            jid: digits.length > 0 ? `${digits}@s.whatsapp.net` : null,
+            phoneNumber: digits.length > 0 ? digits : null,
+            name: user.name ?? user.verifiedName ?? null
+        };
+    }
+
     async getContact(jid: string): Promise<{ jid: string; name: string | null; status: string | null; profilePictureUrl: string | null; onWhatsApp: boolean }> {
         const socket = this.requireSocket();
         const results = await socket.onWhatsApp(jid);
         const exists = results?.[0]?.exists != null && results[0].exists !== false;
         const resolvedJid = results?.[0]?.jid ?? jid;
+        // A consulta devolve os dois enderecos do contato: aproveita para
+        // aprender o par antes mesmo de ele mandar a primeira mensagem.
+        this.lids.remember((results?.[0] as { lid?: string } | undefined)?.lid, resolvedJid);
 
         let profilePictureUrl: string | null = null;
         try {

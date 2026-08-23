@@ -372,6 +372,28 @@ public final class WhatsAppClient implements AutoCloseable {
         return connection().sendRequest("send_reaction", instanceId, payload).thenApply(v -> null);
     }
 
+    /**
+     * Publishes our own presence in a chat: {@code composing} shows the
+     * recipient the "typing..." indicator, {@code recording} the voice-note
+     * one, {@code paused} clears it, and {@code available}/{@code unavailable}
+     * set online/offline.
+     *
+     * Presence is decoration around a message, never the message itself:
+     * callers are expected to treat a failure here as cosmetic and send
+     * anyway.
+     *
+     * @param chatId conversation to publish the presence in
+     * @param presence one of {@code unavailable}, {@code available},
+     *        {@code composing}, {@code recording}, {@code paused}
+     * @return future completed when the bridge acknowledges the update
+     */
+    public CompletableFuture<Void> sendPresence(String chatId, String presence) {
+        ObjectNode payload = JsonNodeFactory.instance.objectNode();
+        payload.put("chatId", Objects.requireNonNull(chatId, "chatId"));
+        payload.put("presence", Objects.requireNonNull(presence, "presence"));
+        return connection().sendRequest("send_presence", instanceId, payload).thenApply(v -> null);
+    }
+
     // ---------------------------------------------------------------- media / contacts / groups
 
     public CompletableFuture<MediaContent> downloadMedia(String chatId, String messageId) {
@@ -382,6 +404,20 @@ public final class WhatsAppClient implements AutoCloseable {
                 .thenApply(data -> new MediaContent(
                         Base64.getDecoder().decode(data.path("base64").asText("")),
                         data.path("mimetype").asText("application/octet-stream")));
+    }
+
+    /**
+     * Identity of the account this instance is logged in as.
+     *
+     * Only the pairing-code flow tells the caller which number it asked to
+     * connect; after a QR-code login nothing else reveals it, so this is the
+     * only way to label a connected session with its own phone number.
+     *
+     * @return {@code { jid, phoneNumber, name }} — any field may be null when
+     *         WhatsApp did not provide it
+     */
+    public CompletableFuture<JsonNode> getMe() {
+        return connection().sendRequest("get_me", instanceId, JsonNodeFactory.instance.objectNode());
     }
 
     public CompletableFuture<Contact> getContact(String jid) {

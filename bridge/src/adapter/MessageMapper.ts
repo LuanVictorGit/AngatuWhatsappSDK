@@ -1,4 +1,5 @@
 import { getContentType, type WAMessage, type proto } from 'baileys';
+import type { LidDirectory } from './LidDirectory.js';
 
 /**
  * Abstract message shape shared with the Java `Message` model. Anything
@@ -16,6 +17,12 @@ export interface AbstractMessage {
     isFromMe: boolean;
     pushName: string | null;
     quotedMessage: AbstractQuotedMessage | null;
+    /**
+     * LID original da conversa, quando `chatId` foi traduzido para o numero
+     * de telefone. Permite ao consumidor juntar uma conversa que ele ja tenha
+     * gravado sob o endereco anonimo.
+     */
+    chatIdLid: string | null;
     rawData: unknown;
 }
 
@@ -111,11 +118,18 @@ function extractQuoted(message: proto.IMessage | null | undefined): AbstractQuot
     };
 }
 
-export function toAbstractMessage(waMessage: WAMessage): AbstractMessage {
-    const chatId = waMessage.key.remoteJid ?? '';
+export function toAbstractMessage(waMessage: WAMessage, lids?: LidDirectory): AbstractMessage {
+    // O endereco que veio no stanza pode ser um LID anonimo; o resto do
+    // sistema so sabe conversar em numero de telefone.
+    const chatIdRaw = waMessage.key.remoteJid ?? '';
+    const chatId = lids ? lids.resolve(chatIdRaw) : chatIdRaw;
+    const chatIdLid = chatId !== chatIdRaw ? chatIdRaw : null;
     const isGroup = chatId.endsWith('@g.us');
     const isFromMe = waMessage.key.fromMe ?? false;
-    const senderId = isFromMe ? 'me' : (isGroup ? waMessage.key.participant : chatId) ?? chatId;
+    const participanteRaw = (isGroup ? waMessage.key.participant : chatIdRaw) ?? chatIdRaw;
+    const senderId = isFromMe
+        ? 'me'
+        : (lids ? lids.resolve(participanteRaw) : participanteRaw);
     const contentType = getContentType(waMessage.message ?? undefined);
     const timestampRaw = waMessage.messageTimestamp;
     const timestamp =
@@ -136,6 +150,7 @@ export function toAbstractMessage(waMessage: WAMessage): AbstractMessage {
         isFromMe,
         pushName: waMessage.pushName ?? null,
         quotedMessage: extractQuoted(waMessage.message),
+        chatIdLid,
         rawData: waMessage
     };
 }

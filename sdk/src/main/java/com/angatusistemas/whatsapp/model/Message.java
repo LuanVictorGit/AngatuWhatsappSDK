@@ -27,10 +27,26 @@ public record Message(
         boolean isFromMe,
         String pushName,
         QuotedMessage quotedMessage,
+        String chatIdLid,
         JsonNode rawData) {
 
     public Instant timestampAsInstant() {
         return Instant.ofEpochSecond(timestamp);
+    }
+
+    /**
+     * Endereco anonimo ({@code <id>@lid}) sob o qual esta conversa chegou,
+     * quando {@link #chatId()} ja veio traduzido para o numero de telefone.
+     *
+     * O WhatsApp esta migrando as conversas individuais para LID: a mesma
+     * pessoa passa a ter dois enderecos. Quem guarda historico precisa disto
+     * para juntar a conversa que tenha sido gravada sob o endereco antigo em
+     * vez de manter duas.
+     *
+     * @return o LID de origem, ou {@code null} se nao houve traducao
+     */
+    public String chatIdLid() {
+        return chatIdLid;
     }
 
     public static Message fromJson(String instanceId, JsonNode data) {
@@ -55,6 +71,7 @@ public record Message(
                 data.path("isFromMe").asBoolean(false),
                 text(data, "pushName"),
                 quoted,
+                text(data, "chatIdLid"),
                 raw != null ? raw : NullNode.getInstance());
     }
 
