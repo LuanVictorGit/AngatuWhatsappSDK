@@ -214,16 +214,32 @@ export class BaileysAdapter {
 
         // Perguntada ao WhatsApp, nao lida da constante do pacote: cliente
         // velho tem o pareamento recusado pelo servidor. Ver WaVersion.ts.
+        // `null` = nao deu para descobrir; a chave e OMITIDA para o Baileys usar
+        // a dele. Mandar `undefined` sobrescreveria o padrao e subiria o socket
+        // sem versao nenhuma — sem QR e sem codigo de pareamento.
         const version = await resolverVersaoWhatsApp(this.logger);
 
         const socket = makeWASocket({
             auth: state,
-            version,
+            ...(version ? { version } : {}),
             logger: this.logger as never,
             browser: [this.options.displayName, 'Chrome', '1.0.0'],
             markOnlineOnConnect: this.options.markOnlineOnConnect,
             syncFullHistory: false,
-            generateHighQualityLinkPreview: false
+            generateHighQualityLinkPreview: false,
+            // Quando o aparelho do destinatario nao consegue decifrar algo que
+            // mandamos, ele pede o reenvio (retry receipt) e o Baileys chama
+            // isto para recifrar. Sem a funcao, o pedido nunca e atendido: o
+            // outro lado insiste, a sessao de criptografia com aquele contato
+            // vai se degradando e o socket acaba caindo. O cache ja existia e
+            // ja era alimentado em `messages.upsert` — so nao estava ligado.
+            getMessage: async (key) => {
+                const chatId = key.remoteJid;
+                if (!chatId || !key.id) {
+                    return undefined;
+                }
+                return this.messageCache.get(chatId, key.id)?.message ?? undefined;
+            }
         });
         this.socket = socket;
 
@@ -602,6 +618,11 @@ export class BaileysAdapter {
             if (!result?.key.id) {
                 throw new BridgeCommandError(ErrorCode.SEND_FAILED, 'Baileys nao retornou um id de mensagem');
             }
+            // O reenvio (retry receipt) e pedido para o que NOS mandamos, entao
+            // e esta copia que o `getMessage` vai procurar. Sem guardar aqui, o
+            // cache so teria mensagem recebida e o pedido de reenvio cairia no
+            // vazio — que e o caso que a funcao existe para atender.
+            this.messageCache.put(result);
             return result.key.id;
         } catch (err) {
             if (err instanceof BridgeCommandError) throw err;
