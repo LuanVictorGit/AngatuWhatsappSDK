@@ -14,6 +14,7 @@ import { Boom } from '@hapi/boom';
 import type { Logger } from '../util/logger.js';
 import { MessageCache } from './MessageCache.js';
 import { LidDirectory } from './LidDirectory.js';
+import { resolverVersaoWhatsApp } from './WaVersion.js';
 import { toAbstractMessage, type AbstractMessage } from './MessageMapper.js';
 import { BridgeCommandError, ErrorCode } from '../protocol/errors.js';
 import * as Content from './ContentBuilder.js';
@@ -211,8 +212,13 @@ export class BaileysAdapter {
         const { state, saveCreds } = await useMultiFileAuthState(this.options.sessionDirectory);
         this.saveCreds = saveCreds;
 
+        // Perguntada ao WhatsApp, nao lida da constante do pacote: cliente
+        // velho tem o pareamento recusado pelo servidor. Ver WaVersion.ts.
+        const version = await resolverVersaoWhatsApp(this.logger);
+
         const socket = makeWASocket({
             auth: state,
+            version,
             logger: this.logger as never,
             browser: [this.options.displayName, 'Chrome', '1.0.0'],
             markOnlineOnConnect: this.options.markOnlineOnConnect,
