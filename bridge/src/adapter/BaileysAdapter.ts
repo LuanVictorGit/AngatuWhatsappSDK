@@ -498,14 +498,50 @@ export class BaileysAdapter {
      * actually appear on the recipient's screen; the caller can return to
      * `unavailable` afterwards.
      */
+    /**
+     * Publishes our own presence ("typing...", "online", "offline").
+     *
+     * Three things have to line up or the indicator silently never shows, with
+     * no error anywhere:
+     *
+     * 1. **The socket has to be online first.** With `markOnlineOnConnect:
+     *    false` — which is what we want, so the number is not online around
+     *    the clock — WhatsApp drops `composing` from an offline socket.
+     *
+     * 2. **The address has to match how the chat is identified.** A regular
+     *    message is resolved server-side whichever address you use, but a
+     *    `chatstate` is delivered verbatim: once a conversation has migrated
+     *    to LID, `composing` sent to `<phone>@s.whatsapp.net` never reaches
+     *    the open chat. So we address the LID whenever we know it.
+     *
+     * 3. **The account needs a profile name.** Baileys refuses to send
+     *    `available`/`unavailable` when `creds.me.name` is empty (it logs
+     *    "no name present, ignoring presence update request" and returns), and
+     *    without `available` the socket stays offline and item 1 bites. There
+     *    is nothing we can do about it from here except say so clearly.
+     */
     async sendPresence(chatId: string, presence: WAPresence): Promise<void> {
         const socket = this.requireSocket();
+        const alvo = presence === 'available' || presence === 'unavailable'
+            ? chatId
+            : this.lids.toLid(chatId);
         try {
             if (presence === 'composing' || presence === 'recording') {
+                if (!socket.user?.name) {
+                    this.logger.warn(
+                        { chatId },
+                        'a conta conectada nao tem nome de perfil: o Baileys ignora "available" e o '
+                        + '"digitando..." nao aparece. Defina um nome no perfil do WhatsApp.'
+                    );
+                }
                 await socket.sendPresenceUpdate('available');
-                await socket.presenceSubscribe(chatId);
+                await socket.presenceSubscribe(alvo);
             }
-            await socket.sendPresenceUpdate(presence, chatId);
+            await socket.sendPresenceUpdate(presence, alvo);
+            this.logger.debug(
+                { presence, alvo, traduzido: alvo !== chatId },
+                'presenca publicada'
+            );
         } catch (err) {
             throw new BridgeCommandError(ErrorCode.SEND_FAILED, (err as Error).message);
         }

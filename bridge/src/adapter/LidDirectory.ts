@@ -25,6 +25,7 @@ import { isLidUser } from 'baileys';
  */
 export class LidDirectory {
     private readonly lidToPn = new Map<string, string>();
+    private readonly pnToLid = new Map<string, string>();
 
     /**
      * Records a pair. Accepts either side in any order-independent form; a
@@ -35,6 +36,7 @@ export class LidDirectory {
         const p = bare(pn);
         if (!l || !p || isLidUser(l) !== true || isLidUser(p) === true) return;
         this.lidToPn.set(l, p);
+        this.pnToLid.set(p, l);
     }
 
     /** Phone-number JID for a LID, or the input unchanged when unknown. */
@@ -48,6 +50,24 @@ export class LidDirectory {
     knows(jid: string | null | undefined): boolean {
         const j = bare(jid);
         return !!j && isLidUser(j) === true && this.lidToPn.has(j);
+    }
+
+    /**
+     * The LID address for a phone-number JID, or the input unchanged.
+     *
+     * This is the direction that matters for *ephemeral* stanzas — typing
+     * indicators, read receipts, presence. A regular message is resolved by
+     * the server whichever address you send it to, so `resolve()` is enough
+     * for those. A `chatstate` is not resolved: it is delivered verbatim, and
+     * the recipient's client only shows it on the chat whose identity matches
+     * the address. Once a conversation has migrated to LID, a "composing"
+     * addressed to `<phone>@s.whatsapp.net` is dropped without any error —
+     * which reads as "the typing indicator never shows up".
+     */
+    toLid(jid: string | null | undefined): string {
+        const j = bare(jid);
+        if (!j || isLidUser(j) === true) return jid ?? '';
+        return this.pnToLid.get(j) ?? jid ?? '';
     }
 
     get size(): number {
