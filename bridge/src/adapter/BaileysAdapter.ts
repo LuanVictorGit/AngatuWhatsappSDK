@@ -80,6 +80,13 @@ const DISCONNECT_CAUSE_BY_STATUS_CODE: Record<number, DisconnectCause> = {
  * valid, another socket simply took over the session, so reconnecting later
  * works and wiping them would force a pointless re-pairing.
  */
+/**
+ * Quanto esperar o handshake do WhatsApp antes de pedir o codigo de
+ * pareamento. Generoso de proposito: quem esta conectando um numero novo
+ * prefere esperar 20s a receber "erro" e nao saber o motivo.
+ */
+const PAIRING_READY_TIMEOUT_MS = 20_000;
+
 const CREDENTIALS_INVALIDATED_STATUS_CODES: ReadonlySet<number> = new Set([
     DisconnectReason.loggedOut,
     DisconnectReason.badSession,
@@ -125,6 +132,23 @@ export class BaileysAdapter {
     /** Traducao LID -> telefone; ver LidDirectory para o porque. */
     private readonly lids = new LidDirectory();
 
+    /**
+     * Resolve quando o socket esta REALMENTE pronto para mandar stanza.
+     *
+     * `makeWASocket()` volta na hora, com o handshake ainda por acontecer:
+     * quem chamar `requestPairingCode` logo depois de `connect()` cai no
+     * `sendRawMessage` do Baileys com `ws.isOpen === false` e leva um
+     * "Connection Closed" — que era exatamente o erro de quem tentava conectar
+     * pelo numero de telefone.
+     *
+     * O sinal usado e o primeiro `qr` do `connection.update`: ele so e emitido
+     * depois do handshake, e significa "o servidor aceitou a conexao e esta
+     * esperando o pareamento". `connection: 'open'` tambem serve (sessao ja
+     * pareada, sem QR nenhum).
+     */
+    private prontoParaParear: Promise<void> | null = null;
+    private marcarPronto: (() => void) | null = null;
+
     constructor(
         private readonly options: AdapterOptions,
         private readonly logger: Logger,
@@ -150,6 +174,9 @@ export class BaileysAdapter {
 
     private async openSocket(): Promise<void> {
         this.setState('CONNECTING', null, null);
+        this.prontoParaParear = new Promise<void>((resolve) => {
+            this.marcarPronto = resolve;
+        });
 
         // A session invalidated by WhatsApp is deleted asynchronously; reading
         // the credentials before that finishes would load the very files that
@@ -251,6 +278,9 @@ export class BaileysAdapter {
         lastDisconnect?: { error?: Error };
     }): void {
         if (update.qr) {
+            // Handshake concluido: o socket ja aceita stanza. E o que
+            // requestPairingCode espera.
+            this.marcarPronto?.();
             this.currentQr = update.qr;
             this.setState('QR_PENDING', null, null);
             this.callbacks.onQr(update.qr);
@@ -258,6 +288,7 @@ export class BaileysAdapter {
         }
 
         if (update.connection === 'open') {
+            this.marcarPronto?.();
             this.currentQr = null;
             this.reconnectAttempts = 0;
             this.setState('CONNECTED', null, null);
@@ -350,14 +381,67 @@ export class BaileysAdapter {
         }
     }
 
+    /**
+     * Codigo de pareamento por numero de telefone (a alternativa ao QR).
+     *
+     * Duas coisas tem de ser verdade antes de pedir o codigo, e nenhuma delas
+     * era garantida:
+     *
+     * 1. **O socket precisa estar pronto para mandar stanza.**
+     *    `makeWASocket()` volta antes do handshake terminar, e o Baileys
+     *    responde `Connection Closed` a qualquer envio nesse intervalo. Por
+     *    isso esperamos `prontoParaParear` — ver o campo para o sinal usado.
+     * 2. **A sessao nao pode ja estar pareada.** Com `creds.registered`, o
+     *    WhatsApp nao emite QR nem aceita pareamento, e a espera acima
+     *    estouraria no timeout sem explicar nada.
+     */
     async requestPairingCode(phoneNumber: string): Promise<string> {
+        const numero = phoneNumber.replace(/\D/g, '');
+        if (numero.length < 10 || numero.length > 15) {
+            throw new BridgeCommandError(
+                ErrorCode.INVALID_PAYLOAD,
+                `numero invalido: "${phoneNumber}". Use so digitos, com DDI (ex.: 5562999998888).`
+            );
+        }
         if (!this.socket) {
             throw new BridgeCommandError(ErrorCode.NOT_CONNECTED, 'Instancia nao esta conectando; chame connect antes');
         }
+        if (this.socket.authState.creds.registered) {
+            throw new BridgeCommandError(
+                ErrorCode.INVALID_PAYLOAD,
+                'esta sessao ja esta pareada; desconecte-a antes de parear outro numero'
+            );
+        }
+
         this.setState('PAIRING_CODE_PENDING', null, null);
-        const code = await this.socket.requestPairingCode(phoneNumber);
+        await this.esperarSocketPronto();
+
+        const code = await this.socket.requestPairingCode(numero);
+        this.logger.info({ numero }, 'codigo de pareamento gerado');
         this.callbacks.onPairingCode(code);
         return code;
+    }
+
+    /** Espera o handshake terminar, com teto para nao travar a rota do painel. */
+    private async esperarSocketPronto(): Promise<void> {
+        if (!this.prontoParaParear) {
+            return;
+        }
+        let temporizador: NodeJS.Timeout | undefined;
+        const estouro = new Promise<never>((_, reject) => {
+            temporizador = setTimeout(
+                () => reject(new BridgeCommandError(
+                    ErrorCode.NOT_CONNECTED,
+                    'o WhatsApp nao respondeu a tempo; verifique a internet e tente de novo'
+                )),
+                PAIRING_READY_TIMEOUT_MS
+            );
+        });
+        try {
+            await Promise.race([this.prontoParaParear, estouro]);
+        } finally {
+            if (temporizador) clearTimeout(temporizador);
+        }
     }
 
     async disconnect(): Promise<void> {
