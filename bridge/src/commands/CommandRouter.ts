@@ -216,6 +216,29 @@ export const handlers: Record<string, Handler> = {
         return {};
     },
 
+    async edit_message(instances, instanceId, payload) {
+        const instance = instances.get(requireInstanceId(instanceId));
+        const messageId = await instance.adapter.editMessage({
+            chatId: requireString(payload, 'chatId'),
+            messageId: requireString(payload, 'messageId'),
+            text: requireString(payload, 'text'),
+            fromMe: optionalBoolean(payload, 'fromMe') ?? true,
+            participant: optionalString(payload, 'participant')
+        });
+        return { messageId };
+    },
+
+    async delete_message(instances, instanceId, payload) {
+        const instance = instances.get(requireInstanceId(instanceId));
+        await instance.adapter.deleteMessage({
+            chatId: requireString(payload, 'chatId'),
+            messageId: requireString(payload, 'messageId'),
+            fromMe: optionalBoolean(payload, 'fromMe') ?? true,
+            participant: optionalString(payload, 'participant')
+        });
+        return {};
+    },
+
     async send_presence(instances, instanceId, payload) {
         const instance = instances.get(requireInstanceId(instanceId));
         const presence = requireString(payload, 'presence');

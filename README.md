@@ -340,6 +340,11 @@ Nove interfaces funcionais, registradas independentemente — assine só o que p
 | `MessageListener` | `onMessageReceived(Message message)` | Nova mensagem (própria ou de terceiros) |
 | `MessageUpdatedListener` | `onMessageUpdated(String chatId, String messageId, JsonNode updates)` | Edição/atualização de mensagem existente |
 | `MessageDeletedListener` | `onMessageDeleted(String chatId, String messageId)` | Mensagem apagada |
+
+Do lado ativo, `editMessage` e `deleteMessage` fazem o mesmo pela sua conta.
+Os dois só valem dentro da janela que o WhatsApp concede depois da entrega
+(cerca de 15 minutos, decididos pelo servidor e sem limite publicado): não há
+como consultar o prazo, então a recusa do servidor é a resposta.
 | `ReactionListener` | `onReactionReceived(String chatId, String messageId, String senderId, String emoji, boolean removed)` | Reação adicionada ou removida |
 | `ConnectionStateListener` | `onConnectionStateChanged(ConnectionState state, DisconnectCause cause, String detail)` | Mudança de estado da conexão |
 | `QrCodeListener` | `onQrCodeReceived(String qrCode)` | Novo QR Code disponível |

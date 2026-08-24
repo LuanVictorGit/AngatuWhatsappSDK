@@ -19,6 +19,8 @@ import com.angatusistemas.whatsapp.model.Group;
 import com.angatusistemas.whatsapp.model.MediaContent;
 import com.angatusistemas.whatsapp.model.Message;
 import com.angatusistemas.whatsapp.protocol.BridgeErrorCode;
+import com.angatusistemas.whatsapp.request.DeleteMessageRequest;
+import com.angatusistemas.whatsapp.request.EditMessageRequest;
 import com.angatusistemas.whatsapp.request.SendAudioRequest;
 import com.angatusistemas.whatsapp.request.SendContactRequest;
 import com.angatusistemas.whatsapp.request.SendDocumentRequest;
@@ -360,6 +362,44 @@ public final class WhatsAppClient implements AutoCloseable {
         putIfPresent(payload, "organization", request.organization());
         putIfPresent(payload, "quotedMessageId", request.quotedMessageId());
         return connection().sendRequest("send_contact", instanceId, payload).thenApply(WhatsAppClient::extractMessageId);
+    }
+
+    /**
+     * Replaces the text of a message already sent by this instance.
+     *
+     * <p>WhatsApp keeps an edit window of a few minutes after delivery and
+     * does not publish the exact limit; past it the server refuses and the
+     * future completes exceptionally. There is no way to check in advance, so
+     * treat the refusal as the answer rather than as an unexpected error.
+     *
+     * @param request target message and its new text
+     * @return id of the edit message the server accepted
+     */
+    public CompletableFuture<String> editMessage(EditMessageRequest request) {
+        ObjectNode payload = JsonNodeFactory.instance.objectNode();
+        payload.put("chatId", request.chatId());
+        payload.put("messageId", request.messageId());
+        payload.put("text", request.text());
+        payload.put("fromMe", request.fromMe());
+        putIfPresent(payload, "participant", request.participant());
+        return connection().sendRequest("edit_message", instanceId, payload).thenApply(WhatsAppClient::extractMessageId);
+    }
+
+    /**
+     * Revokes a message for everyone ("delete for everyone").
+     *
+     * <p>Same window caveat as {@link #editMessage(EditMessageRequest)}.
+     *
+     * @param request target message
+     * @return future completed when the server accepts the revoke
+     */
+    public CompletableFuture<Void> deleteMessage(DeleteMessageRequest request) {
+        ObjectNode payload = JsonNodeFactory.instance.objectNode();
+        payload.put("chatId", request.chatId());
+        payload.put("messageId", request.messageId());
+        payload.put("fromMe", request.fromMe());
+        putIfPresent(payload, "participant", request.participant());
+        return connection().sendRequest("delete_message", instanceId, payload).thenApply(v -> null);
     }
 
     public CompletableFuture<Void> sendReaction(SendReactionRequest request) {

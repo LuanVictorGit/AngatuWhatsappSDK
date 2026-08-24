@@ -349,6 +349,37 @@ client.sendReaction(SendReactionRequest.builder()
         .build());
 ```
 
+### Editar uma mensagem já enviada
+
+```java
+client.editMessage(EditMessageRequest.builder()
+        .chatId(chatId)
+        .messageId(messageId)                    // a mensagem a corrigir
+        .text("Texto corrigido")                 // obrigatorio, nao pode ser vazio
+        .fromMe(true)                            // padrao: true
+        .build());
+```
+
+> **Janela de tempo.** O WhatsApp só aceita a edição nos primeiros minutos
+> depois da entrega — cerca de 15, decididos pelo servidor e **sem limite
+> publicado**. Não há como perguntar antes se uma mensagem ainda está no prazo:
+> passado ele, o servidor recusa e o `CompletableFuture` completa
+> excepcionalmente. Trate a recusa como resposta, não como erro inesperado.
+
+### Apagar para todos
+
+```java
+client.deleteMessage(DeleteMessageRequest.builder()
+        .chatId(chatId)
+        .messageId(messageId)
+        .fromMe(true)                            // false + participant() para apagar de outro membro (admin de grupo)
+        .build());
+```
+
+Apagar só do seu lado não é oferecido: isso é uma decisão sobre o que um
+histórico local mostra, e pertence a quem mantém esse histórico — não ao
+WhatsApp.
+
 ## 5. Baixando mídia
 
 ```java
@@ -695,6 +726,8 @@ java -jar angatu-whatsapp-cli.jar logout --instance-id vendas --session-dir ./se
 | `CompletableFuture<String> sendLocation(SendLocationRequest)` | messageId |
 | `CompletableFuture<String> sendContact(SendContactRequest)` | messageId |
 | `CompletableFuture<Void> sendReaction(SendReactionRequest)` | — |
+| `CompletableFuture<String> editMessage(EditMessageRequest)` | messageId da edição |
+| `CompletableFuture<Void> deleteMessage(DeleteMessageRequest)` | — |
 | `CompletableFuture<MediaContent> downloadMedia(String chatId, String messageId)` | — |
 | `CompletableFuture<Contact> getContact(String jid)` | — |
 | `CompletableFuture<Group> getGroupMetadata(String groupJid)` | — |
@@ -741,5 +774,7 @@ que recebe as coordenadas obrigatórias como argumentos do próprio `builder(...
 | `SendLocationRequest` | **to**, **latitude**\*, **longitude**\*, name, address, quotedMessageId |
 | `SendContactRequest` | **to**, **displayName**, **phoneNumber**, organization, quotedMessageId |
 | `SendReactionRequest` | **chatId**, **messageId**, emoji, fromMe, participant |
+| `EditMessageRequest` | **chatId**, **messageId**, **text**, fromMe (padrão `true`), participant |
+| `DeleteMessageRequest` | **chatId**, **messageId**, fromMe (padrão `true`), participant |
 
 \* `latitude`/`longitude` são passados em `SendLocationRequest.builder(lat, lon)`, não em um setter.

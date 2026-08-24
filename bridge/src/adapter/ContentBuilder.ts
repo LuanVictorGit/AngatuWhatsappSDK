@@ -54,6 +54,25 @@ export interface SendReactionPayload {
     participant?: string;
 }
 
+/**
+ * Identifies one already-sent message, for the operations that act on a
+ * message instead of creating one (edit, revoke).
+ *
+ * `participant` only matters in groups and only when the target message is
+ * not ours: it is how WhatsApp tells apart two members' messages inside the
+ * same chat.
+ */
+export interface MessageTargetPayload {
+    chatId: string;
+    messageId: string;
+    fromMe: boolean;
+    participant?: string;
+}
+
+export interface EditMessagePayload extends MessageTargetPayload {
+    text: string;
+}
+
 function requireNonEmpty(value: unknown, field: string): asserts value is string {
     if (typeof value !== 'string' || value.trim().length === 0) {
         throw new BridgeCommandError(ErrorCode.INVALID_PAYLOAD, `Campo obrigatorio ausente ou vazio: ${field}`);
@@ -128,6 +147,47 @@ export function buildContactContent(payload: SendContactPayload): AnyMessageCont
             contacts: [{ displayName: payload.displayName, vcard }]
         }
     };
+}
+
+/**
+ * Key of an already-sent message, as WhatsApp addresses it.
+ *
+ * Shared by edit and revoke so the two can never disagree about how a
+ * message is identified.
+ */
+export function buildMessageKey(payload: MessageTargetPayload): WAMessageKey {
+    requireNonEmpty(payload.chatId, 'chatId');
+    requireNonEmpty(payload.messageId, 'messageId');
+    return {
+        remoteJid: payload.chatId,
+        fromMe: payload.fromMe,
+        id: payload.messageId,
+        participant: payload.participant
+    };
+}
+
+/**
+ * Replaces the text of a message already delivered.
+ *
+ * WhatsApp only accepts this for messages WE sent and only inside its own
+ * edit window (roughly 15 minutes, decided server-side and not published
+ * anywhere): past it, the request is rejected. The caller has to be ready for
+ * that answer - there is no way to ask beforehand.
+ */
+export function buildEditContent(payload: EditMessagePayload): AnyMessageContent {
+    requireNonEmpty(payload.text, 'text');
+    return { text: payload.text, edit: buildMessageKey(payload) };
+}
+
+/**
+ * Revokes ("delete for everyone") a message already delivered.
+ *
+ * Same window caveat as the edit above, and the same rule about it having to
+ * be our own message in a one-to-one chat. In a group, an admin may also
+ * revoke someone else's - which is why `participant` exists.
+ */
+export function buildDeleteContent(payload: MessageTargetPayload): AnyMessageContent {
+    return { delete: buildMessageKey(payload) };
 }
 
 export function buildReactionContent(payload: SendReactionPayload): AnyMessageContent {

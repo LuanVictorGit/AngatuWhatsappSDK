@@ -745,6 +745,47 @@ export class BaileysAdapter {
         }
     }
 
+    /**
+     * Replaces the text of a message we already sent.
+     *
+     * The edit travels as a normal message carrying the original key, so the
+     * result has its own id - which we cache like any other outbound message,
+     * otherwise a retry receipt for it would find nothing.
+     *
+     * WhatsApp closes the edit window a few minutes after delivery and does
+     * not publish the exact limit. Past it the server simply refuses, and that
+     * refusal is what the caller sees: there is no way to ask in advance
+     * whether a given message is still editable.
+     */
+    async editMessage(payload: Content.EditMessagePayload): Promise<string> {
+        const socket = this.requireSocket();
+        try {
+            const result = await socket.sendMessage(payload.chatId, Content.buildEditContent(payload));
+            if (result) {
+                this.messageCache.put(result);
+            }
+            return result?.key.id ?? payload.messageId;
+        } catch (err) {
+            throw new BridgeCommandError(ErrorCode.SEND_FAILED, (err as Error).message);
+        }
+    }
+
+    /**
+     * Revokes a message for everyone ("apagar para todos").
+     *
+     * Deleting only on our side is deliberately not offered: the panel keeps
+     * its own history, so hiding a message locally is a job for the panel, not
+     * for WhatsApp.
+     */
+    async deleteMessage(payload: Content.MessageTargetPayload): Promise<void> {
+        const socket = this.requireSocket();
+        try {
+            await socket.sendMessage(payload.chatId, Content.buildDeleteContent(payload));
+        } catch (err) {
+            throw new BridgeCommandError(ErrorCode.SEND_FAILED, (err as Error).message);
+        }
+    }
+
     async downloadMedia(chatId: string, messageId: string): Promise<{ base64: string; mimetype: string }> {
         this.requireSocket();
         const cached = this.messageCache.get(chatId, messageId);
