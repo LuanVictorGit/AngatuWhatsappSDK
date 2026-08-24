@@ -149,6 +149,28 @@ export class BaileysAdapter {
     private prontoParaParear: Promise<void> | null = null;
     private marcarPronto: (() => void) | null = null;
 
+    /**
+     * Pareamento por telefone em andamento: numero e codigo mostrados ao
+     * operador.
+     *
+     * Guardado porque o codigo tem de SOBREVIVER A TROCA DE SOCKET. O Baileys
+     * renova o QR a cada 20s e, quando as refs acabam (~2 min), derruba a
+     * conexao com `QR refs attempts ended`; o adapter reconecta e o socket novo
+     * nao tem registro de pareamento nenhum. Como abrir o WhatsApp, achar
+     * "Aparelhos conectados", digitar o numero e digitar o codigo leva mais que
+     * isso, o operador quase sempre digitava um codigo que ja estava morto — e
+     * a tela nao tinha como saber.
+     *
+     * O Baileys aceita um codigo customizado de 8 caracteres em
+     * `requestPairingCode(numero, codigo)`. E o que permite reapresentar o
+     * MESMO codigo ao servidor a cada socket novo, mantendo valido o que o
+     * operador esta digitando.
+     */
+    private pareamento: { numero: string; codigo: string } | null = null;
+
+    /** Em qual socket o pareamento ja foi registrado (evita registrar 2x). */
+    private pareamentoRegistradoEm: WASocket | null = null;
+
     constructor(
         private readonly options: AdapterOptions,
         private readonly logger: Logger,
@@ -281,6 +303,16 @@ export class BaileysAdapter {
             // Handshake concluido: o socket ja aceita stanza. E o que
             // requestPairingCode espera.
             this.marcarPronto?.();
+
+            // Com pareamento por telefone em curso o QR nao interessa: o
+            // operador esta digitando um codigo. Emiti-lo trocaria o estado
+            // para QR_PENDING no meio do processo e, pior, deixaria o socket
+            // seguir para o fim das refs e morrer levando o codigo junto.
+            if (this.pareamento) {
+                this.reregistrarPareamento();
+                return;
+            }
+
             this.currentQr = update.qr;
             this.setState('QR_PENDING', null, null);
             this.callbacks.onQr(update.qr);
@@ -291,6 +323,8 @@ export class BaileysAdapter {
             this.marcarPronto?.();
             this.currentQr = null;
             this.reconnectAttempts = 0;
+            this.pareamento = null;          // pareou: o codigo cumpriu o papel
+            this.pareamentoRegistradoEm = null;
             this.setState('CONNECTED', null, null);
             return;
         }
@@ -326,6 +360,16 @@ export class BaileysAdapter {
             this.setState(cause === 'USER_LOGOUT' ? 'LOGGED_OUT' : 'FAILED', cause, detail);
             this.logger.warn({ cause, detail }, 'connection closed without automatic reconnect');
             return;
+        }
+
+        // Com pareamento em curso, a queda e ESPERADA: o Baileys derruba o
+        // socket quando as refs de QR acabam (~2 min). Nao e falha, entao nao
+        // pode alimentar o backoff exponencial — cada segundo aqui e um
+        // segundo em que o codigo que o operador esta digitando nao existe do
+        // lado do WhatsApp.
+        if (this.pareamento) {
+            this.reconnectAttempts = 0;
+            this.pareamentoRegistradoEm = null;
         }
 
         this.setState('RECONNECTING', cause, detail);
@@ -417,9 +461,39 @@ export class BaileysAdapter {
         await this.esperarSocketPronto();
 
         const code = await this.socket.requestPairingCode(numero);
+        this.pareamento = { numero, codigo: code };
+        this.pareamentoRegistradoEm = this.socket;
         this.logger.info({ numero }, 'codigo de pareamento gerado');
         this.callbacks.onPairingCode(code);
         return code;
+    }
+
+    /**
+     * Reapresenta ao servidor o MESMO codigo, no socket atual.
+     *
+     * Chamado quando o socket novo fica pronto com um pareamento ainda em
+     * curso. Sem isto, o codigo na tela do painel deixa de existir do lado do
+     * WhatsApp assim que a conexao anterior cai — e digitar no celular so
+     * responde "codigo invalido".
+     *
+     * Falha aqui e logada, nao propagada: nao ha ninguem esperando por esta
+     * chamada (ela nasce de um evento), e a proxima reconexao tenta de novo.
+     */
+    private reregistrarPareamento(): void {
+        const p = this.pareamento;
+        const socket = this.socket;
+        if (!p || !socket || this.pareamentoRegistradoEm === socket) {
+            return;
+        }
+        this.pareamentoRegistradoEm = socket;
+        this.setState('PAIRING_CODE_PENDING', null, null);
+        socket
+            .requestPairingCode(p.numero, p.codigo)
+            .then(() => this.logger.info({ numero: p.numero }, 'codigo de pareamento revalidado apos reconexao'))
+            .catch((err) => {
+                this.pareamentoRegistradoEm = null;
+                this.logger.warn({ err }, 'nao consegui revalidar o codigo de pareamento; tentando na proxima reconexao');
+            });
     }
 
     /** Espera o handshake terminar, com teto para nao travar a rota do painel. */
@@ -446,6 +520,8 @@ export class BaileysAdapter {
 
     async disconnect(): Promise<void> {
         this.closedByUser = 'disconnect';
+        this.pareamento = null;
+        this.pareamentoRegistradoEm = null;
         if (this.reconnectTimer) {
             clearTimeout(this.reconnectTimer);
             this.reconnectTimer = null;
@@ -459,6 +535,8 @@ export class BaileysAdapter {
 
     async logout(): Promise<void> {
         this.closedByUser = 'logout';
+        this.pareamento = null;
+        this.pareamentoRegistradoEm = null;
         if (this.reconnectTimer) {
             clearTimeout(this.reconnectTimer);
             this.reconnectTimer = null;
