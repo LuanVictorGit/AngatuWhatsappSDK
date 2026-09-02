@@ -12,7 +12,7 @@ import makeWASocket, {
     type BaileysEventMap
 } from 'baileys';
 import { Boom } from '@hapi/boom';
-import type { Logger } from '../util/logger.js';
+import { loggerDoBaileys, type Logger } from '../util/logger.js';
 import { MessageCache } from './MessageCache.js';
 import { LidDirectory } from './LidDirectory.js';
 import { resolverVersaoWhatsApp } from './WaVersion.js';
@@ -200,6 +200,16 @@ export class BaileysAdapter {
     /** Como desassinar os listeners do socket atual. */
     private assinaturas: Array<() => void> = [];
 
+    /**
+     * Logger entregue ao Baileys, com o ruido de protocolo resumido.
+     *
+     * Separado do `this.logger` (que continua registrando tudo do adapter) para
+     * o resumo valer so para o que a biblioteca emite. Um por adapter, e nao um
+     * por socket: assim a explicacao sai uma vez por instancia, e nao uma vez
+     * por reconexao.
+     */
+    private readonly loggerBaileys: Logger;
+
     private readonly messageCache = new MessageCache();
 
     /** Traducao LID -> telefone; ver LidDirectory para o porque. */
@@ -248,7 +258,9 @@ export class BaileysAdapter {
         private readonly options: AdapterOptions,
         private readonly logger: Logger,
         private readonly callbacks: BaileysAdapterCallbacks
-    ) {}
+    ) {
+        this.loggerBaileys = loggerDoBaileys(options.instanceId);
+    }
 
     getState(): ConnectionStateName {
         return this.state;
@@ -336,7 +348,7 @@ export class BaileysAdapter {
         const socket = makeWASocket({
             auth: state,
             ...(version ? { version } : {}),
-            logger: this.logger as never,
+            logger: this.loggerBaileys as never,
             browser: [this.options.displayName, 'Chrome', '1.0.0'],
             markOnlineOnConnect: this.options.markOnlineOnConnect,
             keepAliveIntervalMs: KEEP_ALIVE_MS,
