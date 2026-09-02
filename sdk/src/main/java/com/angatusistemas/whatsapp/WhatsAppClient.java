@@ -466,6 +466,26 @@ public final class WhatsAppClient implements AutoCloseable {
         return connection().sendRequest("get_contact", instanceId, payload).thenApply(Contact::fromJson);
     }
 
+    /**
+     * URL da foto de perfil de um contato ou grupo, e nada alem disso.
+     *
+     * Prefira este metodo a {@link #getContact(String)} sempre que o objetivo
+     * for so exibir um avatar. O {@code getContact} faz TRES consultas ao
+     * WhatsApp por chamada — existencia do numero, foto e o recado pessoal do
+     * contato — e uma tela que mostra a foto de uma lista de contatos
+     * transforma isso numa varredura da agenda, lendo dados de terceiros que
+     * ela nao exibe. Aqui e uma consulta so, do unico dado que sera mostrado.
+     *
+     * @param jid contato ou grupo
+     * @return {@code { jid, profilePictureUrl }}, com a URL nula quando nao ha
+     *         foto ou ela nao esta visivel para esta conta
+     */
+    public CompletableFuture<JsonNode> getProfilePicture(String jid) {
+        ObjectNode payload = JsonNodeFactory.instance.objectNode();
+        payload.put("jid", Objects.requireNonNull(jid, "jid"));
+        return connection().sendRequest("get_profile_picture", instanceId, payload);
+    }
+
     public CompletableFuture<Group> getGroupMetadata(String groupJid) {
         ObjectNode payload = JsonNodeFactory.instance.objectNode();
         payload.put("groupJid", Objects.requireNonNull(groupJid, "groupJid"));

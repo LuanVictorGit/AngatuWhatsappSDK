@@ -8,7 +8,8 @@ import makeWASocket, {
     type GroupMetadata,
     type Contact as BaileysContact,
     type AnyMessageContent,
-    type WAPresence
+    type WAPresence,
+    type BaileysEventMap
 } from 'baileys';
 import { Boom } from '@hapi/boom';
 import type { Logger } from '../util/logger.js';
@@ -88,6 +89,48 @@ const DISCONNECT_CAUSE_BY_STATUS_CODE: Record<number, DisconnectCause> = {
  */
 const PAIRING_READY_TIMEOUT_MS = 20_000;
 
+/**
+ * Enderecos cujo conteudo o painel nunca usa e por isso nem chega a ser
+ * decifrado.
+ *
+ * `shouldIgnoreJid` e avaliado pelo Baileys no `handleMessage`, ANTES de abrir
+ * o envelope: o stanza e reconhecido, respondido com ack e descartado. A
+ * diferenca em relacao a filtrar depois (o que o painel ja fazia em
+ * `WaEngineSdk.descartavel`) e o que interessa aqui:
+ *
+ * - `status@broadcast` e o "Recado" de TODOS os contatos da agenda. Sem este
+ *   filtro, a aplicacao recebia, decifrava e guardava em cache cada foto,
+ *   video e texto que qualquer contato publicasse — dado pessoal de terceiros
+ *   que o painel nunca exibiu e nunca teve motivo para ter;
+ * - `@newsletter` sao os Canais que a conta segue, igualmente irrelevantes;
+ * - `@broadcast` (listas de transmissao) idem.
+ *
+ * Grupos (`@g.us`) e conversas (`@s.whatsapp.net`, `@lid`) passam: sao o que o
+ * painel de fato usa.
+ */
+function enderecoIgnorado(jid: string | undefined | null): boolean {
+    if (!jid) return false;
+    const servidor = jid.includes('@') ? jid.slice(jid.indexOf('@') + 1) : '';
+    return servidor === 'broadcast' || servidor === 'newsletter';
+}
+
+/**
+ * Intervalo do ping que mantem o socket vivo.
+ *
+ * O padrao do Baileys e 30s. Aqui e mais curto porque uma VPS atras de NAT
+ * perde conexao ociosa antes disso — e cada queda dessas custava uma
+ * reconexao completa, com novo handshake e novas consultas de inicializacao.
+ * Menos quedas e menos reconexao e exatamente o que reduz o volume de
+ * requisicoes que a aplicacao faz ao WhatsApp.
+ */
+const KEEP_ALIVE_MS = 20_000;
+
+/** Teto do handshake. Curto o bastante para nao ficar meia conexao pendurada. */
+const CONNECT_TIMEOUT_MS = 30_000;
+
+/** Teto de uma consulta (metadados de grupo, existencia de numero). */
+const QUERY_TIMEOUT_MS = 45_000;
+
 const CREDENTIALS_INVALIDATED_STATUS_CODES: ReadonlySet<number> = new Set([
     DisconnectReason.loggedOut,
     DisconnectReason.badSession,
@@ -128,6 +171,35 @@ export class BaileysAdapter {
      * credentials back while they are still being deleted.
      */
     private sessionCleanup: Promise<void> | null = null;
+
+    /**
+     * Abertura de socket em andamento.
+     *
+     * `openSocket()` tem tres pontos de espera antes de criar o socket (limpeza
+     * da sessao invalidada, leitura das credenciais em disco e a consulta da
+     * versao do WhatsApp Web, que sozinha pode levar 9s). Duas chamadas
+     * concorrentes atravessavam essa janela juntas e criavam DOIS sockets para a
+     * mesma conta — o servidor ve dois clientes web no mesmo aparelho, derruba
+     * um com `connectionReplaced`, o que dispara outra reconexao, que abre outro
+     * socket. E o loop que faz uma conta parecer estar sendo usada por varios
+     * clientes ao mesmo tempo. Uma promessa unica fecha a porta.
+     */
+    private abrindo: Promise<void> | null = null;
+
+    /**
+     * Numero de serie do socket vivo.
+     *
+     * Cada listener guarda a geracao em que foi registrado e desiste quando ela
+     * nao e mais a atual. Sem isso, um evento atrasado do socket anterior
+     * (recibo, presenca, estado de conexao) era processado como se fosse do
+     * novo: mensagem entrando duas vezes e estado de conexao voltando para tras
+     * sozinho.
+     */
+    private geracao = 0;
+
+    /** Como desassinar os listeners do socket atual. */
+    private assinaturas: Array<() => void> = [];
+
     private readonly messageCache = new MessageCache();
 
     /** Traducao LID -> telefone; ver LidDirectory para o porque. */
@@ -192,10 +264,47 @@ export class BaileysAdapter {
 
     async connect(): Promise<void> {
         this.closedByUser = false;
+        // Ja conectado ou conectando: NAO abre outro socket.
+        //
+        // `connect()` e chamado pelo boot do painel, pela tela de sessoes e
+        // pelo watchdog. Antes, cada uma dessas chamadas abria mais um socket
+        // por cima do que ja existia; a conta aparecia para o WhatsApp como
+        // varios clientes web simultaneos, e a reconexao que o servidor
+        // provoca ao derrubar o duplicado realimentava o ciclo.
+        if (this.socket && (this.state === 'CONNECTED' || this.state === 'CONNECTING'
+            || this.state === 'QR_PENDING' || this.state === 'PAIRING_CODE_PENDING')) {
+            this.logger.debug({ state: this.state }, 'connect() ignorado: ja ha socket ativo');
+            return;
+        }
         await this.openSocket();
     }
 
+    /**
+     * Abre o socket, garantindo que exista no maximo um por instancia.
+     *
+     * A abertura e serializada por `this.abrindo`: enquanto uma esta em curso,
+     * qualquer outra chamada espera a mesma promessa em vez de comecar a sua.
+     */
     private async openSocket(): Promise<void> {
+        if (this.abrindo) {
+            return this.abrindo;
+        }
+        this.abrindo = this.abrirSocket().finally(() => {
+            this.abrindo = null;
+        });
+        return this.abrindo;
+    }
+
+    private async abrirSocket(): Promise<void> {
+        // Um temporizador de reconexao pendente abriria um segundo socket
+        // alguns segundos depois deste.
+        this.cancelarReconexao();
+        // O socket anterior, se houver, sai de cena ANTES de o novo existir:
+        // dois sockets vivos na mesma conta e o cenario que o WhatsApp trata
+        // como uso anomalo.
+        this.descartarSocket();
+
+        const geracao = ++this.geracao;
         this.setState('CONNECTING', null, null);
         this.prontoParaParear = new Promise<void>((resolve) => {
             this.marcarPronto = resolve;
@@ -210,14 +319,19 @@ export class BaileysAdapter {
         }
 
         const { state, saveCreds } = await useMultiFileAuthState(this.options.sessionDirectory);
-        this.saveCreds = saveCreds;
 
         // Perguntada ao WhatsApp, nao lida da constante do pacote: cliente
         // velho tem o pareamento recusado pelo servidor. Ver WaVersion.ts.
         // `null` = nao deu para descobrir; a chave e OMITIDA para o Baileys usar
         // a dele. Mandar `undefined` sobrescreveria o padrao e subiria o socket
-        // sem versao nenhuma — sem QR e sem codigo de pareamento.
+        // sem versao nenhuma - sem QR e sem codigo de pareamento.
         const version = await resolverVersaoWhatsApp(this.logger);
+
+        // Alguem desconectou/deslogou enquanto esperavamos o disco e a rede.
+        if (this.geracao !== geracao) {
+            this.logger.info('abertura abortada: outra operacao assumiu a instancia');
+            return;
+        }
 
         const socket = makeWASocket({
             auth: state,
@@ -225,14 +339,44 @@ export class BaileysAdapter {
             logger: this.logger as never,
             browser: [this.options.displayName, 'Chrome', '1.0.0'],
             markOnlineOnConnect: this.options.markOnlineOnConnect,
+            keepAliveIntervalMs: KEEP_ALIVE_MS,
+            connectTimeoutMs: CONNECT_TIMEOUT_MS,
+            defaultQueryTimeoutMs: QUERY_TIMEOUT_MS,
+
+            // ---- ACESSO MINIMO: o que este cliente NAO pede ao WhatsApp ----
+            //
+            // `syncFullHistory: false` sozinho ja desliga a sincronizacao de
+            // historico nesta versao (o Baileys deriva `shouldSyncHistoryMessage`
+            // dele quando a opcao nao e passada), mas essa derivacao e um
+            // detalhe interno do pacote e uma atualizacao pode mudar o padrao
+            // sem aviso. Declarar as duas deixa a intencao escrita no codigo: o
+            // painel NAO importa conversa antiga do celular. O historico dele
+            // comeca no momento em que a sessao conecta, e e so isso que ele
+            // exibe.
             syncFullHistory: false,
+            shouldSyncHistoryMessage: () => false,
+
+            // Descarta antes de decifrar tudo que o painel nunca usa - em
+            // especial o "Recado" de todos os contatos da agenda. Ver
+            // enderecoIgnorado().
+            shouldIgnoreJid: (jid) => enderecoIgnorado(jid),
+
+            // O painel grava a mensagem que ele proprio envia no momento do
+            // envio (WaChatStore.registrar, em WaEngineSdk). Com o eco ligado,
+            // a mesma mensagem voltava pelo `messages.upsert` e era processada
+            // de novo do zero - trabalho duplicado a cada envio de campanha.
+            emitOwnEvents: false,
+
+            // Previa de link exige baixar a pagina de destino. O painel nunca
+            // mostrou previa nenhuma.
             generateHighQualityLinkPreview: false,
+
             // Quando o aparelho do destinatario nao consegue decifrar algo que
             // mandamos, ele pede o reenvio (retry receipt) e o Baileys chama
             // isto para recifrar. Sem a funcao, o pedido nunca e atendido: o
             // outro lado insiste, a sessao de criptografia com aquele contato
             // vai se degradando e o socket acaba caindo. O cache ja existia e
-            // ja era alimentado em `messages.upsert` — so nao estava ligado.
+            // ja era alimentado em `messages.upsert` - so nao estava ligado.
             getMessage: async (key) => {
                 const chatId = key.remoteJid;
                 if (!chatId || !key.id) {
@@ -241,15 +385,53 @@ export class BaileysAdapter {
                 return this.messageCache.get(chatId, key.id)?.message ?? undefined;
             }
         });
-        this.socket = socket;
 
-        socket.ev.on('creds.update', async () => {
-            await this.saveCreds?.();
+        this.socket = socket;
+        this.saveCreds = saveCreds;
+        this.registrarListeners(socket, saveCreds, geracao);
+    }
+
+    /**
+     * Liga os listeners de UM socket, presos a geracao dele.
+     *
+     * Cada assinatura vira uma funcao de cancelamento em `this.assinaturas`.
+     * Antes elas eram registradas e nunca removidas: a cada reconexao o socket
+     * novo trazia listeners novos e os do anterior continuavam vivos enquanto o
+     * objeto existisse. O sintoma era mensagem processada duas, tres, N vezes -
+     * uma por reconexao acumulada.
+     */
+    private registrarListeners(socket: WASocket, saveCreds: () => Promise<void>, geracao: number): void {
+        const assinar = <T extends keyof BaileysEventMap>(
+            evento: T,
+            ouvinte: (arg: BaileysEventMap[T]) => void
+        ): void => {
+            const protegido = (arg: BaileysEventMap[T]): void => {
+                // Evento atrasado de um socket que ja saiu de cena.
+                if (this.geracao !== geracao) return;
+                ouvinte(arg);
+            };
+            socket.ev.on(evento, protegido);
+            this.assinaturas.push(() => socket.ev.off(evento, protegido));
+        };
+
+        assinar('creds.update', () => {
+            // saveCreds do PROPRIO socket, e nao `this.saveCreds`: durante uma
+            // troca de socket o campo ja aponta para o novo, e gravar as
+            // credenciais de um pelo escritor do outro corrompe a sessao em
+            // disco - que aparece depois como "pediu QR do nada".
+            void saveCreds();
         });
 
-        socket.ev.on('connection.update', (update) => this.handleConnectionUpdate(update));
+        assinar('connection.update', (update) => this.handleConnectionUpdate(update));
 
-        socket.ev.on('messages.upsert', ({ messages, type }) => {
+        assinar('messages.upsert', ({ messages, type }) => {
+            // `notify` = mensagem chegando agora.
+            // `append` = mensagem que chegou enquanto estavamos offline (o
+            //            Baileys marca o stanza com `offline`). NAO e
+            //            sincronizacao de historico - essa vem por
+            //            `messaging-history.set`, que este adapter nunca
+            //            assina. Descartar `append` perderia respostas reais
+            //            recebidas durante uma queda de conexao.
             if (type !== 'notify' && type !== 'append') return;
             for (const msg of messages) {
                 // O par LID/telefone vem no proprio stanza: aprender antes de
@@ -262,16 +444,16 @@ export class BaileysAdapter {
             }
         });
 
-        // Contatos trazem os dois enderecos do mesmo contato de uma vez.
-        const aprenderContatos = (contatos: { id?: string; lid?: string; jid?: string }[]) => {
-            for (const c of contatos ?? []) {
-                this.lids.remember(c.lid ?? c.id, c.jid ?? c.id);
-            }
-        };
-        socket.ev.on('contacts.upsert', aprenderContatos);
-        socket.ev.on('contacts.update', aprenderContatos);
+        // NAO ha listener de `contacts.upsert`/`contacts.update` aqui, e a
+        // ausencia e deliberada. `contacts.upsert` entrega a AGENDA INTEIRA da
+        // conta de uma vez, e o adapter guardava o par LID/telefone de cada
+        // contato - inclusive de gente com quem o painel nunca trocou uma
+        // mensagem. Era coleta de dado de terceiro sem nenhum uso: o unico
+        // motivo de existir do LidDirectory e nao separar em duas a conversa de
+        // quem escreveu para nos, e para isso learnLids(msg) - que le o par no
+        // proprio stanza daquela conversa - resolve por completo.
 
-        socket.ev.on('messages.update', (updates) => {
+        assinar('messages.update', (updates) => {
             for (const update of updates) {
                 const chatId = update.key.remoteJid;
                 const messageId = update.key.id;
@@ -280,7 +462,7 @@ export class BaileysAdapter {
             }
         });
 
-        socket.ev.on('messages.delete', (payload) => {
+        assinar('messages.delete', (payload) => {
             if ('keys' in payload) {
                 for (const key of payload.keys) {
                     if (key.remoteJid && key.id) {
@@ -290,7 +472,7 @@ export class BaileysAdapter {
             }
         });
 
-        socket.ev.on('messages.reaction', (reactions) => {
+        assinar('messages.reaction', (reactions) => {
             for (const r of reactions) {
                 const chatId = r.key.remoteJid;
                 const messageId = r.key.id;
@@ -299,7 +481,7 @@ export class BaileysAdapter {
             }
         });
 
-        socket.ev.on('groups.update', (updates) => {
+        assinar('groups.update', (updates) => {
             for (const update of updates) {
                 if (update.id) {
                     this.callbacks.onGroupUpdated(update.id, update);
@@ -307,13 +489,50 @@ export class BaileysAdapter {
             }
         });
 
-        socket.ev.on('group-participants.update', (event) => {
+        assinar('group-participants.update', (event) => {
             this.callbacks.onGroupUpdated(event.id, event);
         });
 
-        socket.ev.on('presence.update', (event) => {
+        assinar('presence.update', (event) => {
             this.callbacks.onPresenceUpdated(event.id, event.presences);
         });
+    }
+
+    /**
+     * Tira o socket atual de cena: desassina, fecha e esquece.
+     *
+     * Chamado antes de abrir outro e nas saidas deliberadas. Fechar sem
+     * desassinar deixaria os callbacks do socket morto disparando; desassinar
+     * sem fechar deixaria a conexao viva contando como mais um cliente web na
+     * conta.
+     */
+    private descartarSocket(): void {
+        for (const cancelar of this.assinaturas) {
+            try {
+                cancelar();
+            } catch {
+                // Emissor ja descartado: nada a fazer.
+            }
+        }
+        this.assinaturas = [];
+
+        const socket = this.socket;
+        this.socket = null;
+        this.saveCreds = null;
+        if (!socket) return;
+        try {
+            socket.end(undefined);
+        } catch {
+            // Ja fechado.
+        }
+    }
+
+    /** Cancela uma reconexao agendada, se houver. */
+    private cancelarReconexao(): void {
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
     }
 
     private handleConnectionUpdate(update: {
@@ -363,7 +582,11 @@ export class BaileysAdapter {
             (statusCode !== undefined ? DISCONNECT_CAUSE_BY_STATUS_CODE[statusCode] : undefined) ?? 'UNKNOWN';
         const detail = error?.message ?? null;
 
-        this.socket = null;
+        // Desassina e fecha o socket morto. Antes so o campo era zerado: o
+        // objeto continuava com todos os listeners ligados e, se o WebSocket
+        // ainda estivesse meio vivo, seus eventos seguiam sendo processados
+        // junto com os do socket seguinte.
+        this.descartarSocket();
 
         if (this.closedByUser) {
             // Deliberate local closure: report USER_LOGOUT/target-state deterministically
@@ -416,8 +639,13 @@ export class BaileysAdapter {
     }
 
     private scheduleReconnect(immediate: boolean): void {
-        if (this.reconnectTimer) {
-            clearTimeout(this.reconnectTimer);
+        this.cancelarReconexao();
+
+        // Saida deliberada (disconnect/logout) nao reconecta. Sem esta
+        // conferencia, um close que chegasse depois do desligamento explicito
+        // religava a conta sozinha.
+        if (this.closedByUser) {
+            return;
         }
 
         const delay = immediate
@@ -431,6 +659,10 @@ export class BaileysAdapter {
         this.logger.info({ delay, attempt: this.reconnectAttempts }, 'scheduling reconnect');
 
         this.reconnectTimer = setTimeout(() => {
+            this.reconnectTimer = null;
+            if (this.closedByUser) {
+                return;
+            }
             this.openSocket().catch((err) => {
                 this.logger.error({ err }, 'reconnect attempt failed');
                 this.setState('RECONNECTING', 'CONNECTION_LOST', (err as Error).message);
@@ -544,12 +776,12 @@ export class BaileysAdapter {
         this.closedByUser = 'disconnect';
         this.pareamento = null;
         this.pareamentoRegistradoEm = null;
-        if (this.reconnectTimer) {
-            clearTimeout(this.reconnectTimer);
-            this.reconnectTimer = null;
-        }
-        this.socket?.end(undefined);
-        this.socket = null;
+        this.cancelarReconexao();
+        // Invalida a geracao: uma abertura que esteja esperando disco ou rede
+        // neste instante descobre, ao voltar, que ja nao e ela quem manda e
+        // desiste em vez de subir um socket para uma instancia desligada.
+        this.geracao++;
+        this.descartarSocket();
         // Also set explicitly (not just left to handleClose()'s reaction to Baileys' own
         // 'connection.update' close event): if there was no active socket, that event never fires.
         this.setState('DISCONNECTED', 'USER_LOGOUT', 'disconnect() chamado explicitamente');
@@ -559,16 +791,16 @@ export class BaileysAdapter {
         this.closedByUser = 'logout';
         this.pareamento = null;
         this.pareamentoRegistradoEm = null;
-        if (this.reconnectTimer) {
-            clearTimeout(this.reconnectTimer);
-            this.reconnectTimer = null;
-        }
+        this.cancelarReconexao();
         try {
             await this.socket?.logout();
         } catch (err) {
             this.logger.warn({ err }, 'logout() no baileys falhou, prosseguindo com limpeza local');
         }
-        this.socket = null;
+        // Mesma razao do disconnect(): nenhuma abertura em voo pode ressuscitar
+        // uma sessao cujas credenciais estao sendo apagadas logo abaixo.
+        this.geracao++;
+        this.descartarSocket();
         await rm(this.options.sessionDirectory, { recursive: true, force: true });
         // Also set explicitly, same reasoning as disconnect() above.
         this.setState('LOGGED_OUT', 'USER_LOGOUT', 'logout() chamado explicitamente');
@@ -864,6 +1096,32 @@ export class BaileysAdapter {
         }
 
         return { jid: resolvedJid, name: null, status, profilePictureUrl, onWhatsApp: exists };
+    }
+
+    /**
+     * Apenas a URL da foto de perfil - uma consulta, e so o dado que a tela usa.
+     *
+     * Existe para o painel parar de chamar `getContact()` quando tudo o que ele
+     * quer e o avatar. Aquele metodo dispara TRES consultas por contato:
+     * `onWhatsApp` (o numero existe?), `profilePictureUrl` (a foto) e
+     * `fetchStatus` (o "recado" pessoal da pessoa). A tela de conversas pede o
+     * avatar de cada contato da barra lateral, entao abrir o painel virava uma
+     * varredura da agenda inteira - sondagem de existencia de numero e leitura
+     * de recado pessoal de gente com quem o operador nem estava falando, dois
+     * dados que o painel nunca exibiu. E leitura em massa de informacao de
+     * terceiro, e e o comportamento que faz uma conta ser suspensa.
+     *
+     * `null` quando o contato nao tem foto ou nao a mostra para nos - o caso
+     * comum, e por isso nao e erro.
+     */
+    async getProfilePicture(jid: string): Promise<{ jid: string; profilePictureUrl: string | null }> {
+        const socket = this.requireSocket();
+        try {
+            const url = (await socket.profilePictureUrl(jid, 'image')) ?? null;
+            return { jid, profilePictureUrl: url };
+        } catch {
+            return { jid, profilePictureUrl: null };
+        }
     }
 
     getGroupMetadata(jid: string): Promise<GroupMetadata> {

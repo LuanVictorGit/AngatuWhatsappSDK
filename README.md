@@ -382,7 +382,11 @@ abstração).
 MediaContent media = client.downloadMedia(chatId, messageId).get();
 Files.write(Path.of("recebido.jpg"), media.data()); // media.mimetype() também disponível
 
-// Contato
+// Só a foto de perfil — uma consulta ao WhatsApp
+JsonNode foto = client.getProfilePicture("5511999999999@s.whatsapp.net").get();
+String url = foto.path("profilePictureUrl").asText(null);   // null quando não há foto
+
+// Contato completo — TRÊS consultas (ver o aviso abaixo)
 Contact contato = client.getContact("5511999999999@s.whatsapp.net").get();
 
 // Grupos
@@ -397,6 +401,20 @@ client.updateGroupDescription(groupJid, "Nova descrição");
 client.leaveGroup(groupJid);
 String conviteUrl = client.getGroupInviteCode(groupJid).get();
 ```
+
+> ### ⚠️ `getContact` faz três consultas — prefira `getProfilePicture`
+>
+> `getContact(jid)` dispara `onWhatsApp` (o número existe?), `profilePictureUrl`
+> (a foto) e `fetchStatus` (o **recado pessoal** do contato). Numa tela que
+> mostra o avatar de uma lista de contatos isso vira uma varredura da agenda:
+> 200 contatos = 600 consultas em rajada, sondando existência de número e lendo
+> o recado pessoal de gente que a aplicação nem exibe.
+>
+> Isso é leitura em massa de informação de terceiro, e o WhatsApp **suspende
+> contas** por esse comportamento — foi o que aconteceu com uma aplicação que
+> usa esta SDK. Se o objetivo é só exibir um avatar, use
+> `getProfilePicture(jid)`: uma consulta, só o dado que será mostrado. E guarde
+> o resultado: a foto de perfil não muda de minuto em minuto.
 
 ## Múltiplas instâncias
 
@@ -430,6 +448,52 @@ configuráveis por argumento de linha de comando.
 sem exigir um novo QR Code, contanto que o WhatsApp não tenha invalidado a sessão nesse meio
 tempo. **Nunca commite esse diretório em controle de versão** (o `.gitignore` do projeto já
 exclui `sessions/` e `**/sessions/` por padrão).
+
+### Uma conta, um socket
+
+O adapter garante **no máximo um socket Baileys por instância**, e isso não é
+detalhe de implementação: dois sockets vivos na mesma conta fazem o servidor
+derrubar um com `connectionReplaced`, o que dispara outra reconexão, que abre
+outro socket — um ciclo em que a conta aparece para o WhatsApp como vários
+clientes web surgindo e sumindo.
+
+Três garantias sustentam isso:
+
+- **abertura serializada.** `openSocket()` espera três coisas antes de criar o
+  socket (limpeza de sessão invalidada, leitura das credenciais e a consulta da
+  versão do WhatsApp Web, que sozinha leva até 9s). Duas chamadas concorrentes
+  atravessavam essa janela juntas; agora compartilham a mesma promessa, e
+  `connect()` é no-op quando já existe socket ativo;
+- **listeners com número de geração.** Cada assinatura sabe se desfazer e
+  carrega a geração do socket em que nasceu. Antes, cada reconexão somava um
+  jogo novo de listeners e os antigos continuavam vivos — a mesma mensagem era
+  entregue N vezes, uma por reconexão acumulada;
+- **credenciais gravadas pelo escritor do próprio socket.** O listener de
+  `creds.update` usava um campo compartilhado que a troca de socket já tinha
+  reapontado, gravando as credenciais de um pela função do outro. Aparece depois
+  como "pediu QR do nada".
+
+### Acesso mínimo: o que este cliente não pede ao WhatsApp
+
+O socket é configurado para ler só o que a aplicação usa. Não é otimização — é
+o que separa um cliente de mensagens de um coletor de dados, e o WhatsApp
+suspende contas pela diferença:
+
+| opção | valor | efeito |
+|---|---|---|
+| `syncFullHistory` / `shouldSyncHistoryMessage` | `false` / `() => false` | nenhum histórico antigo é importado do celular |
+| `shouldIgnoreJid` | ignora `@broadcast` e `@newsletter` | o "Recado" de todos os contatos é descartado **antes de ser decifrado** |
+| `emitOwnEvents` | `false` | a mensagem que a aplicação envia não volta como evento para ser processada de novo |
+| `generateHighQualityLinkPreview` | `false` | não baixa a página de destino dos links |
+
+O adapter também **não assina `contacts.upsert`/`contacts.update`**: esse evento
+entrega a lista de contatos inteira da conta, e guardá-la seria acumular dado
+pessoal de terceiro sem uso. O `LidDirectory` aprende o par LID/telefone do
+próprio stanza da conversa (`learnLids`), que é tudo de que ele precisa.
+
+`messages.upsert` processa `notify` **e** `append`. `append` parece histórico e
+não é: é a mensagem que chegou enquanto o cliente estava offline. Descartá-la
+perderia respostas recebidas durante uma queda de conexão.
 
 A reconexão acontece em duas camadas:
 

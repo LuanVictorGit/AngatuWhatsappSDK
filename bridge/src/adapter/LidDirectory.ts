@@ -11,18 +11,38 @@ import { isLidUser } from 'baileys';
  * conversations — replies land in one and outgoing messages in the other,
  * which reads exactly like "messages are not arriving".
  *
- * Mappings come from three places, all of them free:
+ * Mappings come from two places, and both of them describe a conversation the
+ * panel is actually part of:
  *
  * 1. `key.senderPn` / `key.participantPn`, which Baileys fills from the
- *    `sender_pn` / `participant_pn` stanza attributes;
- * 2. `contacts.upsert` / `contacts.update`, whose `Contact` carries both
- *    `lid` and `jid`;
- * 3. `onWhatsApp()`, which returns `{ jid, exists, lid }`.
+ *    `sender_pn` / `participant_pn` attributes of the stanza that just
+ *    arrived;
+ * 2. `onWhatsApp()`, which returns `{ jid, exists, lid }` for a number the
+ *    panel deliberately asked about.
+ *
+ * The account's contact list is deliberately NOT one of them. It used to be:
+ * the adapter listened to `contacts.upsert`, which delivers the whole address
+ * book in one event, and stored a pair for every contact - including people
+ * the panel had never exchanged a message with. That is third-party personal
+ * data the product has no use for, and collecting it is the kind of behaviour
+ * WhatsApp suspends accounts over. Learning from the conversation's own stanza
+ * covers every case the directory exists for.
  *
  * The map is per-instance and in memory: it is a cache, not a source of
  * truth, and a cold start simply relearns from the first message of each
- * conversation.
+ * conversation. It is capped ({@link MAX_PARES}) because the process is
+ * long-lived and a campaign talks to a lot of numbers.
  */
+/**
+ * Teto de pares guardados.
+ *
+ * Sem ele, uma campanha para dezenas de milhares de empresas deixaria um par
+ * por numero contatado vivo para sempre. Cheio, o diretorio e esvaziado: a
+ * equivalencia e reaprendida no proximo stanza daquela conversa, e o pior
+ * efeito possivel e uma conversa aparecer separada por um instante.
+ */
+const MAX_PARES = 20_000;
+
 export class LidDirectory {
     private readonly lidToPn = new Map<string, string>();
     private readonly pnToLid = new Map<string, string>();
@@ -35,6 +55,10 @@ export class LidDirectory {
         const l = bare(lid);
         const p = bare(pn);
         if (!l || !p || isLidUser(l) !== true || isLidUser(p) === true) return;
+        if (this.lidToPn.size >= MAX_PARES) {
+            this.lidToPn.clear();
+            this.pnToLid.clear();
+        }
         this.lidToPn.set(l, p);
         this.pnToLid.set(p, l);
     }

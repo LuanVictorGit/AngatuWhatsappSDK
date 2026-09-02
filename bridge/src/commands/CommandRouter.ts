@@ -264,6 +264,11 @@ export const handlers: Record<string, Handler> = {
         return instance.adapter.getContact(requireString(payload, 'jid'));
     },
 
+    async get_profile_picture(instances, instanceId, payload) {
+        const instance = instances.get(requireInstanceId(instanceId));
+        return instance.adapter.getProfilePicture(requireString(payload, 'jid'));
+    },
+
     async get_group_metadata(instances, instanceId, payload) {
         const instance = instances.get(requireInstanceId(instanceId));
         return instance.adapter.getGroupMetadata(requireString(payload, 'groupJid'));
