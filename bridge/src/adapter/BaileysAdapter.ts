@@ -857,8 +857,18 @@ export class BaileysAdapter {
     private async send(to: string, content: AnyMessageContent, quotedMessageId?: string): Promise<string> {
         const socket = this.requireSocket();
         const quoted = this.resolveQuoted(to, quotedMessageId);
+        let timer: NodeJS.Timeout | undefined;
         try {
-            const result = await socket.sendMessage(to, content, { quoted });
+            const timeoutPromise = new Promise<never>((_, reject) => {
+                timer = setTimeout(() => {
+                    reject(new BridgeCommandError(ErrorCode.TIMEOUT, 'Tempo limite esgotado ao enviar mensagem pelo Baileys (100s)'));
+                }, 100_000);
+                timer.unref?.();
+            });
+            const result = await Promise.race([
+                socket.sendMessage(to, content, { quoted }),
+                timeoutPromise
+            ]);
             if (!result?.key.id) {
                 throw new BridgeCommandError(ErrorCode.SEND_FAILED, 'Baileys nao retornou um id de mensagem');
             }
@@ -871,6 +881,8 @@ export class BaileysAdapter {
         } catch (err) {
             if (err instanceof BridgeCommandError) throw err;
             throw new BridgeCommandError(ErrorCode.SEND_FAILED, (err as Error).message);
+        } finally {
+            if (timer) clearTimeout(timer);
         }
     }
 

@@ -59,7 +59,7 @@ public final class BridgeConnection {
     private static final Logger log = LoggerFactory.getLogger(BridgeConnection.class);
 
     private static final Duration DEFAULT_HEARTBEAT_INTERVAL = Duration.ofSeconds(20);
-    private static final Duration DEFAULT_REQUEST_TIMEOUT = Duration.ofSeconds(30);
+    private static final Duration DEFAULT_REQUEST_TIMEOUT = Duration.ofSeconds(60);
     private static final int CLOSE_NORMAL = 1000;
     private static final int CLOSE_HEARTBEAT_TIMEOUT = 4900;
 

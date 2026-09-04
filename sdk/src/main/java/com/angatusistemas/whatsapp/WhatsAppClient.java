@@ -86,6 +86,7 @@ public final class WhatsAppClient implements AutoCloseable {
     private static final Duration DEFAULT_MIN_RECONNECT_DELAY = Duration.ofSeconds(1);
     private static final Duration DEFAULT_MAX_RECONNECT_DELAY = Duration.ofSeconds(30);
     private static final int DEFAULT_MAX_RECONNECT_ATTEMPTS = 10;
+    private static final Duration SEND_REQUEST_TIMEOUT = Duration.ofSeconds(120);
 
     private final String instanceId;
     private final Path sessionDirectory;
@@ -293,7 +294,7 @@ public final class WhatsAppClient implements AutoCloseable {
         payload.put("to", Objects.requireNonNull(to, "to"));
         payload.put("text", Objects.requireNonNull(text, "text"));
         putIfPresent(payload, "quotedMessageId", quotedMessageId);
-        return connection().sendRequest("send_text", instanceId, payload).thenApply(WhatsAppClient::extractMessageId);
+        return connection().sendRequest("send_text", instanceId, payload, SEND_REQUEST_TIMEOUT).thenApply(WhatsAppClient::extractMessageId);
     }
 
     public CompletableFuture<String> sendImage(SendImageRequest request) {
@@ -302,7 +303,7 @@ public final class WhatsAppClient implements AutoCloseable {
         payload.put("filePath", request.filePath());
         putIfPresent(payload, "caption", request.caption());
         putIfPresent(payload, "quotedMessageId", request.quotedMessageId());
-        return connection().sendRequest("send_image", instanceId, payload).thenApply(WhatsAppClient::extractMessageId);
+        return connection().sendRequest("send_image", instanceId, payload, SEND_REQUEST_TIMEOUT).thenApply(WhatsAppClient::extractMessageId);
     }
 
     public CompletableFuture<String> sendVideo(SendVideoRequest request) {
@@ -312,7 +313,7 @@ public final class WhatsAppClient implements AutoCloseable {
         putIfPresent(payload, "caption", request.caption());
         payload.put("gifPlayback", request.gifPlayback());
         putIfPresent(payload, "quotedMessageId", request.quotedMessageId());
-        return connection().sendRequest("send_video", instanceId, payload).thenApply(WhatsAppClient::extractMessageId);
+        return connection().sendRequest("send_video", instanceId, payload, SEND_REQUEST_TIMEOUT).thenApply(WhatsAppClient::extractMessageId);
     }
 
     public CompletableFuture<String> sendAudio(SendAudioRequest request) {
@@ -321,7 +322,7 @@ public final class WhatsAppClient implements AutoCloseable {
         payload.put("filePath", request.filePath());
         payload.put("ptt", request.ptt());
         putIfPresent(payload, "quotedMessageId", request.quotedMessageId());
-        return connection().sendRequest("send_audio", instanceId, payload).thenApply(WhatsAppClient::extractMessageId);
+        return connection().sendRequest("send_audio", instanceId, payload, SEND_REQUEST_TIMEOUT).thenApply(WhatsAppClient::extractMessageId);
     }
 
     public CompletableFuture<String> sendDocument(SendDocumentRequest request) {
@@ -332,7 +333,7 @@ public final class WhatsAppClient implements AutoCloseable {
         payload.put("mimetype", request.mimetype());
         putIfPresent(payload, "caption", request.caption());
         putIfPresent(payload, "quotedMessageId", request.quotedMessageId());
-        return connection().sendRequest("send_document", instanceId, payload).thenApply(WhatsAppClient::extractMessageId);
+        return connection().sendRequest("send_document", instanceId, payload, SEND_REQUEST_TIMEOUT).thenApply(WhatsAppClient::extractMessageId);
     }
 
     public CompletableFuture<String> sendSticker(SendStickerRequest request) {
@@ -340,7 +341,7 @@ public final class WhatsAppClient implements AutoCloseable {
         payload.put("to", request.to());
         payload.put("filePath", request.filePath());
         putIfPresent(payload, "quotedMessageId", request.quotedMessageId());
-        return connection().sendRequest("send_sticker", instanceId, payload).thenApply(WhatsAppClient::extractMessageId);
+        return connection().sendRequest("send_sticker", instanceId, payload, SEND_REQUEST_TIMEOUT).thenApply(WhatsAppClient::extractMessageId);
     }
 
     public CompletableFuture<String> sendLocation(SendLocationRequest request) {
@@ -351,7 +352,7 @@ public final class WhatsAppClient implements AutoCloseable {
         putIfPresent(payload, "name", request.name());
         putIfPresent(payload, "address", request.address());
         putIfPresent(payload, "quotedMessageId", request.quotedMessageId());
-        return connection().sendRequest("send_location", instanceId, payload).thenApply(WhatsAppClient::extractMessageId);
+        return connection().sendRequest("send_location", instanceId, payload, SEND_REQUEST_TIMEOUT).thenApply(WhatsAppClient::extractMessageId);
     }
 
     public CompletableFuture<String> sendContact(SendContactRequest request) {
@@ -361,7 +362,7 @@ public final class WhatsAppClient implements AutoCloseable {
         payload.put("phoneNumber", request.phoneNumber());
         putIfPresent(payload, "organization", request.organization());
         putIfPresent(payload, "quotedMessageId", request.quotedMessageId());
-        return connection().sendRequest("send_contact", instanceId, payload).thenApply(WhatsAppClient::extractMessageId);
+        return connection().sendRequest("send_contact", instanceId, payload, SEND_REQUEST_TIMEOUT).thenApply(WhatsAppClient::extractMessageId);
     }
 
     /**
@@ -382,7 +383,7 @@ public final class WhatsAppClient implements AutoCloseable {
         payload.put("text", request.text());
         payload.put("fromMe", request.fromMe());
         putIfPresent(payload, "participant", request.participant());
-        return connection().sendRequest("edit_message", instanceId, payload).thenApply(WhatsAppClient::extractMessageId);
+        return connection().sendRequest("edit_message", instanceId, payload, SEND_REQUEST_TIMEOUT).thenApply(WhatsAppClient::extractMessageId);
     }
 
     /**
