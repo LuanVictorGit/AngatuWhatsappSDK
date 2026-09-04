@@ -2,6 +2,14 @@ import { childLogger } from './util/logger.js';
 import { readExpectedToken } from './server/AuthToken.js';
 import { BridgeServer } from './server/WebSocketServer.js';
 
+// @ts-expect-error extensao de toJSON para serializacao JSON nativa de BigInt
+if (!BigInt.prototype.toJSON) {
+    // @ts-expect-error extensao de toJSON para serializacao JSON nativa de BigInt
+    BigInt.prototype.toJSON = function () {
+        return this.toString();
+    };
+}
+
 const bridgeVersion = typeof __BRIDGE_VERSION__ !== 'undefined' ? __BRIDGE_VERSION__ : 'dev';
 const baileysVersion = typeof __BAILEYS_VERSION__ !== 'undefined' ? __BAILEYS_VERSION__ : 'dev';
 

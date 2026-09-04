@@ -20,6 +20,14 @@ import { toAbstractMessage, type AbstractMessage } from './MessageMapper.js';
 import { BridgeCommandError, ErrorCode } from '../protocol/errors.js';
 import * as Content from './ContentBuilder.js';
 
+// @ts-expect-error extensao de toJSON para serializacao JSON nativa de BigInt
+if (!BigInt.prototype.toJSON) {
+    // @ts-expect-error extensao de toJSON para serializacao JSON nativa de BigInt
+    BigInt.prototype.toJSON = function () {
+        return this.toString();
+    };
+}
+
 export type ConnectionStateName =
     | 'DISCONNECTED'
     | 'CONNECTING'
@@ -332,6 +340,19 @@ export class BaileysAdapter {
 
         const { state, saveCreds } = await useMultiFileAuthState(this.options.sessionDirectory);
 
+        const rawKeysSet = state.keys.set;
+        state.keys.set = async (data) => {
+            try {
+                await rawKeysSet(data);
+            } catch (err) {
+                this.logger.error(
+                    { err, categories: Object.keys(data) },
+                    'falha ao persistir mutacoes/chaves de autenticacao do Baileys no disco'
+                );
+                throw err;
+            }
+        };
+
         // Perguntada ao WhatsApp, nao lida da constante do pacote: cliente
         // velho tem o pareamento recusado pelo servidor. Ver WaVersion.ts.
         // `null` = nao deu para descobrir; a chave e OMITIDA para o Baileys usar
@@ -354,6 +375,10 @@ export class BaileysAdapter {
             keepAliveIntervalMs: KEEP_ALIVE_MS,
             connectTimeoutMs: CONNECT_TIMEOUT_MS,
             defaultQueryTimeoutMs: QUERY_TIMEOUT_MS,
+            transactionOpts: {
+                maxCommitRetries: 5,
+                delayBetweenTriesMs: 500
+            },
 
             // ---- ACESSO MINIMO: o que este cliente NAO pede ao WhatsApp ----
             //
