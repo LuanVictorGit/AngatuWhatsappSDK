@@ -115,6 +115,7 @@ public final class WhatsAppClient implements AutoCloseable {
     private final String nodeVersion;
     private final String bridgeHost;
     private final Integer bridgePort;
+    private final String logLevel;
 
     private final List<MessageListener> messageListeners = new CopyOnWriteArrayList<>();
     private final List<MessageUpdatedListener> messageUpdatedListeners = new CopyOnWriteArrayList<>();
@@ -157,6 +158,7 @@ public final class WhatsAppClient implements AutoCloseable {
         this.nodeVersion = builder.nodeVersion;
         this.bridgeHost = builder.bridgeHost;
         this.bridgePort = builder.bridgePort;
+        this.logLevel = builder.logLevel;
         this.pacer = new SendPacer(instanceId, new PacerBackendImpl(),
                 builder.pacing != null ? builder.pacing : PacingOptions.padrao(),
                 builder.humanization != null ? builder.humanization : HumanizationOptions.padrao());
@@ -809,7 +811,7 @@ public final class WhatsAppClient implements AutoCloseable {
         BridgeProcessManager newProcessManager;
         try {
             newProcessManager = BridgeProcessManager.start(
-                    new BridgeProcessManager.StartOptions(bridgeHost, bridgePort, null, nodeVersion));
+                    new BridgeProcessManager.StartOptions(bridgeHost, bridgePort, logLevel, nodeVersion));
         } catch (RuntimeException e) {
             return CompletableFuture.failedFuture(e);
         }
@@ -1169,6 +1171,7 @@ public final class WhatsAppClient implements AutoCloseable {
         private Integer maxReconnectAttempts;
         private PacingOptions pacing;
         private HumanizationOptions humanization;
+        private String logLevel;
         private Duration reconnectCooldown;
         /** Distingue "nao configurado" de "configurado como null" (= desistir de vez). */
         private boolean reconnectCooldownSet;
@@ -1231,6 +1234,23 @@ public final class WhatsAppClient implements AutoCloseable {
          * @param pacing ritmo desejado, ou {@code null} para o padrao
          * @return este builder
          */
+        /**
+         * Nivel de log do processo bridge: {@code trace}, {@code debug},
+         * {@code info} (padrao), {@code warn}, {@code error} ou {@code fatal}.
+         *
+         * <p>Existia como variavel de ambiente ({@code ANGATU_BRIDGE_LOG_LEVEL})
+         * mas era inalcancavel pela API — o valor era passado sempre como
+         * {@code null} ao iniciar o processo. Em {@code debug} saem tambem as
+         * repeticoes de ruido de protocolo que o nivel padrao resume.
+         *
+         * @param logLevel nivel do pino no bridge, ou {@code null} para o padrao
+         * @return este builder
+         */
+        public Builder logLevel(String logLevel) {
+            this.logLevel = logLevel;
+            return this;
+        }
+
         public Builder pacing(PacingOptions pacing) {
             this.pacing = pacing;
             return this;

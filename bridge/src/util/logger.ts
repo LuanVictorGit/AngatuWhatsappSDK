@@ -73,6 +73,40 @@ const RUIDO_DO_PROTOCOLO: ReadonlyArray<{ trecho: string; explicacao: string }> 
 const MOSTRA_TUDO = level === 'debug' || level === 'trace';
 
 /**
+ * Quantas vezes cada ruido de protocolo apareceu, por instancia.
+ *
+ * <p><b>Por que contar o que se resolveu esconder.</b> Silenciar as repeticoes
+ * resolveu o log, mas apagou um sinal: uma <i>escalada</i> de falhas de decrypt
+ * e o aviso precoce de que a sessao Signal esta se degradando — e, se o numero
+ * passa a pedir reenvio o tempo todo, isso conta contra a reputacao dele. Sem
+ * contador, essa escalada ficava invisivel no nivel padrao. O log continua
+ * limpo; o numero fica disponivel em `get_status`.
+ */
+const contadoresDeRuido = new Map<string, Map<string, number>>();
+
+/**
+ * Quantas vezes cada ruido de protocolo apareceu numa instancia.
+ *
+ * @param instanceId instancia
+ * @return mapa trecho -> contagem (vazio se nada aconteceu)
+ */
+export function ruidoDoProtocolo(instanceId: string): Record<string, number> {
+    const contagens = contadoresDeRuido.get(instanceId);
+    return contagens ? Object.fromEntries(contagens) : {};
+}
+
+function contarRuido(instanceId: string, trecho: string): number {
+    let contagens = contadoresDeRuido.get(instanceId);
+    if (!contagens) {
+        contagens = new Map();
+        contadoresDeRuido.set(instanceId, contagens);
+    }
+    const total = (contagens.get(trecho) ?? 0) + 1;
+    contagens.set(trecho, total);
+    return total;
+}
+
+/**
  * Logger entregue ao Baileys, com o ruido de protocolo resumido.
  *
  * Instancia separada (e nao um child do rootLogger) porque o filtro vive no
@@ -106,11 +140,20 @@ export function loggerDoBaileys(instanceId: string) {
                     method.apply(this, args);
                     return;
                 }
+                const total = contarRuido(instanceId, ruido.trecho);
                 if (!jaExplicado.has(ruido.trecho)) {
                     jaExplicado.add(ruido.trecho);
                     method.apply(this, [ruido.explicacao]);
                 }
-                // Repeticoes: descartadas neste nivel.
+                // Repeticoes: descartadas do log, mas contadas. Uma escalada
+                // dessas e o aviso precoce de sessao Signal degradando, e sem
+                // marco nenhum ela passaria despercebida ate o numero cair.
+                else if (total % 500 === 0) {
+                    method.apply(this, [
+                        { ocorrencias: total, trecho: ruido.trecho },
+                        'ruido de protocolo se repetindo muito - confira get_status se o numero estiver instavel'
+                    ] as never);
+                }
             }
         }
     }).child({ instanceId, componente: 'baileys' });

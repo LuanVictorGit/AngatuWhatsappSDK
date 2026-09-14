@@ -11,7 +11,7 @@ import makeWASocket, {
     type BaileysEventMap
 } from 'baileys';
 import { Boom } from '@hapi/boom';
-import { loggerDoBaileys, type Logger } from '../util/logger.js';
+import { loggerDoBaileys, ruidoDoProtocolo, type Logger } from '../util/logger.js';
 import { useDurableAuthState, limparCredenciais } from './AuthState.js';
 import { ReadBudget } from './ReadBudget.js';
 import { MessageCache } from './MessageCache.js';
@@ -197,6 +197,34 @@ const MAX_GRUPOS_EM_CACHE = 500;
 const MANUTENCAO_CACHE_MS = 30 * 60_000;
 
 /**
+ * Versao informada no identificador do cliente.
+ *
+ * <p>Era `'1.0.0'`, que nao existe como versao de Chrome nenhuma — e o
+ * identificador do cliente e um dos dados que o servidor ve em toda conexao.
+ * Nao se ganha nada declarando um numero impossivel: o que se quer aqui e nao
+ * destoar, e o proprio Baileys usa uma versao plausivel nos helpers dele. O
+ * campo anterior da tupla continua sendo o `displayName` da aplicacao, que e o
+ * que aparece em "Aparelhos conectados" e por onde o operador reconhece a
+ * sessao.
+ */
+const VERSAO_DO_NAVEGADOR = '131.0.6778.85';
+
+/**
+ * Esconde o miolo de um telefone, deixando so os quatro ultimos digitos.
+ *
+ * <p>O numero inteiro saia em nivel `info` no pareamento. Log de aplicacao
+ * costuma ir para agregador, e telefone e dado pessoal: quatro digitos bastam
+ * para conferir qual conta esta sendo conectada.
+ */
+function mascarar(numero: string | null | undefined): string {
+    const digitos = (numero ?? '').replace(/[^0-9]/g, '');
+    if (digitos.length <= 4) {
+        return digitos.length === 0 ? '(vazio)' : '*'.repeat(digitos.length);
+    }
+    return '*'.repeat(digitos.length - 4) + digitos.slice(-4);
+}
+
+/**
  * Codigos em que o WhatsApp deu a credencial por invalida, e guardar o disco
  * so faria a reconexao repetir a mesma recusa para sempre.
  *
@@ -377,6 +405,23 @@ export class BaileysAdapter {
         return this.socket?.user?.id ?? null;
     }
 
+    /**
+     * Quantas vezes cada ruido de protocolo apareceu nesta instancia.
+     *
+     * <p>O log resume as repeticoes para nao enterrar o resto, entao sem este
+     * contador uma <i>escalada</i> de falhas de decrypt — o aviso precoce de que
+     * a sessao Signal esta degradando, e de que o numero esta pedindo reenvio
+     * demais — ficaria invisivel no nivel padrao.
+     */
+    protocolNoise(): Record<string, number> {
+        return ruidoDoProtocolo(this.options.instanceId);
+    }
+
+    /** Quantas consultas ao WhatsApp ainda cabem neste minuto. */
+    readBudgetRemaining(): number {
+        return this.leituras.disponiveis;
+    }
+
     async connect(): Promise<void> {
         this.closedByUser = false;
         // Ja conectado ou conectando: NAO abre outro socket.
@@ -465,7 +510,7 @@ export class BaileysAdapter {
             auth: state,
             ...(version ? { version } : {}),
             logger: this.loggerBaileys as never,
-            browser: [this.options.displayName, 'Chrome', '1.0.0'],
+            browser: [this.options.displayName, 'Chrome', VERSAO_DO_NAVEGADOR],
             markOnlineOnConnect: this.options.markOnlineOnConnect,
             keepAliveIntervalMs: KEEP_ALIVE_MS,
             connectTimeoutMs: CONNECT_TIMEOUT_MS,
@@ -901,7 +946,7 @@ export class BaileysAdapter {
         const code = await this.socket.requestPairingCode(numero);
         this.pareamento = { numero, codigo: code };
         this.pareamentoRegistradoEm = this.socket;
-        this.logger.info({ numero }, 'codigo de pareamento gerado');
+        this.logger.info({ numero: mascarar(numero) }, 'codigo de pareamento gerado');
         this.callbacks.onPairingCode(code);
         return code;
     }
@@ -927,7 +972,7 @@ export class BaileysAdapter {
         this.setState('PAIRING_CODE_PENDING', null, null);
         socket
             .requestPairingCode(p.numero, p.codigo)
-            .then(() => this.logger.info({ numero: p.numero }, 'codigo de pareamento revalidado apos reconexao'))
+            .then(() => this.logger.info({ numero: mascarar(p.numero) }, 'codigo de pareamento revalidado apos reconexao'))
             .catch((err) => {
                 this.pareamentoRegistradoEm = null;
                 this.logger.warn({ err }, 'nao consegui revalidar o codigo de pareamento; tentando na proxima reconexao');

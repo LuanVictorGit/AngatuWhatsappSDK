@@ -102,7 +102,12 @@ export const handlers: Record<string, Handler> = {
             state: instance.adapter.getState(),
             userId: instance.adapter.getUserId(),
             sessionDirectory: instance.sessionDirectory,
-            createdAt: instance.createdAt
+            createdAt: instance.createdAt,
+            // Saude do protocolo: o log resume as repeticoes de falha de
+            // decrypt para nao enterrar o resto, entao a escalada dessas falhas
+            // - que e o aviso precoce de sessao degradando - so aparece aqui.
+            protocolNoise: instance.adapter.protocolNoise(),
+            readBudgetRemaining: instance.adapter.readBudgetRemaining()
         };
     },
 
