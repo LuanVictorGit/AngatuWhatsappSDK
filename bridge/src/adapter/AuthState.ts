@@ -1,4 +1,4 @@
-import { open, mkdir, readFile, readdir, rename, unlink, stat } from 'node:fs/promises';
+import { open, mkdir, readFile, readdir, rename, rm, unlink, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
     initAuthCreds,
@@ -216,8 +216,14 @@ export async function limparCredenciais(folder: string, logger: Logger): Promise
         if (NAO_E_CREDENCIAL.has(nome)) {
             continue;
         }
+        const caminho = join(folder, nome);
         try {
-            await unlink(join(folder, nome));
+            // `recursive` porque o diretorio de sessao tambem guarda a pasta
+            // `sent-messages` (as mensagens que enviamos, para atender pedido de
+            // reenvio). Elas sao conteudo de uma sessao que esta sendo
+            // descartada: deixa-las para tras guardaria mensagem de uma conta
+            // que nao esta mais conectada.
+            await rm(caminho, { recursive: true, force: true });
             apagados++;
         } catch (err) {
             logger.warn({ err, arquivo: nome }, 'nao foi possivel apagar um arquivo de credencial');

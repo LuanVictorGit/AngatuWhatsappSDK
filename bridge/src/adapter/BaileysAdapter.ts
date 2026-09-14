@@ -1,3 +1,4 @@
+import { join } from 'node:path';
 import makeWASocket, {
     DisconnectReason,
     downloadMediaMessage,
@@ -12,6 +13,7 @@ import makeWASocket, {
 import { Boom } from '@hapi/boom';
 import { loggerDoBaileys, type Logger } from '../util/logger.js';
 import { useDurableAuthState, limparCredenciais } from './AuthState.js';
+import { ReadBudget } from './ReadBudget.js';
 import { MessageCache } from './MessageCache.js';
 import { LidDirectory } from './LidDirectory.js';
 import { resolverVersaoWhatsApp } from './WaVersion.js';
@@ -159,6 +161,41 @@ const MAX_RECONEXOES_IMEDIATAS = 3;
  */
 const RECONEXAO_APOS_SUBSTITUICAO_MS = 5 * 60_000;
 
+/** Validade de um "este numero existe" em cache. */
+const CACHE_NUMERO_OK_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Validade de um "este numero nao existe".
+ *
+ * Menor que a do positivo de proposito: um numero recem-criado no WhatsApp nao
+ * pode ficar marcado como inexistente pelo resto do dia.
+ */
+const CACHE_NUMERO_NAO_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * Teto do cache de numeros ja consultados.
+ *
+ * Sem teto, o mapa guardava uma entrada por telefone ja perguntado e nunca
+ * soltava nenhuma — uma campanha para uma base grande enchia a memoria de
+ * respostas vencidas num processo que fica meses no ar.
+ */
+const MAX_NUMEROS_EM_CACHE = 50_000;
+
+/**
+ * Validade do metadata de um grupo em cache.
+ *
+ * Curto: participante entra e sai de grupo, e cifrar para uma lista velha faz
+ * a mensagem nao chegar a quem entrou depois. Cinco minutos cobre a rajada de
+ * envios de um disparo sem envelhecer a lista.
+ */
+const CACHE_GRUPO_MS = 5 * 60_000;
+
+/** Teto do cache de grupos. */
+const MAX_GRUPOS_EM_CACHE = 500;
+
+/** De quanto em quanto tempo o cache de mensagens e varrido. */
+const MANUTENCAO_CACHE_MS = 30 * 60_000;
+
 /**
  * Codigos em que o WhatsApp deu a credencial por invalida, e guardar o disco
  * so faria a reconexao repetir a mesma recusa para sempre.
@@ -200,6 +237,12 @@ export class BaileysAdapter {
     private reconnectAttempts = 0;
     /** Reconexoes "na hora" (515) seguidas, para o caminho imediato ter teto. */
     private reconexoesImediatas = 0;
+    /** Teto de consultas por minuto: e leitura em rajada que suspende conta. */
+    private readonly leituras = new ReadBudget();
+    /** Respostas de "este numero tem WhatsApp?", com prazo de validade. */
+    private readonly numerosVerificados = new Map<string, { jid: string; exists: boolean; ateMs: number }>();
+    /** Metadata de grupo em cache, servindo tambem ao `cachedGroupMetadata` do Baileys. */
+    private readonly gruposEmCache = new Map<string, { metadata: GroupMetadata; ateMs: number }>();
     private reconnectTimer: NodeJS.Timeout | null = null;
     /**
      * Which deliberate local action (if any) is in flight. Not a plain boolean:
@@ -259,7 +302,9 @@ export class BaileysAdapter {
      */
     private readonly loggerBaileys: Logger;
 
-    private readonly messageCache = new MessageCache();
+    private readonly messageCache: MessageCache;
+    /** Faxina periodica do cache em memoria e do que esta em disco. */
+    private manutencaoTimer: NodeJS.Timeout | null = null;
 
     /** Traducao LID -> telefone; ver LidDirectory para o porque. */
     private readonly lids = new LidDirectory();
@@ -309,6 +354,15 @@ export class BaileysAdapter {
         private readonly callbacks: BaileysAdapterCallbacks
     ) {
         this.loggerBaileys = loggerDoBaileys(options.instanceId);
+        // As mensagens que enviamos vao para o disco, dentro do proprio
+        // diretorio de sessao: e o que permite atender um pedido de reenvio
+        // feito depois de um restart.
+        this.messageCache = new MessageCache(2000, 60 * 60 * 1000,
+            join(options.sessionDirectory, 'sent-messages'));
+        // sweepExpired existia mas nunca era chamado: nada saia do cache a nao
+        // ser por excesso de tamanho.
+        this.manutencaoTimer = setInterval(() => this.messageCache.manutencao(), MANUTENCAO_CACHE_MS);
+        this.manutencaoTimer.unref?.();
     }
 
     getState(): ConnectionStateName {
@@ -431,6 +485,14 @@ export class BaileysAdapter {
             // painel NAO importa conversa antiga do celular. O historico dele
             // comeca no momento em que a sessao conecta, e e so isso que ele
             // exibe.
+            // Sem isto o Baileys pede o metadata do grupo A CADA envio para
+            // grupo, e cada pedido traz numero e nome de todos os
+            // participantes. Tres mensagens seguidas ao mesmo grupo custavam
+            // tres varreduras da lista de membros.
+            cachedGroupMetadata: async (jid) => {
+                const emCache = this.gruposEmCache.get(jid);
+                return emCache && Date.now() < emCache.ateMs ? emCache.metadata : undefined;
+            },
             syncFullHistory: false,
             shouldSyncHistoryMessage: () => false,
 
@@ -1271,8 +1333,71 @@ export class BaileysAdapter {
         };
     }
 
+    /**
+     * Se um numero tem conta no WhatsApp — <b>uma</b> consulta, nao tres.
+     *
+     * <p>E a alternativa barata ao {@link #getContact}, que dispara
+     * `onWhatsApp` + `profilePictureUrl` + `fetchStatus` por chamada. Quem so
+     * quer saber se vale a pena enviar (o caso comum antes de um disparo) nao
+     * tem por que ler a foto e o recado pessoal de alguem — e foi exatamente
+     * esse excesso que fez uma conta ser suspensa por coleta.
+     *
+     * <p>Com cache: uma resposta positiva vale 24h, uma negativa 6h. O prazo
+     * menor no negativo e para um numero recem-criado nao ficar marcado como
+     * inexistente o dia todo. O cache tambem e protecao: repetir a mesma
+     * pergunta sobre o mesmo numero e, por si so, um padrao de sondagem.
+     */
+    async checkNumber(numero: string): Promise<{ jid: string; exists: boolean; cached: boolean }> {
+        const agora = Date.now();
+        const emCache = this.numerosVerificados.get(numero);
+        if (emCache && agora < emCache.ateMs) {
+            return { jid: emCache.jid, exists: emCache.exists, cached: true };
+        }
+
+        const socket = this.requireSocket();
+        this.leituras.consumir('check_number');
+        const resultados = await socket.onWhatsApp(numero);
+        const primeiro = resultados?.[0];
+        const exists = primeiro?.exists != null && primeiro.exists !== false;
+        // O JID vem do proprio WhatsApp: e ele quem sabe se a conta e a com ou
+        // a sem o nono digito.
+        const jid = primeiro?.jid ?? numero;
+        this.lids.remember((primeiro as { lid?: string } | undefined)?.lid, jid);
+
+        this.guardarNumero(numero, {
+            jid,
+            exists,
+            ateMs: agora + (exists ? CACHE_NUMERO_OK_MS : CACHE_NUMERO_NAO_MS)
+        });
+        return { jid, exists, cached: false };
+    }
+
+    /** Guarda a resposta sobre um numero, mantendo o cache limitado. */
+    private guardarNumero(numero: string, entrada: { jid: string; exists: boolean; ateMs: number }): void {
+        if (this.numerosVerificados.size >= MAX_NUMEROS_EM_CACHE) {
+            const agora = Date.now();
+            for (const [chave, valor] of this.numerosVerificados) {
+                if (agora >= valor.ateMs) {
+                    this.numerosVerificados.delete(chave);
+                }
+            }
+            // Ainda cheio depois da faxina (campanha grande em poucas horas):
+            // esvaziar custa consultas repetidas; nao esvaziar custava memoria
+            // que so sobe num processo que fica meses no ar.
+            if (this.numerosVerificados.size >= MAX_NUMEROS_EM_CACHE) {
+                this.numerosVerificados.clear();
+                this.logger.info('cache de numeros verificados esvaziado para nao crescer sem limite');
+            }
+        }
+        this.numerosVerificados.set(numero, entrada);
+    }
+
     async getContact(jid: string): Promise<{ jid: string; name: string | null; status: string | null; profilePictureUrl: string | null; onWhatsApp: boolean }> {
         const socket = this.requireSocket();
+        // Tres consultas num unico metodo: cobra as tres do orcamento.
+        this.leituras.consumir('get_contact');
+        this.leituras.consumir('get_contact');
+        this.leituras.consumir('get_contact');
         const results = await socket.onWhatsApp(jid);
         const exists = results?.[0]?.exists != null && results[0].exists !== false;
         const resolvedJid = results?.[0]?.jid ?? jid;
@@ -1317,6 +1442,7 @@ export class BaileysAdapter {
      */
     async getProfilePicture(jid: string): Promise<{ jid: string; profilePictureUrl: string | null }> {
         const socket = this.requireSocket();
+        this.leituras.consumir('get_profile_picture');
         try {
             const url = (await socket.profilePictureUrl(jid, 'image')) ?? null;
             return { jid, profilePictureUrl: url };
@@ -1325,13 +1451,50 @@ export class BaileysAdapter {
         }
     }
 
-    getGroupMetadata(jid: string): Promise<GroupMetadata> {
-        return this.requireSocket().groupMetadata(jid);
+    /**
+     * Metadados de um grupo, com cache curto.
+     *
+     * <p>O cache serve a dois clientes: quem chama isto direto e o proprio
+     * Baileys, que consulta o metadata do grupo <b>a cada envio</b> para saber
+     * para quem cifrar. Sem o cache, mandar tres mensagens seguidas ao mesmo
+     * grupo custava tres consultas — e cada uma traz numero e nome de TODOS os
+     * participantes.
+     */
+    async getGroupMetadata(jid: string): Promise<GroupMetadata> {
+        const agora = Date.now();
+        const emCache = this.gruposEmCache.get(jid);
+        if (emCache && agora < emCache.ateMs) {
+            return emCache.metadata;
+        }
+        this.leituras.consumir('get_group_metadata');
+        const metadata = await this.requireSocket().groupMetadata(jid);
+        this.guardarGrupo(jid, metadata);
+        return metadata;
+    }
+
+    private guardarGrupo(jid: string, metadata: GroupMetadata): void {
+        if (this.gruposEmCache.size >= MAX_GRUPOS_EM_CACHE) {
+            const maisAntigo = this.gruposEmCache.keys().next().value;
+            if (maisAntigo !== undefined) {
+                this.gruposEmCache.delete(maisAntigo);
+            }
+        }
+        this.gruposEmCache.set(jid, { metadata, ateMs: Date.now() + CACHE_GRUPO_MS });
     }
 
     async listGroups(): Promise<GroupMetadata[]> {
+        // Uma so chamada, mas ela traz TODOS os grupos com TODOS os
+        // participantes: pesa como varias consultas, e e por isso que custa
+        // caro no orcamento.
+        this.leituras.consumir('list_groups');
         const map = await this.requireSocket().groupFetchAllParticipating();
-        return Object.values(map);
+        const grupos = Object.values(map);
+        // Ja que vieram, aproveita: sem isto, o primeiro envio para cada um
+        // desses grupos pediria o metadata de novo.
+        for (const g of grupos) {
+            this.guardarGrupo(g.id, g);
+        }
+        return grupos;
     }
 
     createGroup(subject: string, participants: string[]): Promise<GroupMetadata> {

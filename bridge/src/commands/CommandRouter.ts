@@ -271,6 +271,11 @@ export const handlers: Record<string, Handler> = {
         return instance.adapter.getMe();
     },
 
+    async check_number(instances, instanceId, payload) {
+        const instance = instances.get(requireInstanceId(instanceId));
+        return instance.adapter.checkNumber(requireString(payload, 'number'));
+    },
+
     async get_contact(instances, instanceId, payload) {
         const instance = instances.get(requireInstanceId(instanceId));
         return instance.adapter.getContact(requireString(payload, 'jid'));

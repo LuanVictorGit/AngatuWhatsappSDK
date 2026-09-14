@@ -18,6 +18,7 @@ import com.angatusistemas.whatsapp.model.Contact;
 import com.angatusistemas.whatsapp.model.Group;
 import com.angatusistemas.whatsapp.model.MediaContent;
 import com.angatusistemas.whatsapp.model.Message;
+import com.angatusistemas.whatsapp.model.NumberCheck;
 import com.angatusistemas.whatsapp.pacing.HumanizationOptions;
 import com.angatusistemas.whatsapp.pacing.PacingOptions;
 import com.angatusistemas.whatsapp.pacing.QueuedSend;
@@ -657,6 +658,54 @@ public final class WhatsAppClient implements AutoCloseable {
         return connection().sendRequest("get_me", instanceId, JsonNodeFactory.instance.objectNode());
     }
 
+    /**
+     * Se um numero tem conta no WhatsApp — <b>uma</b> consulta, com cache.
+     *
+     * <p>E o que usar antes de enviar para um numero novo. Prefira sempre este
+     * metodo a {@link #getContact(String)}: aquele dispara <b>tres</b> consultas
+     * (existencia, foto e recado pessoal) e so a primeira interessa aqui. Ler
+     * foto e recado de gente com quem nao se esta conversando, em volume, e
+     * exatamente o comportamento que faz o WhatsApp suspender uma conta por
+     * coleta de dados.
+     *
+     * <p>A resposta fica em cache no bridge: 24h para um numero que existe, 6h
+     * para um que nao existe (menor, para um numero recem-criado nao ficar
+     * condenado o dia todo). Repetir a mesma pergunta sobre o mesmo numero
+     * tambem e um padrao de sondagem, entao o cache protege duas vezes.
+     *
+     * <p><b>Envie para o JID que voltar daqui</b>, e nao para o numero que voce
+     * digitou: e o servidor do WhatsApp quem sabe se a conta e a com ou a sem o
+     * nono digito.
+     *
+     * @param number numero em digitos, com DDI (ex.: {@code "5562999998888"})
+     * @return existencia e o JID canonico
+     */
+    public CompletableFuture<NumberCheck> checkNumber(String number) {
+        ObjectNode payload = JsonNodeFactory.instance.objectNode();
+        payload.put("number", Objects.requireNonNull(number, "number"));
+        return connection().sendRequest("check_number", instanceId, payload).thenApply(NumberCheck::fromJson);
+    }
+
+    /**
+     * Contato completo: existencia, foto e recado pessoal.
+     *
+     * <p><b>Custa tres consultas ao WhatsApp por chamada</b> — {@code onWhatsApp},
+     * {@code profilePictureUrl} e {@code fetchStatus} — e por isso pesa tres
+     * vezes no teto de leitura do bridge.
+     *
+     * <p>Foi este metodo, chamado em lista, que fez uma aplicacao ter a conta
+     * suspensa: uma tela pedia o avatar de 200 conversas ao abrir, o que virava
+     * ate 600 consultas em rajada logo apos conectar, sondando existencia de
+     * numero e lendo o recado pessoal de gente com quem ninguem estava
+     * conversando.
+     *
+     * <p>Quase sempre o que se quer e um dos dois metodos baratos:
+     * {@link #checkNumber(String)} (so existencia) ou
+     * {@link #getProfilePicture(String)} (so a foto).
+     *
+     * @param jid contato
+     * @return o contato, com os campos que o WhatsApp devolveu
+     */
     public CompletableFuture<Contact> getContact(String jid) {
         ObjectNode payload = JsonNodeFactory.instance.objectNode();
         payload.put("jid", Objects.requireNonNull(jid, "jid"));
