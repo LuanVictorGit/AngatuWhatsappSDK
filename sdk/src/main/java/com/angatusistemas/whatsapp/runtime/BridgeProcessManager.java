@@ -43,11 +43,23 @@ public final class BridgeProcessManager {
     private static final Duration FORCE_KILL_TIMEOUT = Duration.ofSeconds(10);
     private static final int TOKEN_BYTES = 32;
 
+    /**
+     * Prazo que o hook de desligamento da JVM da ao bridge para morrer.
+     *
+     * <p>Curto de proposito: este codigo roda durante o encerramento da JVM, e
+     * segurar a saida do processo por dez segundos e inaceitavel. O caminho bom
+     * de encerramento continua sendo o {@code shutdown} pelo WebSocket, que o
+     * {@code WhatsAppClient.close()} faz antes; o hook so existe para quando
+     * ninguem chamou {@code close()}.
+     */
+    private static final Duration HOOK_GRACE_PERIOD = Duration.ofSeconds(3);
+
     private final Process process;
     private final NodeExecutable node;
     private final String authToken;
     private final CompletableFuture<Integer> portReady = new CompletableFuture<>();
     private final CompletableFuture<Void> processExited = new CompletableFuture<>();
+    private volatile Thread shutdownHook;
 
     private BridgeProcessManager(Process process, NodeExecutable node, String authToken) {
         this.process = process;
@@ -70,6 +82,57 @@ public final class BridgeProcessManager {
             }
             processExited.complete(null);
         });
+
+        registrarShutdownHook();
+    }
+
+    /**
+     * Garante que o processo do bridge morre junto com a JVM.
+     *
+     * <p><b>Por que isto importa mais do que parece.</b> Um {@link Process} do
+     * Java nao e filho no sentido de morrer junto: se a JVM sai sem chamar
+     * {@code close()} — um {@code System.exit}, uma excecao fatal, um
+     * {@code docker stop} — o processo do bridge FICA, e com ele o socket aberto
+     * no WhatsApp. Quando a aplicacao volta, ela abre um segundo socket na mesma
+     * conta, o servidor derruba um com {@code connectionReplaced}, isso dispara
+     * reconexao, que abre outro socket. Para o WhatsApp e uma conta com varios
+     * clientes web aparecendo e sumindo — a assinatura de automacao que leva a
+     * suspensao.
+     *
+     * <p>O hook nao cobre {@code kill -9} nem queda de energia (nada cobre):
+     * para esses, o bridge se encerra sozinho por ociosidade e a trava de sessao
+     * em disco e reconhecida como orfa pelo processo seguinte.
+     */
+    private void registrarShutdownHook() {
+        Thread hook = new Thread(() -> {
+            if (!process.isAlive()) {
+                return;
+            }
+            log.info("JVM encerrando com o bridge ainda vivo (pid={}) - encerrando o processo", process.pid());
+            // O proprio hook nao pode tentar se desregistrar: a JVM ja esta em
+            // shutdown e removeShutdownHook lanca IllegalStateException.
+            shutdownHook = null;
+            stop(HOOK_GRACE_PERIOD);
+        }, "angatu-bridge-shutdown-" + process.pid());
+        try {
+            Runtime.getRuntime().addShutdownHook(hook);
+            shutdownHook = hook;
+        } catch (IllegalStateException e) {
+            log.debug("JVM ja em encerramento - hook do bridge nao registrado");
+        }
+    }
+
+    private void removerShutdownHook() {
+        Thread hook = shutdownHook;
+        if (hook == null) {
+            return;
+        }
+        shutdownHook = null;
+        try {
+            Runtime.getRuntime().removeShutdownHook(hook);
+        } catch (IllegalStateException e) {
+            // Estamos dentro do encerramento da JVM: o hook ja e irrelevante.
+        }
     }
 
     public static BridgeProcessManager start(StartOptions options) {
@@ -185,6 +248,7 @@ public final class BridgeProcessManager {
      * than the primary shutdown path.
      */
     public boolean stop(Duration gracePeriod) {
+        removerShutdownHook();
         if (!process.isAlive()) {
             return true;
         }

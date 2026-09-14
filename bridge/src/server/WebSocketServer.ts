@@ -13,6 +13,26 @@ const HANDSHAKE_TIMEOUT_MS = 5_000;
 const STALE_CONNECTION_MS = 90_000;
 const REAPER_INTERVAL_MS = 15_000;
 
+/**
+ * Quanto o bridge espera sem NENHUM cliente conectado antes de se encerrar.
+ *
+ * E a rede de seguranca contra o processo orfao: a JVM que subiu este bridge
+ * pode morrer de um `kill -9`, de um OOM ou de um `docker stop` sem executar
+ * nenhum hook, e o processo filho nao morre junto. Um bridge orfao mantem o
+ * socket do WhatsApp aberto, e quando o app volta o segundo socket na mesma
+ * conta faz o servidor derrubar um com `connectionReplaced` — em looping.
+ *
+ * A contagem comeca no boot (cobre a JVM que morreu antes de conectar) e e
+ * cancelada na primeira conexao, recomecando sempre que a ultima cair.
+ * `ANGATU_BRIDGE_IDLE_MS=0` desliga.
+ */
+const IDLE_SHUTDOWN_MS = (() => {
+    const bruto = process.env.ANGATU_BRIDGE_IDLE_MS;
+    if (bruto === undefined) return 120_000;
+    const n = Number.parseInt(bruto, 10);
+    return Number.isFinite(n) && n >= 0 ? n : 120_000;
+})();
+
 interface Connection {
     ws: WebSocket;
     authenticated: boolean;
@@ -31,6 +51,9 @@ export class BridgeServer implements EventSink {
     private readonly reaperTimer: NodeJS.Timeout;
     readonly instanceManager: InstanceManager;
     private closing = false;
+    private idleTimer: NodeJS.Timeout | null = null;
+    /** Chamado quando o bridge se encerra por ociosidade (o index.ts sai do processo). */
+    onIdleShutdown: (() => void) | null = null;
 
     constructor(
         host: string,
@@ -44,6 +67,37 @@ export class BridgeServer implements EventSink {
         this.wss.on('connection', (ws) => this.handleConnection(ws));
         this.wss.on('error', (err) => this.logger.error({ err }, 'websocket server error'));
         this.reaperTimer = setInterval(() => this.reapStaleConnections(), REAPER_INTERVAL_MS);
+        this.agendarOciosidade();
+    }
+
+    /**
+     * (Re)inicia a contagem de ociosidade. Sem cliente nenhum, este processo nao
+     * tem para quem entregar evento — continuar vivo so mantem um socket do
+     * WhatsApp aberto sem dono.
+     */
+    private agendarOciosidade(): void {
+        if (IDLE_SHUTDOWN_MS === 0 || this.closing || this.idleTimer) {
+            return;
+        }
+        this.idleTimer = setTimeout(() => {
+            this.idleTimer = null;
+            if (this.closing || this.connections.size > 0) {
+                return;
+            }
+            this.logger.warn(
+                { idleMs: IDLE_SHUTDOWN_MS },
+                'nenhum cliente conectado ha tempo demais - encerrando o bridge para nao virar processo orfao'
+            );
+            void this.close().finally(() => this.onIdleShutdown?.());
+        }, IDLE_SHUTDOWN_MS);
+        this.idleTimer.unref?.();
+    }
+
+    private cancelarOciosidade(): void {
+        if (this.idleTimer) {
+            clearTimeout(this.idleTimer);
+            this.idleTimer = null;
+        }
     }
 
     /** Resolves once the OS has actually bound the listening socket. */
@@ -71,6 +125,7 @@ export class BridgeServer implements EventSink {
             }, HANDSHAKE_TIMEOUT_MS)
         };
         this.connections.add(conn);
+        this.cancelarOciosidade();
 
         ws.on('message', (raw: Buffer) => {
             void this.handleMessage(conn, raw);
@@ -79,6 +134,9 @@ export class BridgeServer implements EventSink {
         ws.on('close', () => {
             clearTimeout(conn.handshakeTimer);
             this.connections.delete(conn);
+            if (this.connections.size === 0) {
+                this.agendarOciosidade();
+            }
         });
 
         ws.on('error', (err) => this.logger.warn({ err }, 'connection error'));
@@ -204,11 +262,15 @@ export class BridgeServer implements EventSink {
                 this.connections.delete(conn);
             }
         }
+        if (this.connections.size === 0) {
+            this.agendarOciosidade();
+        }
     }
 
     async close(): Promise<void> {
         if (this.closing) return;
         this.closing = true;
+        this.cancelarOciosidade();
         clearInterval(this.reaperTimer);
         await this.instanceManager.shutdownAll();
         for (const conn of this.connections) {

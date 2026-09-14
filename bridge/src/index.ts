@@ -32,6 +32,12 @@ async function main(): Promise<void> {
     // then hand off race between two separate processes).
     logger.info({ port: server.actualPort, bridgeVersion, baileysVersion }, 'bridge_ready');
 
+    // Ficar sem cliente por tempo demais significa que a JVM que nos subiu
+    // morreu sem executar hook nenhum. Continuar vivo manteria o socket do
+    // WhatsApp aberto sem dono — e um segundo socket na mesma conta e o que faz
+    // o servidor responder connectionReplaced em looping.
+    server.onIdleShutdown = () => process.exit(0);
+
     let shuttingDown = false;
     const shutdown = async (signal: string) => {
         if (shuttingDown) return;
@@ -48,6 +54,18 @@ async function main(): Promise<void> {
 
     process.on('SIGINT', () => void shutdown('SIGINT'));
     process.on('SIGTERM', () => void shutdown('SIGTERM'));
+
+    // Ultima linha de defesa para a trava de sessao: 'exit' e sincrono e roda
+    // em qualquer saida do processo, inclusive nas fatais abaixo. Deixar a
+    // trava para tras nao trava a conta para sempre (o proximo processo a
+    // reconhece como orfa), mas gera um aviso e um susto desnecessarios.
+    process.on('exit', () => {
+        try {
+            server.instanceManager.releaseAllLocks();
+        } catch {
+            // saida do processo nao e lugar de lancar
+        }
+    });
 
     process.on('uncaughtException', (err) => {
         logger.fatal({ err }, 'uncaught exception - terminating process');
