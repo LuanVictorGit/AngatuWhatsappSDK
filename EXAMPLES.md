@@ -26,6 +26,7 @@ propositalmente só código.
 - [11. Exemplo completo: bot com comandos](#11-exemplo-completo-bot-com-comandos)
 - [12. CLI: exemplos de linha de comando](#12-cli-exemplos-de-linha-de-comando)
 - [13. Referência rápida de métodos](#13-referência-rápida-de-métodos)
+- [14. Ritmo, humanização e leitura mínima](#14-ritmo-humanização-e-leitura-mínima)
 
 ## Configuração da dependência
 
@@ -44,6 +45,7 @@ import com.angatusistemas.whatsapp.WhatsAppClient;
 import com.angatusistemas.whatsapp.ConnectionState;
 import com.angatusistemas.whatsapp.DisconnectCause;
 import com.angatusistemas.whatsapp.model.*;
+import com.angatusistemas.whatsapp.pacing.*;
 import com.angatusistemas.whatsapp.request.*;
 import com.angatusistemas.whatsapp.exception.*;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -68,6 +70,10 @@ WhatsAppClient client = WhatsAppClient.builder()
         .minReconnectDelay(Duration.ofSeconds(2))     // opcional - default 1s
         .maxReconnectDelay(Duration.ofSeconds(60))    // opcional - default 30s
         .maxReconnectAttempts(15)                     // opcional - default 10
+        .reconnectCooldown(Duration.ofMinutes(5))     // opcional - default 5min; null = desistir de vez
+        .pacing(PacingOptions.padrao())               // opcional - default 4-12s entre envios, 10/min
+        .humanization(HumanizationOptions.padrao())   // opcional - digitando ligado, leitura MANUAL
+        .logLevel("info")                             // opcional - trace|debug|info|warn|error|fatal
         .nodeVersion("24.19.0")                        // opcional - default: versao LTS pinada pelo SDK
         .bridgeHost("127.0.0.1")                       // opcional/avancado - default 127.0.0.1
         .bridgePort(0)                                 // opcional/avancado - default: porta efemera do SO
@@ -728,8 +734,20 @@ java -jar angatu-whatsapp-cli.jar logout --instance-id vendas --session-dir ./se
 | `CompletableFuture<Void> sendReaction(SendReactionRequest)` | — |
 | `CompletableFuture<String> editMessage(EditMessageRequest)` | messageId da edição |
 | `CompletableFuture<Void> deleteMessage(DeleteMessageRequest)` | — |
+| `CompletableFuture<Void> sendPresence(String chatId, String presence)` | — |
+| `CompletableFuture<Void> markRead(String chatId, String messageId)` | azulzinho numa mensagem |
+| `CompletableFuture<Void> markChatRead(String chatId)` | azulzinho na última recebida |
+| `CompletableFuture<Void> subscribePresence(String chatId)` | passa a receber a presença do contato |
 | `CompletableFuture<MediaContent> downloadMedia(String chatId, String messageId)` | — |
-| `CompletableFuture<Contact> getContact(String jid)` | — |
+| `CompletableFuture<JsonNode> getMe()` | `{ jid, phoneNumber, name }` da conta conectada |
+| `CompletableFuture<NumberCheck> checkNumber(String number)` | **1 consulta** — existência + JID canônico |
+| `CompletableFuture<JsonNode> getProfilePicture(String jid)` | **1 consulta** — só o avatar |
+| `CompletableFuture<Contact> getContact(String jid)` | **3 consultas** — prefira os dois acima |
+| `PacingOptions pacing()` / `void setPacing(PacingOptions)` | ritmo em vigor |
+| `HumanizationOptions humanization()` / `void setHumanization(...)` | sinais em vigor |
+| `List<QueuedSend> pendingSends()` | fila de envio |
+| `boolean cancelSend(String queuedSendId)` | — |
+| `int clearQueue()` | quantos foram descartados |
 | `CompletableFuture<Group> getGroupMetadata(String groupJid)` | — |
 | `CompletableFuture<List<Group>> listGroups()` | — |
 | `CompletableFuture<Group> createGroup(String subject, List<String> participants)` | — |
@@ -750,6 +768,10 @@ java -jar angatu-whatsapp-cli.jar logout --instance-id vendas --session-dir ./se
 | `minReconnectDelay(Duration)` | Não | 1s |
 | `maxReconnectDelay(Duration)` | Não | 30s |
 | `maxReconnectAttempts(int)` | Não | 10 |
+| `reconnectCooldown(Duration)` | Não | 5min (`null` = desistir de vez) |
+| `pacing(PacingOptions)` | Não | `PacingOptions.padrao()` |
+| `humanization(HumanizationOptions)` | Não | `HumanizationOptions.padrao()` |
+| `logLevel(String)` | Não | `info` |
 | `nodeVersion(String)` | Não | versão LTS pinada pelo SDK |
 | `bridgeHost(String)` | Não | `127.0.0.1` |
 | `bridgePort(int)` | Não | porta efêmera do SO |
@@ -778,3 +800,91 @@ que recebe as coordenadas obrigatórias como argumentos do próprio `builder(...
 | `DeleteMessageRequest` | **chatId**, **messageId**, fromMe (padrão `true`), participant |
 
 \* `latitude`/`longitude` são passados em `SendLocationRequest.builder(lat, lon)`, não em um setter.
+
+---
+
+## 14. Ritmo, humanização e leitura mínima
+
+### `PacingOptions` (`com.angatusistemas.whatsapp.pacing`)
+
+```java
+PacingOptions.padrao()      // 4–12s entre envios, 10/min
+PacingOptions.desligado()   // sem espera (a fila continua serializando)
+
+PacingOptions.builder()
+        .minDelay(Duration.ofSeconds(6))
+        .maxDelay(Duration.ofSeconds(20))
+        .maxPerMinute(6)
+        .build();
+```
+
+### `HumanizationOptions`
+
+```java
+HumanizationOptions.padrao()     // digitando + gravando ligados, leitura MANUAL
+HumanizationOptions.desligado()  // nenhum sinal
+
+HumanizationOptions.builder()
+        .typing(true)
+        .typingMsPerChar(25)
+        .typingMin(Duration.ofSeconds(3))
+        .typingMax(Duration.ofSeconds(9))
+        .recording(true)
+        .presenceAroundSend(true)
+        .onlineHoldAfterSend(Duration.ofSeconds(3))
+        .readReceipts(ReadReceiptMode.ON_REPLY)
+        .readDelay(Duration.ofSeconds(1), Duration.ofSeconds(4))
+        .autoSubscribePresence(false)
+        .build();
+```
+
+`ReadReceiptMode`: `OFF`, `MANUAL` (padrão), `ON_REPLY`, `AUTO`.
+
+### Azulzinho e presença do contato
+
+```java
+// Marca uma mensagem especifica como lida.
+client.markRead("5562999998888@s.whatsapp.net", messageId).join();
+
+// Marca a ultima mensagem recebida da conversa.
+client.markChatRead("5562999998888@s.whatsapp.net").join();
+
+// Passa a RECEBER o "digitando..." do contato pelo PresenceListener.
+client.subscribePresence("5562999998888@s.whatsapp.net").join();
+```
+
+### Acompanhando e controlando a fila
+
+```java
+for (QueuedSend item : client.pendingSends()) {
+    System.out.println(item.id() + " -> " + item.chatId() + " [" + item.status() + "]");
+}
+
+client.cancelSend("q42");          // cancela um item que ainda nao saiu
+client.clearQueue();               // esvazia a fila
+client.setPacing(PacingOptions.desligado());
+client.setHumanization(HumanizationOptions.padrao());
+```
+
+`QueuedSend.Status`: `QUEUED`, `TYPING`, `SENDING`, `DONE`, `FAILED`, `CANCELLED`.
+
+### Conferir um número antes de enviar
+
+```java
+NumberCheck r = client.checkNumber("5562999998888").join();
+if (r.exists()) {
+    // Envie para o JID que o WhatsApp devolveu, nao para o numero digitado:
+    // e ele quem sabe se a conta e a com ou a sem o nono digito.
+    client.sendText(r.jid(), "Ola!");
+}
+```
+
+| Método | Consultas ao WhatsApp | Quando usar |
+|---|---|---|
+| `checkNumber(numero)` | **1** (com cache 24h/6h) | saber se o número existe |
+| `getProfilePicture(jid)` | **1** | só o avatar |
+| `getContact(jid)` | **3** | quando precisar de existência + foto + recado |
+
+Há um teto de 30 consultas por minuto no bridge. Estourado, a chamada falha com
+`BridgeErrorCode.TIMEOUT` e uma mensagem explicando — consultar em rajada é o comportamento que leva
+uma conta a ser suspensa por coleta de dados.

@@ -51,14 +51,25 @@ escrever, ler ou entender uma linha de Node.js/TypeScript**.
   fala com ele por WebSocket (`127.0.0.1`, autenticado por token), e o encerra ao fechar o cliente.
 - **Multi-instância**: várias contas de WhatsApp na mesma aplicação, cada uma com seu próprio
   `instanceId` e diretório de sessão, com prevenção de conflito em tempo de execução.
-- **Sessão persistente**: a autenticação (estado do Baileys) é salva em disco por instância e
-  sobrevive a reinícios — sem novo QR Code a cada deploy.
+- **Uma conta, um socket — garantido em disco**: uma trava (`.lock`) no diretório de sessão impede
+  que dois processos abram a mesma conta, mesmo depois de um `kill -9` que deixe um bridge órfão.
+  Dois sockets na mesma conta fazem o WhatsApp derrubar um com `connectionReplaced`, o que dispara
+  reconexão, que abre outro socket — o vaivém que denuncia automação.
+- **Sessão persistente**: a autenticação (estado do Baileys) é salva em disco por instância, com
+  gravação atômica (`.tmp` + `fsync` + `rename`), e sobrevive a reinícios — sem novo QR Code a cada
+  deploy, e sem o "pediu QR do nada" que uma queda no meio da escrita causava.
+- **Ritmo humano embutido** (`PacingOptions`): fila sequencial por instância — nada sai em paralelo
+  —, intervalo aleatório de 4 a 12 segundos entre envios e teto de 10 por minuto.
+- **Sinais de presença configuráveis** (`HumanizationOptions`): "digitando...", "gravando áudio...",
+  online/offline em volta do envio e o "azulzinho" de leitura, cada um ligando e desligando sozinho.
 - **Eventos independentes**: listeners separados por tipo (mensagem, atualização, exclusão,
   reação, estado de conexão, QR Code, grupo, presença, erro) em vez de um único callback genérico.
 - **Exceções tipadas** com contexto de diagnóstico (`instanceId`, código de erro do bridge, causa).
-- **Reconexão automática** com backoff exponencial limitado, distinguindo logout do usuário,
-  perda de conexão, reinício solicitado pelo WhatsApp, falha de autenticação e queda do processo
-  bridge.
+- **Reconexão automática** com backoff exponencial, distinguindo logout do usuário, perda de
+  conexão, reinício solicitado pelo WhatsApp, substituição por outro cliente, falha de autenticação
+  e queda do processo bridge — e que **nunca desiste de vez**: esgotado o backoff, as tentativas
+  continuam espaçadas (`reconnectCooldown`, padrão 5 min) em vez de o cliente ficar em `FAILED`
+  para sempre.
 - **CLI opcional** (`angatu-whatsapp-cli`) para parear um número ou enviar uma mensagem avulsa sem
   escrever código Java.
 
@@ -359,7 +370,12 @@ client.addMessageListener(message -> {
 
 client.addConnectionStateListener((state, cause, detail) -> {
     if (state == ConnectionState.FAILED) {
-        // maxReconnectAttempts esgotado - decida se recria o cliente ou alerta um humano
+        // Backoff esgotado. O SDK CONTINUA tentando a cada reconnectCooldown:
+        // aqui e lugar de alertar um humano, nao de recriar o cliente.
+    }
+    if (cause == DisconnectCause.CONNECTION_REPLACED) {
+        // Outro cliente assumiu a conta. A credencial continua valida -
+        // NAO apague a sessao aqui. O bridge volta a tentar sozinho.
     }
 });
 
@@ -505,14 +521,34 @@ A reconexão acontece em duas camadas:
    — sem novo QR Code, pois o estado de autenticação já está persistido.
 
 O backoff é exponencial com jitter, limitado por `maxReconnectDelay` e por `maxReconnectAttempts`
-(padrão: 10 tentativas). Ao esgotar as tentativas, a instância vai para `ConnectionState.FAILED`
-e para de tentar sozinha — nesse ponto, cabe à aplicação decidir (alertar, recriar o cliente, etc.)
-via `ErrorListener`/`ConnectionStateListener`.
+(padrão: 10 tentativas). **Esgotadas as tentativas, o SDK não desiste**: a instância é reportada como
+`ConnectionState.FAILED` — a aplicação precisa saber que o número está fora do ar — mas as tentativas
+continuam saindo a cada `reconnectCooldown` (padrão 5 minutos), indefinidamente, e a conexão volta
+sozinha quando a rede voltar.
+
+> Até a versão anterior o cliente parava de vez em `FAILED`, e era por esse caminho que um número
+> "desconectava e não voltava": a queda durava mais que as dez tentativas e só um restart da
+> aplicação o traria de volta. O intervalo é longo de propósito — reconectar sem parar é pior que não
+> reconectar, porque cada tentativa reapresenta um cliente web novo ao WhatsApp.
+>
+> Para o comportamento antigo: `.reconnectCooldown(null)`.
 
 `DisconnectCause` distingue: `USER_LOGOUT` (logout explícito — precisa de novo QR),
 `CONNECTION_LOST` (falha transitória de rede), `WHATSAPP_RESTART` (o próprio WhatsApp pediu
-reinício), `AUTH_FAILURE` (credenciais rejeitadas — precisa de novo QR), `BRIDGE_CRASH` (processo
-Node morreu inesperadamente) e `UNKNOWN`.
+reinício), `AUTH_FAILURE` (credenciais rejeitadas), `CONNECTION_REPLACED` (outro cliente assumiu a
+conta), `BRIDGE_CRASH` (processo Node morreu inesperadamente) e `UNKNOWN`.
+
+> **`CONNECTION_REPLACED` não é logout, e a credencial continua válida.** Até a versão anterior o
+> `connectionReplaced` (440) do WhatsApp chegava como `USER_LOGOUT`, e toda aplicação que reage a
+> "deslogou" apagando a sessão transformava um conflito recuperável em repareamento forçado — o pior
+> movimento possível numa conta sob observação. Ao receber esta causa, **não apague nada**: o bridge
+> espera cinco minutos e tenta voltar sozinho, devagar o bastante para não começar uma guerra de
+> reconexão com quem assumiu.
+
+> **`AUTH_FAILURE` nem sempre apaga a sessão.** Um 403 (`forbidden`) significa "a conta está restrita
+> agora", não "esta credencial não vale": o diretório é preservado, e se a restrição passar a mesma
+> credencial volta a conectar. Já 401/500/411 descartam as credenciais, porque sem isso todo
+> `connect()` repetiria a mesma recusa sem nunca gerar um QR novo.
 
 ## Tratamento de erros
 
@@ -557,7 +593,11 @@ Todas as opções do `WhatsAppClient.builder()`:
 | `markOnlineOnConnect(boolean)` | Não | `false` | Marcar como "online" assim que conectar |
 | `minReconnectDelay(Duration)` | Não | 1s | Menor atraso entre tentativas de reconexão |
 | `maxReconnectDelay(Duration)` | Não | 30s | Maior atraso entre tentativas de reconexão |
-| `maxReconnectAttempts(int)` | Não | 10 | Tentativas consecutivas antes de ir para `FAILED` |
+| `maxReconnectAttempts(int)` | Não | 10 | Tentativas do backoff exponencial antes de passar ao modo espaçado |
+| `reconnectCooldown(Duration)` | Não | 5min | Intervalo das tentativas depois que o backoff se esgota; `null` = desistir de vez |
+| `pacing(PacingOptions)` | Não | 4–12s, 10/min | Ritmo dos envios — ver [Ritmo e humanização](#ritmo-e-humanização) |
+| `humanization(HumanizationOptions)` | Não | digitando ligado, leitura `MANUAL` | Sinais de presença e azulzinho |
+| `logLevel(String)` | Não | `info` | Nível do log do processo bridge (`trace`…`fatal`) |
 | `nodeVersion(String)` | Não | versão LTS atual pinada pelo SDK | Versão do Node a baixar se necessário |
 | `bridgeHost(String)` | Não | `127.0.0.1` | **Avançado** — veja [Segurança](#segurança) |
 | `bridgePort(int)` | Não | porta efêmera do SO | Fixar uma porta local em vez de uma aleatória |
@@ -569,6 +609,14 @@ Variáveis de ambiente/propriedades de sistema reconhecidas pelo SDK:
 | `ANGATU_WHATSAPP_HOME` | Variável de ambiente | Sobrescreve o diretório de cache (Node baixado, bridge instalado) |
 | `ANGATU_WHATSAPP_NODE_PATH` | Variável de ambiente | Força um executável Node.js específico (erro se inválido) |
 | `angatu.whatsapp.node.path` | Propriedade de sistema (`-D`) | Mesmo efeito que `ANGATU_WHATSAPP_NODE_PATH`, com prioridade maior |
+
+Lidas pelo **processo bridge** (repassadas pelo SDK, ou definidas no ambiente do processo Java):
+
+| Nome | Padrão | Efeito |
+|---|---|---|
+| `ANGATU_BRIDGE_LOG_LEVEL` | `info` | Nível do log do bridge; em `debug` saem também as repetições de ruído de protocolo. Prefira `.logLevel(...)` no builder |
+| `ANGATU_BRIDGE_IDLE_MS` | `120000` | Tempo sem nenhum cliente conectado antes de o bridge se encerrar sozinho. `0` desliga |
+| `ANGATU_BRIDGE_LEITURAS_POR_MIN` | `30` | Teto de consultas ao WhatsApp por minuto. `0` desliga |
 
 Sem essas variáveis, o cache fica em `%LOCALAPPDATA%\angatu-whatsapp-sdk` (Windows),
 `$XDG_CACHE_HOME/angatu-whatsapp-sdk` ou `~/.angatu-whatsapp-sdk` (Linux/macOS).
@@ -787,6 +835,121 @@ a saída está redirecionada (não é um console interativo de verdade) — e `C
 sem ambiguidade em qualquer codepage/terminal, então a saída do QR não depende de nenhuma
 configuração de codificação da máquina do usuário.
 
+## Ritmo e humanização
+
+Quem conecta um número por Baileys assume o risco de banimento. Boa parte desse risco não vem do
+volume em si, mas do **padrão**: mensagens saindo em paralelo, no mesmo milissegundo, sem nenhum
+sinal de presença, de um número que fica online 24 horas por dia. Esse conjunto é indistinguível de
+robô, e o SDK já sai configurado para não produzi-lo.
+
+### O que acontece em todo envio, por padrão
+
+1. o envio entra numa **fila com uma thread por instância** — nada sai em paralelo, venha de onde
+   vier na aplicação;
+2. espera-se um intervalo **aleatório de 4 a 12 segundos** desde o último envio que deu certo;
+3. confere-se o **teto de 10 por minuto**, em janela deslizante;
+4. publica-se `composing` ("digitando...") por um tempo proporcional ao texto — 25 ms por caractere,
+   entre 3 e 9 segundos, com jitter — renovado a cada 8 s, porque o WhatsApp apaga o indicador
+   sozinho em ~10 s;
+5. a mensagem sai;
+6. publica-se `paused` e depois `unavailable`, devolvendo o número ao estado offline.
+
+O passo 6 não é detalhe. Para publicar "digitando..." o cliente precisa se declarar disponível, e um
+número que fica **online o tempo todo** é justamente um dos padrões que identificam automação. Ele só
+aparece online nos segundos do envio.
+
+Dois detalhes que valem a pena conhecer, porque falham em silêncio:
+
+- **a espera não depende da presença.** Se a publicação falhar, a pausa acontece do mesmo jeito.
+  Voltar na hora seria o pior dos dois mundos: sem o indicador *e* sem a pausa;
+- **a conta precisa ter nome de perfil.** O Baileys recusa `available`/`unavailable` quando
+  `creds.me.name` está vazio, e o "digitando..." simplesmente não aparece. O bridge avisa no log.
+
+### Configurando
+
+```java
+WhatsAppClient client = WhatsAppClient.builder()
+        .instanceId("vendas")
+        .sessionDirectory(Path.of("wa-sessions/vendas"))
+        .pacing(PacingOptions.builder()
+                .minDelay(Duration.ofSeconds(6))
+                .maxDelay(Duration.ofSeconds(20))
+                .maxPerMinute(6)
+                .build())
+        .humanization(HumanizationOptions.builder()
+                .readReceipts(ReadReceiptMode.ON_REPLY)
+                .build())
+        .build();
+```
+
+| Opção de `HumanizationOptions` | Padrão | O que faz |
+|---|---|---|
+| `typing` | ligado | "digitando..." proporcional ao texto |
+| `typingMsPerChar` / `typingMin` / `typingMax` | 25 ms / 3 s / 9 s | duração do indicador |
+| `recording` | ligado | "gravando áudio..." em envio de áudio/PTT |
+| `presenceAroundSend` | ligado | `available` antes, `unavailable` depois |
+| `onlineHoldAfterSend` | 0 s | quanto tempo segue online após enviar |
+| `readReceipts` | `MANUAL` | o "azulzinho" — ver abaixo |
+| `readDelay` | 1–4 s | atraso antes de marcar como lida |
+| `autoSubscribePresence` | desligado | receber o "digitando..." **do contato** |
+
+### O "azulzinho" (`ReadReceiptMode`)
+
+| Modo | Comportamento |
+|---|---|
+| `OFF` | nunca marca nada como lido |
+| `MANUAL` (padrão) | só quando a aplicação chama `markRead`/`markChatRead` |
+| `ON_REPLY` | marca a conversa como lida logo **antes** de responder — leu, digitou, respondeu |
+| `AUTO` | marca toda mensagem recebida, após `readDelay` |
+
+`MANUAL` é o padrão apenas porque não muda o comportamento de quem já usava o SDK. Para um bot que
+de fato responde, **`ON_REPLY` é o modo recomendado**.
+
+> Se a conta estiver com "confirmações de leitura" desligada na privacidade do celular, a marcação é
+> aceita mas o remetente não vê o azul. Isso não depende do SDK.
+
+### Acompanhando a fila
+
+```java
+client.pendingSends();        // o que ainda não saiu
+client.cancelSend(id);        // cancela um item — inclusive o que só espera o intervalo
+client.clearQueue();          // esvazia a fila
+client.setPacing(outro);      // troca o ritmo em tempo de execução
+```
+
+`cancelSend` alcança também o envio que a fila já pegou mas que ainda está esperando: com até 12
+segundos de intervalo, um "parar" que só mexesse na fila deixaria a próxima mensagem sair mesmo
+assim — justamente o que o operador acabou de pedir para não acontecer.
+
+### Se a sua aplicação já controla o ritmo
+
+Duas camadas se somam. Para desligar a daqui:
+
+```java
+.pacing(PacingOptions.desligado())
+.humanization(HumanizationOptions.desligado())
+```
+
+`PacingOptions.desligado()` tira a **espera**, nunca a serialização: mesmo assim os envios de uma
+instância continuam saindo um de cada vez.
+
+### Leitura: o que de fato derruba uma conta
+
+Vale dizer com todas as letras, porque é contraintuitivo: **a suspensão que motivou boa parte deste
+desenho não veio de envio, veio de leitura.** Uma tela que pedia a foto de perfil de 200 conversas ao
+abrir disparava, via `getContact`, até 600 consultas em rajada logo após conectar — sondando
+existência de número e lendo o recado pessoal de gente com quem ninguém estava conversando. Do ponto
+de vista do servidor, isso é indistinguível de raspagem de agenda.
+
+- use **`checkNumber(numero)`** (uma consulta, com cache de 24 h/6 h) para saber se um número existe;
+- use **`getProfilePicture(jid)`** (uma consulta) quando quiser só o avatar;
+- **`getContact(jid)` custa três consultas** (existência + foto + recado pessoal) e pesa três no
+  orçamento. Use só quando precisar mesmo das três;
+- há um **teto de 30 consultas por minuto** no bridge (`ANGATU_BRIDGE_LEITURAS_POR_MIN`); estourado,
+  a consulta é recusada com erro tipado em vez de virar mais uma requisição ao WhatsApp;
+- a regra geral que vale a pena adotar: **a tela lê do seu banco, o WhatsApp é consultado quando
+  chega uma mensagem ou quando o usuário pede explicitamente.**
+
 ## Limitações conhecidas
 
 - **Baileys não é oficial** (veja o aviso no topo deste README) — risco de banimento em uso
@@ -794,11 +957,9 @@ configuração de codificação da máquina do usuário.
 - **Um processo Node.js por instância conectada** — custo de recursos que cresce linearmente com
   o número de contas de WhatsApp simultâneas na mesma aplicação. Não recomendado, no desenho
   atual, para centenas/milhares de instâncias na mesma JVM.
-- **Prevenção de conflito de `instanceId`/`sessionDirectory` é por JVM**, não entre processos
-  diferentes na mesma máquina ou em máquinas diferentes — rodar dois processos apontando para o
-  mesmo `sessionDirectory` (ex.: dois comandos do CLI, ou uma instância do CLI e uma aplicação
-  Java própria) não é impedido pelo SDK e corrompe o estado de autenticação do Baileys em disco,
-  já que ambos tentariam abrir o mesmo `useMultiFileAuthState` concorrentemente.
+- **A trava de sessão é um arquivo no sistema de arquivos local.** Ela impede dois processos na
+  mesma máquina, mas não cobre duas máquinas apontando para o mesmo diretório por rede (NFS/SMB),
+  onde a exclusão do `O_EXCL` não é confiável. Não compartilhe um diretório de sessão por rede.
 - **Download do Node.js verificado apenas por SHA-256** obtido do próprio `nodejs.org` no momento
   do download (mesmo modelo de confiança de ferramentas como nvm/volta/fnm) — não há verificação
   de assinatura GPG independente.
@@ -807,8 +968,10 @@ configuração de codificação da máquina do usuário.
 - **Sem sincronização de histórico de conversas** — o SDK expõe eventos em tempo real e consultas
   pontuais (contato, grupo, mídia de uma mensagem específica), não uma sincronização completa do
   histórico de chats como um cliente WhatsApp Web faz ao conectar.
-- **Sem limitação de taxa de envio embutida** — enviar mensagens em volume alto/rápido é
-  responsabilidade da aplicação; o WhatsApp pode marcar como spam ou banir por padrões agressivos.
+- **O ritmo embutido protege o padrão de envio, não o conteúdo.** A fila garante que nada sai em
+  paralelo e que há intervalo entre mensagens, mas o SDK não tem como saber se o texto é bem-vindo:
+  mandar a mesma mensagem não solicitada para milhares de desconhecidos derruba a conta em qualquer
+  cadência. Ver [Ritmo e humanização](#ritmo-e-humanização).
 - **`close()` gracioso depende do WebSocket ainda estar alcançável.** No Windows,
   `Process.destroy()` não aciona um handler de sinal no processo filho (ao contrário de Unix) —
   por isso o encerramento organizado é feito pedindo `shutdown` pelo próprio WebSocket antes de
@@ -823,7 +986,6 @@ configuração de codificação da máquina do usuário.
   de uso com um número grande de contas simultâneas (o bridge já suporta múltiplas instâncias por
   processo — falta expor essa opção no lado Java).
 - Sincronização/consulta de histórico de conversas.
-- Utilitário opcional de limitação de taxa de envio (rate limiting) embutido no SDK.
 - Verificação de assinatura GPG (além do SHA-256 atual) para os binários do Node.js baixados.
 - Imagem Docker de referência com Node.js pré-instalado, para ambientes que preferem não usar o
   download automático.
