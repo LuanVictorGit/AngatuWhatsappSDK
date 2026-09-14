@@ -1,7 +1,5 @@
-import { rm } from 'node:fs/promises';
 import makeWASocket, {
     DisconnectReason,
-    useMultiFileAuthState,
     downloadMediaMessage,
     type WASocket,
     type WAMessage,
@@ -13,6 +11,7 @@ import makeWASocket, {
 } from 'baileys';
 import { Boom } from '@hapi/boom';
 import { loggerDoBaileys, type Logger } from '../util/logger.js';
+import { useDurableAuthState, limparCredenciais } from './AuthState.js';
 import { MessageCache } from './MessageCache.js';
 import { LidDirectory } from './LidDirectory.js';
 import { resolverVersaoWhatsApp } from './WaVersion.js';
@@ -139,11 +138,22 @@ const CONNECT_TIMEOUT_MS = 30_000;
 /** Teto de uma consulta (metadados de grupo, existencia de numero). */
 const QUERY_TIMEOUT_MS = 45_000;
 
+/**
+ * Codigos em que o WhatsApp deu a credencial por invalida, e guardar o disco
+ * so faria a reconexao repetir a mesma recusa para sempre.
+ *
+ * <p><b>403 `forbidden` foi retirado desta lista de proposito.</b> Ele nao quer
+ * dizer "estas credenciais nao valem": quer dizer que a conta esta restrita
+ * neste momento. Apagar o diretorio ali destruia credencial boa e obrigava um
+ * novo pareamento — e repareamento numa conta ja sinalizada e o oposto do que
+ * se quer fazer, porque reapresenta um cliente web novo justamente quando o
+ * numero esta sob observacao. Agora o 403 reporta AUTH_FAILURE e <b>preserva o
+ * disco</b>: se a restricao passar, a mesma credencial volta a conectar.
+ */
 const CREDENTIALS_INVALIDATED_STATUS_CODES: ReadonlySet<number> = new Set([
     DisconnectReason.loggedOut,
     DisconnectReason.badSession,
-    DisconnectReason.multideviceMismatch,
-    DisconnectReason.forbidden
+    DisconnectReason.multideviceMismatch
 ]);
 
 /**
@@ -338,7 +348,7 @@ export class BaileysAdapter {
             this.sessionCleanup = null;
         }
 
-        const { state, saveCreds } = await useMultiFileAuthState(this.options.sessionDirectory);
+        const { state, saveCreds } = await useDurableAuthState(this.options.sessionDirectory, this.logger);
 
         const rawKeysSet = state.keys.set;
         state.keys.set = async (data) => {
@@ -456,7 +466,16 @@ export class BaileysAdapter {
             // troca de socket o campo ja aponta para o novo, e gravar as
             // credenciais de um pelo escritor do outro corrompe a sessao em
             // disco - que aparece depois como "pediu QR do nada".
-            void saveCreds();
+            //
+            // O catch nao e decoracao: sem ele a rejeicao subia sem dono, o
+            // handler de `unhandledRejection` do index.ts derrubava o processo
+            // INTEIRO (todas as instancias dele) por causa de um ENOSPC
+            // passageiro, e ainda por cima no momento exato em que uma
+            // credencial estava sendo gravada. Perder uma gravacao e ruim;
+            // derrubar o bridge no meio dela e muito pior.
+            void saveCreds().catch((err) => {
+                this.logger.error({ err }, 'falha ao gravar as credenciais no disco - a sessao segue em memoria');
+            });
         });
 
         assinar('connection.update', (update) => this.handleConnectionUpdate(update));
@@ -670,7 +689,7 @@ export class BaileysAdapter {
      */
     private discardInvalidatedSession(statusCode: number): void {
         this.logger.warn({ statusCode }, 'credenciais invalidadas pelo WhatsApp; limpando sessao para permitir novo pareamento');
-        this.sessionCleanup = rm(this.options.sessionDirectory, { recursive: true, force: true }).catch((err) => {
+        this.sessionCleanup = limparCredenciais(this.options.sessionDirectory, this.logger).catch((err) => {
             this.logger.error({ err }, 'falha ao limpar a sessao invalidada; o proximo connect pode continuar sendo recusado');
         });
     }
@@ -838,7 +857,10 @@ export class BaileysAdapter {
         // uma sessao cujas credenciais estao sendo apagadas logo abaixo.
         this.geracao++;
         this.descartarSocket();
-        await rm(this.options.sessionDirectory, { recursive: true, force: true });
+        // Apaga as credenciais, nao a pasta: o `.lock` da SessionLock mora nela
+        // e ainda e nosso. Removida a pasta inteira, a trava sumia junto e outro
+        // processo podia assumir a conta no meio do encerramento desta.
+        await limparCredenciais(this.options.sessionDirectory, this.logger);
         // Also set explicitly, same reasoning as disconnect() above.
         this.setState('LOGGED_OUT', 'USER_LOGOUT', 'logout() chamado explicitamente');
     }
