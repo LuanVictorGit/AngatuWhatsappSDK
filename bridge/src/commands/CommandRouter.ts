@@ -249,6 +249,18 @@ export const handlers: Record<string, Handler> = {
         return {};
     },
 
+    async mark_read(instances, instanceId, payload) {
+        const instance = instances.get(requireInstanceId(instanceId));
+        await instance.adapter.markRead(requireString(payload, 'chatId'), optionalString(payload, 'messageId'));
+        return {};
+    },
+
+    async subscribe_presence(instances, instanceId, payload) {
+        const instance = instances.get(requireInstanceId(instanceId));
+        await instance.adapter.subscribePresence(requireString(payload, 'chatId'));
+        return {};
+    },
+
     async download_media(instances, instanceId, payload) {
         const instance = instances.get(requireInstanceId(instanceId));
         return instance.adapter.downloadMedia(requireString(payload, 'chatId'), requireString(payload, 'messageId'));

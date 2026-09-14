@@ -18,6 +18,11 @@ import com.angatusistemas.whatsapp.model.Contact;
 import com.angatusistemas.whatsapp.model.Group;
 import com.angatusistemas.whatsapp.model.MediaContent;
 import com.angatusistemas.whatsapp.model.Message;
+import com.angatusistemas.whatsapp.pacing.HumanizationOptions;
+import com.angatusistemas.whatsapp.pacing.PacingOptions;
+import com.angatusistemas.whatsapp.pacing.QueuedSend;
+import com.angatusistemas.whatsapp.pacing.ReadReceiptMode;
+import com.angatusistemas.whatsapp.pacing.SendPacer;
 import com.angatusistemas.whatsapp.protocol.BridgeErrorCode;
 import com.angatusistemas.whatsapp.request.DeleteMessageRequest;
 import com.angatusistemas.whatsapp.request.EditMessageRequest;
@@ -131,6 +136,14 @@ public final class WhatsAppClient implements AutoCloseable {
     private volatile BridgeProcessManager processManager;
     private volatile BridgeConnection connection;
 
+    /**
+     * A fila de envio desta instancia: uma thread, nada em paralelo, com o
+     * intervalo humano e o "digitando..." embutidos. Ver {@link SendPacer}.
+     */
+    private final SendPacer pacer;
+    /** Conversas cuja presenca ja foi assinada, para nao repetir a consulta. */
+    private final java.util.Set<String> presencaAssinada = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
     private WhatsAppClient(Builder builder) {
         this.instanceId = builder.instanceId;
         this.sessionDirectory = builder.sessionDirectory;
@@ -143,6 +156,9 @@ public final class WhatsAppClient implements AutoCloseable {
         this.nodeVersion = builder.nodeVersion;
         this.bridgeHost = builder.bridgeHost;
         this.bridgePort = builder.bridgePort;
+        this.pacer = new SendPacer(instanceId, new PacerBackendImpl(),
+                builder.pacing != null ? builder.pacing : PacingOptions.padrao(),
+                builder.humanization != null ? builder.humanization : HumanizationOptions.padrao());
 
         InstanceRegistry.register(instanceId, sessionDirectory);
     }
@@ -205,6 +221,12 @@ public final class WhatsAppClient implements AutoCloseable {
         userInitiatedStop = true;
         InstanceRegistry.unregister(instanceId);
         log.info("encerrando WhatsAppClient '{}'", instanceId);
+
+        // Antes de derrubar a conexao: o que esta na fila nao vai sair, e cada
+        // item precisa completar o future de quem o espera. Sem isto, quem
+        // chamou send*() e esta bloqueado em .get() ficaria pendurado para
+        // sempre depois de um close().
+        pacer.close();
 
         BridgeConnection currentConnection = this.connection;
         BridgeProcessManager currentProcess = this.processManager;
@@ -297,6 +319,40 @@ public final class WhatsAppClient implements AutoCloseable {
 
     // ---------------------------------------------------------------- sending
 
+    /**
+     * Poe um envio na fila desta instancia.
+     *
+     * <p><b>Mudanca de comportamento que vale registrar:</b> antes, um envio com
+     * o cliente desconectado lancava {@link ConnectionException} na thread de
+     * quem chamou, enquanto qualquer outra falha vinha pelo {@code future} —
+     * uma inconsistencia que escapava de quem so envolvia tudo em
+     * {@code .exceptionally(...)}. Agora {@code connection()} e avaliado dentro
+     * da fila, entao <b>toda</b> falha chega pelo future.
+     */
+    private CompletableFuture<String> enfileirar(String to, QueuedSend.Kind kind, int textLength,
+                                                 String action, ObjectNode payload) {
+        return pacer.enqueue(to, kind, textLength,
+                () -> connection().sendRequest(action, instanceId, payload, SEND_REQUEST_TIMEOUT)
+                        .thenApply(WhatsAppClient::extractMessageId)).result();
+    }
+
+    private static int tamanho(String texto) {
+        return texto == null ? 0 : texto.length();
+    }
+
+    /** O que a fila precisa do cliente, sem que o {@link SendPacer} dependa dele. */
+    private final class PacerBackendImpl implements SendPacer.PacerBackend {
+        @Override
+        public CompletableFuture<Void> sendPresence(String chatId, String presence) {
+            return WhatsAppClient.this.sendPresence(chatId, presence);
+        }
+
+        @Override
+        public CompletableFuture<Void> markChatRead(String chatId) {
+            return WhatsAppClient.this.markChatRead(chatId);
+        }
+    }
+
     public CompletableFuture<String> sendText(String to, String text) {
         return sendText(to, text, null);
     }
@@ -306,7 +362,7 @@ public final class WhatsAppClient implements AutoCloseable {
         payload.put("to", Objects.requireNonNull(to, "to"));
         payload.put("text", Objects.requireNonNull(text, "text"));
         putIfPresent(payload, "quotedMessageId", quotedMessageId);
-        return connection().sendRequest("send_text", instanceId, payload, SEND_REQUEST_TIMEOUT).thenApply(WhatsAppClient::extractMessageId);
+        return enfileirar(to, QueuedSend.Kind.TEXT, text.length(), "send_text", payload);
     }
 
     public CompletableFuture<String> sendImage(SendImageRequest request) {
@@ -315,7 +371,7 @@ public final class WhatsAppClient implements AutoCloseable {
         payload.put("filePath", request.filePath());
         putIfPresent(payload, "caption", request.caption());
         putIfPresent(payload, "quotedMessageId", request.quotedMessageId());
-        return connection().sendRequest("send_image", instanceId, payload, SEND_REQUEST_TIMEOUT).thenApply(WhatsAppClient::extractMessageId);
+        return enfileirar(request.to(), QueuedSend.Kind.MEDIA, tamanho(request.caption()), "send_image", payload);
     }
 
     public CompletableFuture<String> sendVideo(SendVideoRequest request) {
@@ -325,7 +381,7 @@ public final class WhatsAppClient implements AutoCloseable {
         putIfPresent(payload, "caption", request.caption());
         payload.put("gifPlayback", request.gifPlayback());
         putIfPresent(payload, "quotedMessageId", request.quotedMessageId());
-        return connection().sendRequest("send_video", instanceId, payload, SEND_REQUEST_TIMEOUT).thenApply(WhatsAppClient::extractMessageId);
+        return enfileirar(request.to(), QueuedSend.Kind.MEDIA, tamanho(request.caption()), "send_video", payload);
     }
 
     public CompletableFuture<String> sendAudio(SendAudioRequest request) {
@@ -334,7 +390,7 @@ public final class WhatsAppClient implements AutoCloseable {
         payload.put("filePath", request.filePath());
         payload.put("ptt", request.ptt());
         putIfPresent(payload, "quotedMessageId", request.quotedMessageId());
-        return connection().sendRequest("send_audio", instanceId, payload, SEND_REQUEST_TIMEOUT).thenApply(WhatsAppClient::extractMessageId);
+        return enfileirar(request.to(), QueuedSend.Kind.AUDIO, 0, "send_audio", payload);
     }
 
     public CompletableFuture<String> sendDocument(SendDocumentRequest request) {
@@ -345,7 +401,7 @@ public final class WhatsAppClient implements AutoCloseable {
         payload.put("mimetype", request.mimetype());
         putIfPresent(payload, "caption", request.caption());
         putIfPresent(payload, "quotedMessageId", request.quotedMessageId());
-        return connection().sendRequest("send_document", instanceId, payload, SEND_REQUEST_TIMEOUT).thenApply(WhatsAppClient::extractMessageId);
+        return enfileirar(request.to(), QueuedSend.Kind.MEDIA, tamanho(request.caption()), "send_document", payload);
     }
 
     public CompletableFuture<String> sendSticker(SendStickerRequest request) {
@@ -353,7 +409,7 @@ public final class WhatsAppClient implements AutoCloseable {
         payload.put("to", request.to());
         payload.put("filePath", request.filePath());
         putIfPresent(payload, "quotedMessageId", request.quotedMessageId());
-        return connection().sendRequest("send_sticker", instanceId, payload, SEND_REQUEST_TIMEOUT).thenApply(WhatsAppClient::extractMessageId);
+        return enfileirar(request.to(), QueuedSend.Kind.MEDIA, 0, "send_sticker", payload);
     }
 
     public CompletableFuture<String> sendLocation(SendLocationRequest request) {
@@ -364,7 +420,7 @@ public final class WhatsAppClient implements AutoCloseable {
         putIfPresent(payload, "name", request.name());
         putIfPresent(payload, "address", request.address());
         putIfPresent(payload, "quotedMessageId", request.quotedMessageId());
-        return connection().sendRequest("send_location", instanceId, payload, SEND_REQUEST_TIMEOUT).thenApply(WhatsAppClient::extractMessageId);
+        return enfileirar(request.to(), QueuedSend.Kind.MEDIA, 0, "send_location", payload);
     }
 
     public CompletableFuture<String> sendContact(SendContactRequest request) {
@@ -374,7 +430,7 @@ public final class WhatsAppClient implements AutoCloseable {
         payload.put("phoneNumber", request.phoneNumber());
         putIfPresent(payload, "organization", request.organization());
         putIfPresent(payload, "quotedMessageId", request.quotedMessageId());
-        return connection().sendRequest("send_contact", instanceId, payload, SEND_REQUEST_TIMEOUT).thenApply(WhatsAppClient::extractMessageId);
+        return enfileirar(request.to(), QueuedSend.Kind.MEDIA, 0, "send_contact", payload);
     }
 
     /**
@@ -445,6 +501,134 @@ public final class WhatsAppClient implements AutoCloseable {
         payload.put("chatId", Objects.requireNonNull(chatId, "chatId"));
         payload.put("presence", Objects.requireNonNull(presence, "presence"));
         return connection().sendRequest("send_presence", instanceId, payload).thenApply(v -> null);
+    }
+
+    /**
+     * Marca uma mensagem recebida como lida — o "azulzinho" no celular de quem
+     * escreveu.
+     *
+     * <p>A mensagem precisa ter sido vista por este processo e ainda estar no
+     * cache do bridge: o WhatsApp exige a chave completa da mensagem
+     * ({@code remoteJid}, {@code id}, {@code participant}, {@code fromMe}), e
+     * inventar uma a partir do id faria o stanza ser aceito sem o azul nunca
+     * aparecer — falha silenciosa, que e pior que erro.
+     *
+     * <p>Se a conta estiver com "confirmacoes de leitura" desligada na
+     * privacidade do celular, a marcacao e aceita mas o remetente nao ve o azul.
+     * Isso nao depende da SDK.
+     *
+     * @param chatId conversa
+     * @param messageId mensagem a marcar
+     * @return future completado quando o bridge confirmar
+     * @see HumanizationOptions#readReceipts()
+     */
+    public CompletableFuture<Void> markRead(String chatId, String messageId) {
+        ObjectNode payload = JsonNodeFactory.instance.objectNode();
+        payload.put("chatId", Objects.requireNonNull(chatId, "chatId"));
+        payload.put("messageId", Objects.requireNonNull(messageId, "messageId"));
+        return connection().sendRequest("mark_read", instanceId, payload).thenApply(v -> null);
+    }
+
+    /**
+     * Marca a <b>ultima mensagem recebida</b> de uma conversa como lida.
+     *
+     * <p>E o que o modo {@link ReadReceiptMode#ON_REPLY} usa antes de enviar uma
+     * resposta. Falha se nenhuma mensagem daquela conversa foi vista por este
+     * processo.
+     *
+     * @param chatId conversa
+     * @return future completado quando o bridge confirmar
+     */
+    public CompletableFuture<Void> markChatRead(String chatId) {
+        ObjectNode payload = JsonNodeFactory.instance.objectNode();
+        payload.put("chatId", Objects.requireNonNull(chatId, "chatId"));
+        return connection().sendRequest("mark_read", instanceId, payload).thenApply(v -> null);
+    }
+
+    /**
+     * Assina a presenca de uma conversa, para o {@link PresenceListener} passar
+     * a receber o "digitando..." e o online <b>do contato</b>.
+     *
+     * <p>Sem esta assinatura o WhatsApp simplesmente nao envia presenca daquela
+     * conversa. Ate esta versao ela so acontecia como efeito colateral de
+     * publicar a nossa propria presenca, o que tornava impossivel observar um
+     * contato sem antes escrever para ele.
+     *
+     * <p>Chame nas conversas que importam, e nao em todas: cada assinatura e uma
+     * consulta, e leitura em volume e o que faz uma conta ser suspensa por
+     * coleta. Para assinar automaticamente toda conversa que escrever, ha
+     * {@code HumanizationOptions.builder().autoSubscribePresence(true)}.
+     *
+     * @param chatId conversa a observar
+     * @return future completado quando o bridge confirmar
+     */
+    public CompletableFuture<Void> subscribePresence(String chatId) {
+        ObjectNode payload = JsonNodeFactory.instance.objectNode();
+        payload.put("chatId", Objects.requireNonNull(chatId, "chatId"));
+        return connection().sendRequest("subscribe_presence", instanceId, payload).thenApply(v -> null);
+    }
+
+    // ---------------------------------------------------------------- fila de envio
+
+    /** O ritmo em vigor nesta instancia. */
+    public PacingOptions pacing() {
+        return pacer.pacing();
+    }
+
+    /** Os sinais de humanizacao em vigor nesta instancia. */
+    public HumanizationOptions humanization() {
+        return pacer.humanization();
+    }
+
+    /**
+     * Troca o ritmo em tempo de execucao; vale do proximo envio em diante.
+     *
+     * <p>Para quando uma campanha precisa de uma cadencia propria e o resto do
+     * sistema, de outra.
+     *
+     * @param pacing novo ritmo, ou {@code null} para voltar ao padrao
+     */
+    public void setPacing(PacingOptions pacing) {
+        pacer.setPacing(pacing);
+    }
+
+    /**
+     * Troca os sinais de humanizacao em tempo de execucao.
+     *
+     * @param humanization nova configuracao, ou {@code null} para o padrao
+     */
+    public void setHumanization(HumanizationOptions humanization) {
+        pacer.setHumanization(humanization);
+    }
+
+    /**
+     * Envios que ainda nao sairam, incluindo o que esta em andamento.
+     *
+     * <p>Para a aplicacao mostrar o que esta na fila e dar ao operador um botao
+     * de parar.
+     */
+    public List<QueuedSend> pendingSends() {
+        return pacer.pending();
+    }
+
+    /**
+     * Cancela um envio que ainda nao comecou a sair.
+     *
+     * @param queuedSendId o {@link QueuedSend#id()}
+     * @return {@code true} se ele estava na fila e foi removido
+     */
+    public boolean cancelSend(String queuedSendId) {
+        return pacer.cancel(queuedSendId);
+    }
+
+    /**
+     * Esvazia a fila. O envio em andamento termina normalmente — aborta-lo no
+     * meio deixaria a duvida de se a mensagem saiu.
+     *
+     * @return quantos envios foram descartados
+     */
+    public int clearQueue() {
+        return pacer.clear();
     }
 
     // ---------------------------------------------------------------- media / contacts / groups
@@ -782,9 +966,52 @@ public final class WhatsAppClient implements AutoCloseable {
     }
 
     private void notifyMessage(Message message) {
+        reagirAMensagemRecebida(message);
         for (MessageListener listener : messageListeners) {
             safeInvoke(() -> listener.onMessageReceived(message));
         }
+    }
+
+    /**
+     * Os sinais automaticos disparados pela chegada de uma mensagem: o
+     * azulzinho no modo {@link ReadReceiptMode#AUTO} e a assinatura de presenca
+     * da conversa.
+     *
+     * <p>Roda <b>fora</b> da thread de eventos do bridge. Essa thread e unica e
+     * serve a todos os nove tipos de listener: segura-la por alguns segundos
+     * esperando um atraso de leitura atrasaria tambem os eventos de conexao e de
+     * QR Code da instancia inteira.
+     */
+    private void reagirAMensagemRecebida(Message message) {
+        if (message == null || message.isFromMe() || message.chatId() == null) {
+            return;
+        }
+        HumanizationOptions sinais = pacer.humanization();
+        String chatId = message.chatId();
+
+        if (sinais.autoSubscribePresence() && presencaAssinada.add(chatId)) {
+            subscribePresence(chatId).exceptionally(e -> {
+                // Nao conseguiu assinar: solta a marca para tentar de novo na
+                // proxima mensagem, em vez de desistir daquela conversa para
+                // sempre.
+                presencaAssinada.remove(chatId);
+                log.debug("nao foi possivel assinar a presenca de '{}': {}", chatId, e.getMessage());
+                return null;
+            });
+        }
+
+        if (sinais.readReceipts() != ReadReceiptMode.AUTO) {
+            return;
+        }
+        String messageId = message.messageId();
+        if (messageId == null) {
+            return;
+        }
+        long atrasoMs = sinais.atrasoLeitura(ThreadLocalRandom.current()).toMillis();
+        reconnectExecutor.schedule(() -> markRead(chatId, messageId).exceptionally(e -> {
+            log.debug("nao foi possivel marcar '{}' como lida: {}", chatId, e.getMessage());
+            return null;
+        }), atrasoMs, TimeUnit.MILLISECONDS);
     }
 
     private void notifyMessageUpdated(JsonNode data) {
@@ -891,6 +1118,8 @@ public final class WhatsAppClient implements AutoCloseable {
         private Duration minReconnectDelay;
         private Duration maxReconnectDelay;
         private Integer maxReconnectAttempts;
+        private PacingOptions pacing;
+        private HumanizationOptions humanization;
         private Duration reconnectCooldown;
         /** Distingue "nao configurado" de "configurado como null" (= desistir de vez). */
         private boolean reconnectCooldownSet;
@@ -941,6 +1170,38 @@ public final class WhatsAppClient implements AutoCloseable {
         }
 
         /** How many consecutive bridge-connection reconnect attempts before giving up and moving to FAILED. Default 10. */
+        /**
+         * Ritmo com que as mensagens saem deste numero. Padrao:
+         * {@link PacingOptions#padrao()} — 4 a 12 segundos entre envios, teto de
+         * 10 por minuto.
+         *
+         * <p>A fila em si nao desliga: mesmo com {@link PacingOptions#desligado()}
+         * os envios continuam saindo <b>um de cada vez</b>. Duas mensagens no
+         * mesmo segundo pelo mesmo numero e o padrao que denuncia automacao.
+         *
+         * @param pacing ritmo desejado, ou {@code null} para o padrao
+         * @return este builder
+         */
+        public Builder pacing(PacingOptions pacing) {
+            this.pacing = pacing;
+            return this;
+        }
+
+        /**
+         * Sinais que a conta emite em volta de um envio: "digitando...",
+         * "gravando audio...", online/offline e o azulzinho de leitura.
+         *
+         * <p>Padrao: {@link HumanizationOptions#padrao()} — digitando e gravando
+         * ligados, leitura em {@link ReadReceiptMode#MANUAL}.
+         *
+         * @param humanization configuracao desejada, ou {@code null} para o padrao
+         * @return este builder
+         */
+        public Builder humanization(HumanizationOptions humanization) {
+            this.humanization = humanization;
+            return this;
+        }
+
         /**
          * Intervalo entre tentativas depois que o backoff exponencial se
          * esgotou. Padrao: 5 minutos.

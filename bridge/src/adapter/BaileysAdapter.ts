@@ -1105,6 +1105,70 @@ export class BaileysAdapter {
         }
     }
 
+    /**
+     * Marca uma mensagem (ou a ultima recebida da conversa) como lida — o
+     * "azulzinho" no celular de quem escreveu.
+     *
+     * <p>Ate esta versao a SDK nunca chamava `readMessages`: a conta recebia
+     * milhares de mensagens sem marcar nenhuma, que nao e como um cliente de
+     * verdade se comporta.
+     *
+     * <p>`readMessages` exige a <b>chave completa</b> (`remoteJid`, `id`,
+     * `participant`, `fromMe`), nao so o id — e por isso que a mensagem precisa
+     * estar no {@link MessageCache}. Inventar uma chave a partir do id seria
+     * pior que falhar: o WhatsApp aceitaria o stanza e o azul nunca apareceria,
+     * sem erro nenhum para investigar.
+     *
+     * @param chatId conversa
+     * @param messageId mensagem especifica, ou `undefined` para a ultima recebida
+     */
+    async markRead(chatId: string, messageId?: string): Promise<void> {
+        const socket = this.requireSocket();
+        const id = messageId ?? this.messageCache.lastIncomingId(chatId);
+        if (!id) {
+            throw new BridgeCommandError(
+                ErrorCode.MEDIA_NOT_FOUND,
+                `Nenhuma mensagem recebida conhecida em ${chatId} para marcar como lida`
+            );
+        }
+        const mensagem = this.messageCache.get(chatId, id);
+        if (!mensagem) {
+            throw new BridgeCommandError(
+                ErrorCode.MEDIA_NOT_FOUND,
+                `Mensagem ${id} nao esta mais em cache; nao ha como montar a chave de leitura`
+            );
+        }
+        try {
+            await socket.readMessages([mensagem.key]);
+            this.logger.debug({ chatId, messageId: id }, 'mensagem marcada como lida');
+        } catch (err) {
+            throw new BridgeCommandError(ErrorCode.SEND_FAILED, (err as Error).message);
+        }
+    }
+
+    /**
+     * Assina a presenca de uma conversa, para o `presence.update` passar a
+     * entregar o "digitando..." e o online <b>do contato</b>.
+     *
+     * <p>Sem esta assinatura o WhatsApp nao envia presenca daquela conversa. Ate
+     * agora ela so acontecia como efeito colateral de publicar `composing`, o
+     * que tornava impossivel observar um contato sem antes escrever para ele.
+     *
+     * <p>Vai para o LID quando ele e conhecido, pelo mesmo motivo do
+     * {@link #sendPresence}: stanza de presenca nao e resolvido pelo servidor,
+     * chega literal no endereco que a gente mandar.
+     */
+    async subscribePresence(chatId: string): Promise<void> {
+        const socket = this.requireSocket();
+        const alvo = this.lids.toLid(chatId);
+        try {
+            await socket.presenceSubscribe(alvo);
+            this.logger.debug({ chatId, alvo, traduzido: alvo !== chatId }, 'presenca da conversa assinada');
+        } catch (err) {
+            throw new BridgeCommandError(ErrorCode.SEND_FAILED, (err as Error).message);
+        }
+    }
+
     async sendReaction(payload: Content.SendReactionPayload): Promise<void> {
         const socket = this.requireSocket();
         try {
