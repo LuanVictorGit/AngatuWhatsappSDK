@@ -88,6 +88,15 @@ public final class WhatsAppClient implements AutoCloseable {
     private static final int DEFAULT_MAX_RECONNECT_ATTEMPTS = 10;
     private static final Duration SEND_REQUEST_TIMEOUT = Duration.ofSeconds(120);
 
+    /**
+     * Intervalo entre tentativas depois que o backoff exponencial se esgotou.
+     *
+     * <p>Ver {@link Builder#reconnectCooldown(Duration)} para o porque de isto
+     * existir. Cinco minutos: devagar o bastante para nao martelar nada, rapido
+     * o bastante para o numero voltar sozinho dentro do mesmo turno de trabalho.
+     */
+    private static final Duration DEFAULT_RECONNECT_COOLDOWN = Duration.ofMinutes(5);
+
     private final String instanceId;
     private final Path sessionDirectory;
     private final String displayName;
@@ -95,6 +104,8 @@ public final class WhatsAppClient implements AutoCloseable {
     private final Duration minReconnectDelay;
     private final Duration maxReconnectDelay;
     private final int maxReconnectAttempts;
+    /** {@code null} = desistir de vez apos {@link #maxReconnectAttempts} (comportamento antigo). */
+    private final Duration reconnectCooldown;
     private final String nodeVersion;
     private final String bridgeHost;
     private final Integer bridgePort;
@@ -128,6 +139,7 @@ public final class WhatsAppClient implements AutoCloseable {
         this.minReconnectDelay = builder.minReconnectDelay != null ? builder.minReconnectDelay : DEFAULT_MIN_RECONNECT_DELAY;
         this.maxReconnectDelay = builder.maxReconnectDelay != null ? builder.maxReconnectDelay : DEFAULT_MAX_RECONNECT_DELAY;
         this.maxReconnectAttempts = builder.maxReconnectAttempts != null ? builder.maxReconnectAttempts : DEFAULT_MAX_RECONNECT_ATTEMPTS;
+        this.reconnectCooldown = builder.reconnectCooldownSet ? builder.reconnectCooldown : DEFAULT_RECONNECT_COOLDOWN;
         this.nodeVersion = builder.nodeVersion;
         this.bridgeHost = builder.bridgeHost;
         this.bridgePort = builder.bridgePort;
@@ -631,18 +643,42 @@ public final class WhatsAppClient implements AutoCloseable {
             return;
         }
         int attempt = reconnectAttempts.incrementAndGet();
+        long delayMs;
+
         if (attempt > maxReconnectAttempts) {
-            notifyConnectionState(ConnectionState.FAILED, DisconnectCause.UNKNOWN,
-                    "numero maximo de tentativas de reconexao excedido (" + maxReconnectAttempts + ")");
-            notifyError(new ConnectionException(instanceId, BridgeErrorCode.CONNECTION_FAILED,
-                    "desistindo de reconectar ao bridge para '" + instanceId + "' apos " + maxReconnectAttempts + " tentativas"));
-            return;
+            if (reconnectCooldown == null) {
+                // Comportamento antigo, agora so sob pedido explicito
+                // (reconnectCooldown(null)): desiste de vez.
+                notifyConnectionState(ConnectionState.FAILED, DisconnectCause.UNKNOWN,
+                        "numero maximo de tentativas de reconexao excedido (" + maxReconnectAttempts + ")");
+                notifyError(new ConnectionException(instanceId, BridgeErrorCode.CONNECTION_FAILED,
+                        "desistindo de reconectar ao bridge para '" + instanceId + "' apos " + maxReconnectAttempts + " tentativas"));
+                return;
+            }
+
+            delayMs = reconnectCooldown.toMillis() + ThreadLocalRandom.current().nextLong(1_000);
+            if (attempt == maxReconnectAttempts + 1) {
+                // O aviso sai UMA vez, na virada. Repeti-lo a cada ciclo
+                // encheria o log (e o listener de erro da aplicacao) de uma
+                // linha identica a cada cinco minutos, para sempre.
+                notifyConnectionState(ConnectionState.FAILED, DisconnectCause.UNKNOWN,
+                        "backoff esgotado apos " + maxReconnectAttempts + " tentativas - novas tentativas a cada "
+                                + reconnectCooldown.toSeconds() + "s");
+                notifyError(new ConnectionException(instanceId, BridgeErrorCode.CONNECTION_FAILED,
+                        "bridge de '" + instanceId + "' nao voltou apos " + maxReconnectAttempts
+                                + " tentativas; seguindo em tentativas espacadas de " + reconnectCooldown.toSeconds() + "s"));
+                log.warn("bridge de '{}' nao voltou apos {} tentativas - passando a tentar a cada {}s, indefinidamente",
+                        instanceId, maxReconnectAttempts, reconnectCooldown.toSeconds());
+            } else {
+                log.info("nova tentativa de reconexao ao bridge para '{}' em {} ms (modo espacado)", instanceId, delayMs);
+            }
+        } else {
+            long boundedExponent = Math.min(attempt - 1, 20);
+            delayMs = Math.min(maxReconnectDelay.toMillis(), minReconnectDelay.toMillis() * (1L << boundedExponent))
+                    + ThreadLocalRandom.current().nextLong(250);
+            log.info("agendando reconexao ao bridge para '{}' em {} ms (tentativa {}/{})", instanceId, delayMs, attempt, maxReconnectAttempts);
         }
 
-        long boundedExponent = Math.min(attempt - 1, 20);
-        long delayMs = Math.min(maxReconnectDelay.toMillis(), minReconnectDelay.toMillis() * (1L << boundedExponent))
-                + ThreadLocalRandom.current().nextLong(250);
-        log.info("agendando reconexao ao bridge para '{}' em {} ms (tentativa {}/{})", instanceId, delayMs, attempt, maxReconnectAttempts);
         reconnectExecutor.schedule(() -> attemptReconnect(bridgeStillAlive), delayMs, TimeUnit.MILLISECONDS);
     }
 
@@ -855,6 +891,9 @@ public final class WhatsAppClient implements AutoCloseable {
         private Duration minReconnectDelay;
         private Duration maxReconnectDelay;
         private Integer maxReconnectAttempts;
+        private Duration reconnectCooldown;
+        /** Distingue "nao configurado" de "configurado como null" (= desistir de vez). */
+        private boolean reconnectCooldownSet;
         private String nodeVersion;
         private String bridgeHost;
         private Integer bridgePort;
@@ -902,6 +941,39 @@ public final class WhatsAppClient implements AutoCloseable {
         }
 
         /** How many consecutive bridge-connection reconnect attempts before giving up and moving to FAILED. Default 10. */
+        /**
+         * Intervalo entre tentativas depois que o backoff exponencial se
+         * esgotou. Padrao: 5 minutos.
+         *
+         * <p><b>O que isto conserta.</b> Ate esta versao, esgotados os
+         * {@link #maxReconnectAttempts(int)} o cliente ia para
+         * {@link ConnectionState#FAILED} e <b>ninguem mais tentava</b>. Era o
+         * caminho pelo qual um numero "desconectava e nao voltava": a queda de
+         * rede durava mais que as dez tentativas, o cliente desistia em
+         * silencio e so um restart da aplicacao o traria de volta. Quem usava a
+         * SDK tinha de escrever um vigia por fora so para isso.
+         *
+         * <p>Agora o estado {@code FAILED} continua sendo reportado — a
+         * aplicacao precisa saber que o numero esta fora do ar —, mas as
+         * tentativas <b>nao param</b>: elas passam a sair neste intervalo, para
+         * sempre, e a conexao volta sozinha quando a rede voltar.
+         *
+         * <p>O intervalo e longo de proposito. Reconectar sem parar e pior do
+         * que nao reconectar: cada tentativa reapresenta um cliente web ao
+         * WhatsApp, e uma conta que faz isso vinte vezes por hora tem a
+         * assinatura de uso automatizado que leva a suspensao.
+         *
+         * @param reconnectCooldown intervalo entre tentativas espacadas, ou
+         *        {@code null} para o comportamento antigo (desistir de vez
+         *        apos {@code maxReconnectAttempts})
+         * @return este builder
+         */
+        public Builder reconnectCooldown(Duration reconnectCooldown) {
+            this.reconnectCooldown = reconnectCooldown;
+            this.reconnectCooldownSet = true;
+            return this;
+        }
+
         public Builder maxReconnectAttempts(int maxReconnectAttempts) {
             this.maxReconnectAttempts = maxReconnectAttempts;
             return this;

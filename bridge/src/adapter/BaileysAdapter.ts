@@ -37,7 +37,13 @@ export type ConnectionStateName =
     | 'LOGGED_OUT'
     | 'FAILED';
 
-export type DisconnectCause = 'USER_LOGOUT' | 'CONNECTION_LOST' | 'WHATSAPP_RESTART' | 'AUTH_FAILURE' | 'UNKNOWN';
+export type DisconnectCause =
+    | 'USER_LOGOUT'
+    | 'CONNECTION_LOST'
+    | 'WHATSAPP_RESTART'
+    | 'AUTH_FAILURE'
+    | 'CONNECTION_REPLACED'
+    | 'UNKNOWN';
 
 export interface BaileysAdapterCallbacks {
     onConnectionStateChanged(state: ConnectionStateName, cause: DisconnectCause | null, detail: string | null): void;
@@ -62,7 +68,11 @@ export interface AdapterOptions {
 
 const DISCONNECT_CAUSE_BY_STATUS_CODE: Record<number, DisconnectCause> = {
     [DisconnectReason.loggedOut]: 'USER_LOGOUT',
-    [DisconnectReason.connectionReplaced]: 'USER_LOGOUT',
+    // 440 NAO e logout. Outro cliente assumiu a sessao; a credencial continua
+    // valida. Reporta-lo como USER_LOGOUT fazia qualquer aplicacao que reage a
+    // "deslogou" apagando a credencial transformar um conflito recuperavel em
+    // repareamento forcado. Ver o tratamento em handleClose().
+    [DisconnectReason.connectionReplaced]: 'CONNECTION_REPLACED',
     [DisconnectReason.badSession]: 'AUTH_FAILURE',
     [DisconnectReason.multideviceMismatch]: 'AUTH_FAILURE',
     [DisconnectReason.forbidden]: 'AUTH_FAILURE',
@@ -74,21 +84,6 @@ const DISCONNECT_CAUSE_BY_STATUS_CODE: Record<number, DisconnectCause> = {
     [DisconnectReason.unavailableService]: 'CONNECTION_LOST'
 };
 
-/**
- * Closures after which the credentials on disk are unusable and must be
- * discarded.
- *
- * Baileys only emits a QR code when it starts with no valid credentials. If a
- * dead session is left on disk, every subsequent connect() reloads it, gets
- * rejected by WhatsApp for the same reason, and returns to LOGGED_OUT without
- * ever producing a QR - leaving the operator with a "reconnect" button that
- * can never work. Clearing the directory is what makes the next connect()
- * fall back to pairing.
- *
- * `connectionReplaced` is deliberately absent: there the credentials are still
- * valid, another socket simply took over the session, so reconnecting later
- * works and wiping them would force a pointless re-pairing.
- */
 /**
  * Quanto esperar o handshake do WhatsApp antes de pedir o codigo de
  * pareamento. Generoso de proposito: quem esta conectando um numero novo
@@ -139,6 +134,32 @@ const CONNECT_TIMEOUT_MS = 30_000;
 const QUERY_TIMEOUT_MS = 45_000;
 
 /**
+ * Quantas reconexoes seguidas podem sair sem espera nenhuma.
+ *
+ * O 515 (`restartRequired`) pede religar na hora, e isso e normal <b>uma vez</b>,
+ * logo apos o pareamento. O problema e que o caminho imediato ignorava o
+ * contador de tentativas: se o servidor respondesse 515 repetidamente — versao
+ * de WhatsApp Web errada em cache por 6h, por exemplo — o resultado era um laco
+ * abrir->515->abrir sem freio nenhum, martelando o servidor do WhatsApp com
+ * handshakes. A partir da quarta seguida, o 515 passa a esperar como qualquer
+ * outra queda.
+ */
+const MAX_RECONEXOES_IMEDIATAS = 3;
+
+/**
+ * Espera antes de tentar voltar depois de um `connectionReplaced` (440).
+ *
+ * Longa de proposito. 440 significa que OUTRO cliente assumiu a conta. Voltar
+ * correndo derrubaria o dele, que voltaria correndo e derrubaria o nosso — a
+ * guerra de reconexao que faz a conta apresentar clientes web entrando e saindo
+ * sem parar, que e exatamente a assinatura de automacao que se quer evitar.
+ * Cinco minutos e devagar o bastante para nao ser guerra e rapido o bastante
+ * para a conta voltar sozinha quando o outro cliente era um bridge orfao (que
+ * se encerra por ociosidade em 120s).
+ */
+const RECONEXAO_APOS_SUBSTITUICAO_MS = 5 * 60_000;
+
+/**
  * Codigos em que o WhatsApp deu a credencial por invalida, e guardar o disco
  * so faria a reconexao repetir a mesma recusa para sempre.
  *
@@ -149,6 +170,14 @@ const QUERY_TIMEOUT_MS = 45_000;
  * se quer fazer, porque reapresenta um cliente web novo justamente quando o
  * numero esta sob observacao. Agora o 403 reporta AUTH_FAILURE e <b>preserva o
  * disco</b>: se a restricao passar, a mesma credencial volta a conectar.
+ *
+ * <p>`connectionReplaced` (440) nunca esteve aqui, pelo mesmo motivo: a
+ * credencial continua valida, outro socket apenas assumiu a sessao.
+ *
+ * <p>O que sobra na lista sao os codigos em que o Baileys so voltaria a emitir
+ * QR depois de o diretorio ficar vazio — sem a limpeza, todo connect() recarrega
+ * a sessao morta, leva a mesma recusa e volta a LOGGED_OUT sem nunca produzir um
+ * QR, deixando o operador com um botao de "reconectar" que nao pode funcionar.
  */
 const CREDENTIALS_INVALIDATED_STATUS_CODES: ReadonlySet<number> = new Set([
     DisconnectReason.loggedOut,
@@ -169,6 +198,8 @@ export class BaileysAdapter {
     private state: ConnectionStateName = 'DISCONNECTED';
     private currentQr: string | null = null;
     private reconnectAttempts = 0;
+    /** Reconexoes "na hora" (515) seguidas, para o caminho imediato ter teto. */
+    private reconexoesImediatas = 0;
     private reconnectTimer: NodeJS.Timeout | null = null;
     /**
      * Which deliberate local action (if any) is in flight. Not a plain boolean:
@@ -620,6 +651,7 @@ export class BaileysAdapter {
             this.marcarPronto?.();
             this.currentQr = null;
             this.reconnectAttempts = 0;
+            this.reconexoesImediatas = 0;
             this.pareamento = null;          // pareou: o codigo cumpriu o papel
             this.pareamentoRegistradoEm = null;
             this.setState('CONNECTED', null, null);
@@ -663,6 +695,22 @@ export class BaileysAdapter {
             return;
         }
 
+        // Outro cliente assumiu a conta. A credencial continua boa, entao nao
+        // se apaga nada — mas voltar correndo comecaria uma guerra de
+        // reconexao com quem assumiu. Espera longa e fixa: se o outro lado era
+        // um bridge orfao, ele morre por ociosidade nesse meio tempo e a conta
+        // volta sozinha; se era um cliente de verdade, cinco minutos entre
+        // tentativas nao produz o vaivem que chama atencao na conta.
+        if (cause === 'CONNECTION_REPLACED') {
+            this.logger.warn(
+                { detail, proximaTentativaMs: RECONEXAO_APOS_SUBSTITUICAO_MS },
+                'outro cliente assumiu esta conta (connectionReplaced) - credenciais preservadas, nova tentativa daqui a pouco'
+            );
+            this.setState('RECONNECTING', cause, detail);
+            this.scheduleReconnect(false, RECONEXAO_APOS_SUBSTITUICAO_MS);
+            return;
+        }
+
         // Com pareamento em curso, a queda e ESPERADA: o Baileys derruba o
         // socket quando as refs de QR acabam (~2 min). Nao e falha, entao nao
         // pode alimentar o backoff exponencial — cada segundo aqui e um
@@ -694,7 +742,7 @@ export class BaileysAdapter {
         });
     }
 
-    private scheduleReconnect(immediate: boolean): void {
+    private scheduleReconnect(immediate: boolean, delayFixoMs?: number): void {
         this.cancelarReconexao();
 
         // Saida deliberada (disconnect/logout) nao reconecta. Sem esta
@@ -704,12 +752,30 @@ export class BaileysAdapter {
             return;
         }
 
-        const delay = immediate
-            ? 0
-            : Math.min(
-                  this.options.maxReconnectDelayMs,
-                  this.options.minReconnectDelayMs * Math.pow(2, this.reconnectAttempts)
-              ) + Math.floor(Math.random() * 250);
+        // O caminho imediato (515) tem teto: sem ele, um 515 que se repetisse
+        // virava um laco de handshakes sem espera nenhuma, porque
+        // reconnectAttempts era incrementado mas nunca consultado aqui.
+        const podeSerImediato = immediate && this.reconexoesImediatas < MAX_RECONEXOES_IMEDIATAS;
+        if (immediate && !podeSerImediato) {
+            this.logger.warn(
+                { seguidas: this.reconexoesImediatas },
+                'WhatsApp pediu reinicio imediato vezes demais seguidas - passando a esperar entre as tentativas'
+            );
+        }
+        this.reconexoesImediatas = podeSerImediato ? this.reconexoesImediatas + 1 : 0;
+
+        let delay: number;
+        if (podeSerImediato) {
+            delay = 0;
+        } else if (delayFixoMs !== undefined) {
+            delay = delayFixoMs + Math.floor(Math.random() * 1_000);
+        } else {
+            delay =
+                Math.min(
+                    this.options.maxReconnectDelayMs,
+                    this.options.minReconnectDelayMs * Math.pow(2, this.reconnectAttempts)
+                ) + Math.floor(Math.random() * 250);
+        }
 
         this.reconnectAttempts += 1;
         this.logger.info({ delay, attempt: this.reconnectAttempts }, 'scheduling reconnect');
