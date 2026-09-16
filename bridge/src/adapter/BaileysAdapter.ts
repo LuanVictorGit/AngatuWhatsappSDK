@@ -11,7 +11,7 @@ import makeWASocket, {
     type BaileysEventMap
 } from 'baileys';
 import { Boom } from '@hapi/boom';
-import { loggerDoBaileys, ruidoDoProtocolo, type Logger } from '../util/logger.js';
+import { limparRuido, loggerDoBaileys, ruidoDoProtocolo, type Logger } from '../util/logger.js';
 import { useDurableAuthState, limparCredenciais } from './AuthState.js';
 import { ReadBudget } from './ReadBudget.js';
 import { MessageCache } from './MessageCache.js';
@@ -1036,6 +1036,26 @@ export class BaileysAdapter {
         await limparCredenciais(this.options.sessionDirectory, this.logger);
         // Also set explicitly, same reasoning as disconnect() above.
         this.setState('LOGGED_OUT', 'USER_LOGOUT', 'logout() chamado explicitamente');
+    }
+
+    /**
+     * Libera o que vive fora do socket: o temporizador de manutencao do cache
+     * de mensagens e os contadores de ruido de protocolo desta instancia.
+     *
+     * De proposito NAO faz parte de `disconnect()` nem de `logout()`: dos dois
+     * a instancia pode voltar a operar (reconectar sem QR novo), e enquanto
+     * isso o `messageCache` ainda precisa de alguem varrendo o que expirou.
+     * `destroy()` e para quando a instancia deixa de existir de verdade - o
+     * `destroy`/`shutdown` do InstanceManager.
+     *
+     * Idempotente: chamar duas vezes nao faz mal.
+     */
+    destroy(): void {
+        if (this.manutencaoTimer) {
+            clearInterval(this.manutencaoTimer);
+            this.manutencaoTimer = null;
+        }
+        limparRuido(this.options.instanceId);
     }
 
     /**

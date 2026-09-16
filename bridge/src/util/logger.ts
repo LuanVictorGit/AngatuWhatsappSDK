@@ -95,6 +95,20 @@ export function ruidoDoProtocolo(instanceId: string): Record<string, number> {
     return contagens ? Object.fromEntries(contagens) : {};
 }
 
+/**
+ * Esquece os contadores de uma instancia que deixou de existir.
+ *
+ * `contadoresDeRuido` e um mapa de nivel de modulo: sem isto, a entrada de
+ * cada instancia destruida ficaria la ate o processo terminar. Chamado pelo
+ * `destroy()` do adapter, nao pelo `disconnect()` - depois de um disconnect a
+ * instancia ainda existe e a contagem ainda vale.
+ *
+ * @param instanceId instancia que esta sendo destruida
+ */
+export function limparRuido(instanceId: string): void {
+    contadoresDeRuido.delete(instanceId);
+}
+
 function contarRuido(instanceId: string, trecho: string): number {
     let contagens = contadoresDeRuido.get(instanceId);
     if (!contagens) {

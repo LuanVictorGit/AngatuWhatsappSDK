@@ -43,7 +43,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * WebSocket-level keepalive in favour of its own application-level
  * heartbeat).
  */
-final class MockBridgeServer implements AutoCloseable {
+public final class MockBridgeServer implements AutoCloseable {
 
     private static final String WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -63,7 +63,7 @@ final class MockBridgeServer implements AutoCloseable {
         this.serverSocket = serverSocket;
     }
 
-    static MockBridgeServer start() throws IOException {
+    public static MockBridgeServer start() throws IOException {
         ServerSocket serverSocket = new ServerSocket();
         serverSocket.bind(new InetSocketAddress("127.0.0.1", 0));
         MockBridgeServer server = new MockBridgeServer(serverSocket);
@@ -71,7 +71,7 @@ final class MockBridgeServer implements AutoCloseable {
         return server;
     }
 
-    int port() {
+    public int port() {
         return serverSocket.getLocalPort();
     }
 
@@ -80,7 +80,7 @@ final class MockBridgeServer implements AutoCloseable {
     }
 
     /** Waits for and returns the next full JSON message the client sent, or null on timeout. */
-    JsonNode nextMessage(Duration timeout) throws InterruptedException {
+    public JsonNode nextMessage(Duration timeout) throws InterruptedException {
         return receivedMessages.poll(timeout.toMillis(), TimeUnit.MILLISECONDS);
     }
 
@@ -88,7 +88,7 @@ final class MockBridgeServer implements AutoCloseable {
         return lastCloseCode.get();
     }
 
-    void sendJson(Object value) throws IOException {
+    public void sendJson(Object value) throws IOException {
         sendFrame(0x1, mapper.writeValueAsBytes(value));
     }
 

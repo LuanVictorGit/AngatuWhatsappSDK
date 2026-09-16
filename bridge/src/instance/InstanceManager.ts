@@ -106,6 +106,9 @@ export class InstanceManager {
     async destroy(instanceId: string): Promise<void> {
         const instance = this.get(instanceId);
         await instance.adapter.disconnect();
+        // Depois do disconnect: a instancia nao volta mais, entao o
+        // temporizador de manutencao e os contadores dela vao junto.
+        instance.adapter.destroy();
         this.instances.delete(instanceId);
         this.sessionDirsInUse.delete(resolve(instance.sessionDirectory));
         this.liberarTrava(instanceId);
@@ -113,7 +116,10 @@ export class InstanceManager {
     }
 
     async shutdownAll(): Promise<void> {
-        await Promise.all([...this.instances.values()].map((instance) => instance.adapter.disconnect()));
+        await Promise.all([...this.instances.values()].map(async (instance) => {
+            await instance.adapter.disconnect();
+            instance.adapter.destroy();
+        }));
         this.instances.clear();
         this.sessionDirsInUse.clear();
         for (const instanceId of [...this.locks.keys()]) {

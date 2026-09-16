@@ -58,6 +58,7 @@ import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
@@ -93,6 +94,18 @@ public final class WhatsAppClient implements AutoCloseable {
     private static final Duration DEFAULT_MAX_RECONNECT_DELAY = Duration.ofSeconds(30);
     private static final int DEFAULT_MAX_RECONNECT_ATTEMPTS = 10;
     private static final Duration SEND_REQUEST_TIMEOUT = Duration.ofSeconds(120);
+
+    /**
+     * Teto do conjunto {@link #presencaAssinada}.
+     *
+     * <p>Sem ele, um processo de longa duracao acumula um {@code String} por
+     * conversa distinta que ja escreveu, para sempre. Vinte mil cabe folgado em
+     * memoria e cobre qualquer volume plausivel de conversas ativas; ao encher,
+     * o conjunto e esvaziado por inteiro - o mesmo padrao "capado, e ao encher,
+     * limpa tudo" que o bridge ja usa em {@code LidDirectory},
+     * {@code numerosVerificados} e {@code gruposEmCache}.
+     */
+    private static final int MAX_PRESENCAS_ASSINADAS = 20_000;
 
     /**
      * Intervalo entre tentativas depois que o backoff exponencial se esgotou.
@@ -139,6 +152,17 @@ public final class WhatsAppClient implements AutoCloseable {
     private volatile BridgeConnection connection;
 
     /**
+     * Trava contra duas tentativas simultaneas de criar processo/WebSocket.
+     *
+     * <p>Sem ela, duas chamadas concorrentes que cheguem a
+     * {@link #startBridgeAndConnectInstance()} sobem dois processos do bridge e
+     * so a referencia do segundo sobrevive em {@link #processManager} - o
+     * primeiro fica orfao, vivo, segurando a trava de sessao em disco e duas
+     * threads nao-daemon da biblioteca de WebSocket.
+     */
+    private final AtomicBoolean orchestratingConnection = new AtomicBoolean(false);
+
+    /**
      * A fila de envio desta instancia: uma thread, nada em paralelo, com o
      * intervalo humano e o "digitando..." embutidos. Ver {@link SendPacer}.
      */
@@ -159,11 +183,16 @@ public final class WhatsAppClient implements AutoCloseable {
         this.bridgeHost = builder.bridgeHost;
         this.bridgePort = builder.bridgePort;
         this.logLevel = builder.logLevel;
+        // O registro vem ANTES do pacer de proposito. SendPacer sobe a thread
+        // da fila no proprio construtor; se register() lancar (instanceId ou
+        // sessionDirectory repetido), o construtor do WhatsAppClient propaga a
+        // excecao sem devolver objeto nenhum - e ninguem teria como chamar
+        // pacer.close() na thread que acabou de nascer.
+        InstanceRegistry.register(instanceId, sessionDirectory);
+
         this.pacer = new SendPacer(instanceId, new PacerBackendImpl(),
                 builder.pacing != null ? builder.pacing : PacingOptions.padrao(),
                 builder.humanization != null ? builder.humanization : HumanizationOptions.padrao());
-
-        InstanceRegistry.register(instanceId, sessionDirectory);
     }
 
     public static Builder builder() {
@@ -172,6 +201,25 @@ public final class WhatsAppClient implements AutoCloseable {
 
     // ---------------------------------------------------------------- lifecycle
 
+    /**
+     * Conecta ao WhatsApp, reaproveitando o processo do bridge e o WebSocket
+     * que ja existirem.
+     *
+     * <p>Os tres caminhos, do mais barato ao mais caro, sao os mesmos que
+     * {@link #attemptReconnect(boolean)} ja escolhia internamente. Chamar
+     * {@code connect()} depois de {@link #disconnect()} - o ciclo de pausar e
+     * retomar documentado em EXAMPLES.md - cai no primeiro: {@code disconnect()}
+     * fecha a conexao do lado do WhatsApp e nao toca no processo nem no
+     * WebSocket entre Java e bridge, que continuam validos. Antes, este metodo
+     * subia um processo novo em toda chamada; o antigo, ainda vivo, ficava sem
+     * referencia nenhuma e ainda derrubava o novo com
+     * {@code INSTANCE_ALREADY_EXISTS} - a trava de sessao em disco pertencia a
+     * ele.
+     *
+     * <p>O caminho rapido nao precisa de trava propria: o {@code connect()} do
+     * lado do bridge ja e no-op quando existe socket ativo (uma conta, um
+     * socket).
+     */
     public CompletableFuture<Void> connect() {
         if (closed.get()) {
             return CompletableFuture.failedFuture(
@@ -179,6 +227,16 @@ public final class WhatsAppClient implements AutoCloseable {
         }
         userInitiatedStop = false;
         reconnectAttempts.set(0);
+
+        BridgeConnection existingConnection = this.connection;
+        if (existingConnection != null && existingConnection.isOpen()) {
+            return existingConnection.sendRequest("connect", instanceId, JsonNodeFactory.instance.objectNode())
+                    .thenApply(v -> (Void) null);
+        }
+        BridgeProcessManager existingProcess = this.processManager;
+        if (existingProcess != null && existingProcess.isAlive()) {
+            return reconnectWebSocketOnly();
+        }
         return startBridgeAndConnectInstance();
     }
 
@@ -247,12 +305,18 @@ public final class WhatsAppClient implements AutoCloseable {
             } catch (Exception e) {
                 log.debug("conexao com o bridge nao fechou a tempo apos o pedido de shutdown: {}", e.getMessage());
             }
-        } else if (currentConnection != null) {
+        }
+        // Fora do if de proposito: o caminho educado acima pode ter esgotado o
+        // timeout com a conexao ainda aberta, e ai ela tambem precisa ser
+        // fechada. close() e idempotente, entao chamar sempre nao custa nada e
+        // garante que as threads da biblioteca de WebSocket caiam.
+        if (currentConnection != null) {
             currentConnection.close();
         }
 
-        if (currentProcess != null) {
-            currentProcess.stop(SHUTDOWN_GRACE_PERIOD);
+        if (currentProcess != null && !currentProcess.stop(SHUTDOWN_GRACE_PERIOD)) {
+            log.warn("nao foi possivel confirmar o encerramento do processo do bridge de '{}' - "
+                    + "pode ter restado um processo node orfao", instanceId);
         }
 
         reconnectExecutor.shutdownNow();
@@ -807,7 +871,24 @@ public final class WhatsAppClient implements AutoCloseable {
 
     // ---------------------------------------------------------------- connection orchestration
 
+    /**
+     * Sobe um processo do bridge novo e conecta a instancia nele.
+     *
+     * <p>Protegido pela trava de orquestracao: junto de
+     * {@link #reconnectWebSocketOnly()}, e o unico lugar que cria recursos de
+     * sistema operacional. As duas entradas travam aqui dentro - e nao em quem
+     * chama - para que toda chamada fique coberta, venha ela de
+     * {@link #connect()} ou de {@link #attemptReconnect(boolean)}.
+     */
     private CompletableFuture<Void> startBridgeAndConnectInstance() {
+        if (!orchestratingConnection.compareAndSet(false, true)) {
+            return jaHaConexaoEmAndamento();
+        }
+        return subirBridgeEConectar().whenComplete((v, ex) -> orchestratingConnection.set(false));
+    }
+
+    /** Corpo de {@link #startBridgeAndConnectInstance()}, ja com a trava tomada. */
+    private CompletableFuture<Void> subirBridgeEConectar() {
         BridgeProcessManager newProcessManager;
         try {
             newProcessManager = BridgeProcessManager.start(
@@ -815,6 +896,9 @@ public final class WhatsAppClient implements AutoCloseable {
         } catch (RuntimeException e) {
             return CompletableFuture.failedFuture(e);
         }
+        // O anterior so cai depois que o novo subiu: se start() falhar, nao vale
+        // a pena derrubar o que ainda estava de pe.
+        encerrarProcessoSubstituido(this.processManager);
         this.processManager = newProcessManager;
 
         return newProcessManager.portReady()
@@ -829,11 +913,58 @@ public final class WhatsAppClient implements AutoCloseable {
     private CompletableFuture<ProtocolAck> openConnection(BridgeProcessManager processManagerForThisAttempt, int port) {
         BridgeConnection newConnection = new BridgeConnection(URI.create("ws://127.0.0.1:" + port), processManagerForThisAttempt.authToken());
         newConnection.setEventListener(this::handleBridgeEvent);
+        BridgeConnection previousConnection = this.connection;
         this.connection = newConnection;
+        encerrarConexaoSubstituida(previousConnection);
         return newConnection.connect(HANDSHAKE_TIMEOUT).thenApply(ack -> {
-            newConnection.whenClosed().thenAccept(this::handleConnectionClosed);
+            newConnection.whenClosed().thenAccept(info -> handleConnectionClosed(newConnection, info));
             return new ProtocolAck();
         });
+    }
+
+    /**
+     * Fecha uma conexao que acaba de ser substituida por outra.
+     *
+     * <p>Diferente do processo, isto e inline: {@code close()} nao bloqueia em
+     * E/S e e idempotente. A troca de {@link #connection} vem antes da chamada
+     * de proposito - assim {@link #handleConnectionClosed} ja enxerga a nova
+     * como a atual e reconhece este fechamento como o da anterior, sem agendar
+     * uma reconexao que nao faz falta.
+     */
+    private void encerrarConexaoSubstituida(BridgeConnection anterior) {
+        if (anterior != null) {
+            anterior.close();
+        }
+    }
+
+    /**
+     * Encerra um processo do bridge que acaba de ser substituido.
+     *
+     * <p>Fora da thread chamadora porque {@code stop()} pode levar ate
+     * {@link #SHUTDOWN_GRACE_PERIOD} mais o tempo do termino forcado se o
+     * processo ainda estiver vivo, e a tentativa de conexao nova nao pode
+     * esperar por isso. Mesmo com o processo ja morto a chamada importa: e
+     * {@code stop()} quem remove o shutdown hook da JVM, e este e o caminho
+     * percorrido a cada recuperacao de {@code BRIDGE_CRASH} - sem a chamada,
+     * cada queda do bridge deixava uma {@code Thread} registrada para sempre
+     * dentro do processo Java, que e o de vida longa.
+     */
+    private void encerrarProcessoSubstituido(BridgeProcessManager anterior) {
+        if (anterior == null) {
+            return;
+        }
+        try {
+            reconnectExecutor.execute(() -> anterior.stop(SHUTDOWN_GRACE_PERIOD));
+        } catch (RejectedExecutionException e) {
+            // Executor ja encerrado por um close() concorrente: melhor segurar
+            // esta thread do que deixar um processo node orfao para tras.
+            anterior.stop(SHUTDOWN_GRACE_PERIOD);
+        }
+    }
+
+    private CompletableFuture<Void> jaHaConexaoEmAndamento() {
+        return CompletableFuture.failedFuture(new IllegalStateException(
+                "ja existe uma tentativa de conexao em andamento para '" + instanceId + "'"));
     }
 
     /** Marker return type so the connect chain above reads as a sequence of steps rather than juggling HandshakeAck. */
@@ -862,8 +993,15 @@ public final class WhatsAppClient implements AutoCloseable {
         return connection().sendRequest("create_instance", instanceId, payload);
     }
 
-    private void handleConnectionClosed(DisconnectInfo info) {
+    private void handleConnectionClosed(BridgeConnection closedConnection, DisconnectInfo info) {
         if (userInitiatedStop || closed.get()) {
+            return;
+        }
+        if (closedConnection != this.connection) {
+            // Conexao ja substituida por outra: este fechamento e o encerramento
+            // esperado da anterior, nao a queda da atual - reagir a ele agendaria
+            // uma reconexao por cima de uma conexao que esta de pe.
+            log.debug("fechamento de uma conexao ja substituida de '{}' ignorado (code={})", instanceId, info.code());
             return;
         }
         boolean bridgeStillAlive = processManager != null && processManager.isAlive();
@@ -941,8 +1079,23 @@ public final class WhatsAppClient implements AutoCloseable {
         }
     }
 
-    /** The bridge process survived; only the Java<->bridge WebSocket needs to be re-established, not the WhatsApp connection itself. */
+    /**
+     * The bridge process survived; only the Java&lt;-&gt;bridge WebSocket needs to be
+     * re-established, not the WhatsApp connection itself.
+     *
+     * <p>Sob a mesma trava de {@link #startBridgeAndConnectInstance()}: as duas
+     * criam recursos que ninguem mais teria como fechar se ficassem sem
+     * referencia.
+     */
     private CompletableFuture<Void> reconnectWebSocketOnly() {
+        if (!orchestratingConnection.compareAndSet(false, true)) {
+            return jaHaConexaoEmAndamento();
+        }
+        return reabrirWebSocket().whenComplete((v, ex) -> orchestratingConnection.set(false));
+    }
+
+    /** Corpo de {@link #reconnectWebSocketOnly()}, ja com a trava tomada. */
+    private CompletableFuture<Void> reabrirWebSocket() {
         BridgeProcessManager currentProcess = this.processManager;
         int port;
         try {
@@ -951,15 +1104,18 @@ public final class WhatsAppClient implements AutoCloseable {
             port = -1;
         }
         if (port <= 0) {
-            return startBridgeAndConnectInstance();
+            // Chama o corpo, nao o metodo travado: a trava ja e nossa.
+            return subirBridgeEConectar();
         }
 
         BridgeConnection newConnection = new BridgeConnection(URI.create("ws://127.0.0.1:" + port), currentProcess.authToken());
         newConnection.setEventListener(this::handleBridgeEvent);
+        BridgeConnection previousConnection = this.connection;
         this.connection = newConnection;
+        encerrarConexaoSubstituida(previousConnection);
         return newConnection.connect(HANDSHAKE_TIMEOUT)
                 .thenCompose(ack -> {
-                    newConnection.whenClosed().thenAccept(this::handleConnectionClosed);
+                    newConnection.whenClosed().thenAccept(info -> handleConnectionClosed(newConnection, info));
                     return newConnection.sendRequest("get_status", instanceId, JsonNodeFactory.instance.objectNode());
                 })
                 .thenAccept(status -> notifyConnectionState(
@@ -1040,15 +1196,25 @@ public final class WhatsAppClient implements AutoCloseable {
         HumanizationOptions sinais = pacer.humanization();
         String chatId = message.chatId();
 
-        if (sinais.autoSubscribePresence() && presencaAssinada.add(chatId)) {
-            subscribePresence(chatId).exceptionally(e -> {
-                // Nao conseguiu assinar: solta a marca para tentar de novo na
-                // proxima mensagem, em vez de desistir daquela conversa para
-                // sempre.
-                presencaAssinada.remove(chatId);
-                log.debug("nao foi possivel assinar a presenca de '{}': {}", chatId, e.getMessage());
-                return null;
-            });
+        if (sinais.autoSubscribePresence()) {
+            if (presencaAssinada.size() >= MAX_PRESENCAS_ASSINADAS) {
+                // Capado, e ao encher, limpa tudo - o mesmo padrao dos caches do
+                // bridge. O pior caso e reassinar mais tarde uma conversa que ja
+                // estava assinada, e subscribePresence e idempotente.
+                log.debug("teto de {} presencas assinadas atingido em '{}' - recomecando o conjunto",
+                        MAX_PRESENCAS_ASSINADAS, instanceId);
+                presencaAssinada.clear();
+            }
+            if (presencaAssinada.add(chatId)) {
+                subscribePresence(chatId).exceptionally(e -> {
+                    // Nao conseguiu assinar: solta a marca para tentar de novo na
+                    // proxima mensagem, em vez de desistir daquela conversa para
+                    // sempre.
+                    presencaAssinada.remove(chatId);
+                    log.debug("nao foi possivel assinar a presenca de '{}': {}", chatId, e.getMessage());
+                    return null;
+                });
+            }
         }
 
         if (sinais.readReceipts() != ReadReceiptMode.AUTO) {

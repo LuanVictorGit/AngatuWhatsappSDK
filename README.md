@@ -754,6 +754,11 @@ O módulo `sdk` cobre, sem depender de uma conta real de WhatsApp:
   conexão, contra um **mock do bridge** (`MockBridgeServer`, WebSocket RFC 6455 implementado à mão
   sobre socket bloqueante — veja [Decisões de arquitetura](#decisões-de-arquitetura) para o porquê
   de não usar a própria classe de servidor da biblioteca WebSocket aqui).
+- `WhatsAppClientLifecycleTest` — ciclo de vida de recursos: que `connect()` reaproveita o processo
+  e o WebSocket que já existirem (o ciclo `disconnect()` → `connect()` **não** sobe um segundo
+  processo Node), que uma orquestração de conexão já em andamento recusa chamadas concorrentes em
+  vez de criar um processo por chamada, que o conjunto de presenças assinadas tem teto, e que uma
+  construção recusada por `InstanceRegistry` não deixa a thread da fila de envio órfã.
 
 O módulo `cli` cobre o parser de argumentos e o renderizador de QR Code em ASCII (incluindo, depois
 de um bug real encontrado durante o desenvolvimento, que a saída é estritamente ASCII — veja a
@@ -763,6 +768,33 @@ Testes de integração real Java↔Bridge↔WhatsApp (com um número de telefone
 parte da suíte automatizada — foram verificados manualmente durante o desenvolvimento deste
 projeto (conexão, QR Code, autenticação, troca de mensagens, causas de desconexão) e podem ser
 repetidos a qualquer momento com o CLI (`connect`) ou os exemplos.
+
+### Verificação manual de vazamento de recursos
+
+Duas coisas dependem de um processo bridge de verdade e por isso ficam fora da suíte — subir Node a
+cada execução deixaria os testes lentos e dependentes do ambiente. Valem uma passada manual sempre
+que a orquestração de conexão de `WhatsAppClient` for mexida:
+
+```bash
+# 1. Rajada de connect() concorrente logo após construir o cliente:
+#    só UM processo node pode subir.
+ps aux | grep -c '[b]ridge.mjs'
+
+# 2. Crash do bridge e recuperação, algumas vezes seguidas: o número de
+#    threads da JVM não pode crescer a cada ciclo (é o shutdown hook do
+#    processo antigo que vazava aqui).
+kill -9 <pid-do-node>
+jcmd <pid-java> Thread.print | grep -c '^"'
+
+# 3. Com autoSubscribePresence ligado, trocando de conversa por 30+ minutos:
+#    o heap tem de estabilizar, não crescer linearmente.
+jcmd <pid-java> GC.heap_info
+```
+
+O lado Node tem a verificação equivalente para `BaileysAdapter.destroy()` (o temporizador de
+manutenção do cache de mensagens e os contadores de ruído de protocolo): criar uma instância,
+chamar `destroy()` e confirmar que nenhum handle `Timeout` sobrou em
+`process._getActiveHandles()`.
 
 ## Como publicar
 
