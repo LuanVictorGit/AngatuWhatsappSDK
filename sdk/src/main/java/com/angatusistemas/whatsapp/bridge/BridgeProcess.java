@@ -100,6 +100,15 @@ public final class BridgeProcess {
         return process.isAlive();
     }
 
+    public boolean exitsWithin(Duration wait) {
+        try {
+            return process.waitFor(wait.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return !process.isAlive();
+        }
+    }
+
     public void stop(Duration grace) {
         if (!process.isAlive()) {
             return;

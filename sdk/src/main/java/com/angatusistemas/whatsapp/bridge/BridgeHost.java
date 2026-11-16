@@ -37,6 +37,7 @@ public final class BridgeHost {
     private static final long MAX_RESTART_DELAY_MS = 30_000;
     private static final long COOLDOWN_DELAY_MS = 60_000;
     private static final int FAILURES_BEFORE_COOLDOWN = 10;
+    private static final Duration CRASH_GRACE = Duration.ofSeconds(1);
 
     private final Map<String, Attachment> attachments = new ConcurrentHashMap<>();
     private final ReentrantLock lock = new ReentrantLock();
@@ -160,8 +161,14 @@ public final class BridgeHost {
             return;
         }
         connection = null;
+        Threads.VIRTUAL.execute(() -> classifyAndRecover(detail));
+    }
+
+    // The socket usually closes before the OS reports the process dead: give the exit a moment to show.
+    private void classifyAndRecover(String detail) {
         BridgeProcess current = process;
-        DisconnectCause cause = current != null && current.isAlive() ? DisconnectCause.CONNECTION_LOST : DisconnectCause.BRIDGE_CRASH;
+        boolean crashed = current == null || current.exitsWithin(CRASH_GRACE);
+        DisconnectCause cause = crashed ? DisconnectCause.BRIDGE_CRASH : DisconnectCause.CONNECTION_LOST;
         Console.warn("[whatsapp] bridge link lost (%s, %s) - reconnecting", cause, detail);
         attachments.values().forEach(attachment -> Threads.VIRTUAL.execute(() -> attachment.onBridgeLost(cause, detail)));
         scheduleRestart();
