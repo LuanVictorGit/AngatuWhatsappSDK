@@ -1,135 +1,133 @@
 package com.angatusistemas.whatsapp;
 
-import com.angatusistemas.whatsapp.exception.BridgeException;
+import br.com.angatusistemas.lib.console.Console;
+import com.angatusistemas.whatsapp.bridge.BridgeHost;
+import com.angatusistemas.whatsapp.bridge.OrphanBridges;
+import com.angatusistemas.whatsapp.exception.BridgeErrorCode;
 import com.angatusistemas.whatsapp.exception.ConnectionException;
+import com.angatusistemas.whatsapp.exception.QueueException;
 import com.angatusistemas.whatsapp.exception.WhatsAppException;
+import com.angatusistemas.whatsapp.internal.Decode;
+import com.angatusistemas.whatsapp.internal.EventInbox;
 import com.angatusistemas.whatsapp.internal.InstanceRegistry;
+import com.angatusistemas.whatsapp.internal.Jids;
+import com.angatusistemas.whatsapp.internal.Json;
 import com.angatusistemas.whatsapp.internal.QrCodeRenderer;
+import com.angatusistemas.whatsapp.internal.SessionInspector;
+import com.angatusistemas.whatsapp.internal.Threads;
+import com.angatusistemas.whatsapp.listener.ButtonListener;
+import com.angatusistemas.whatsapp.listener.CallListener;
 import com.angatusistemas.whatsapp.listener.ConnectionStateListener;
 import com.angatusistemas.whatsapp.listener.ErrorListener;
 import com.angatusistemas.whatsapp.listener.GroupUpdateListener;
 import com.angatusistemas.whatsapp.listener.MessageDeletedListener;
 import com.angatusistemas.whatsapp.listener.MessageListener;
 import com.angatusistemas.whatsapp.listener.MessageUpdatedListener;
+import com.angatusistemas.whatsapp.listener.PollVoteListener;
 import com.angatusistemas.whatsapp.listener.PresenceListener;
 import com.angatusistemas.whatsapp.listener.QrCodeListener;
 import com.angatusistemas.whatsapp.listener.ReactionListener;
+import com.angatusistemas.whatsapp.model.Account;
+import com.angatusistemas.whatsapp.model.BridgeStats;
+import com.angatusistemas.whatsapp.model.BusinessProfile;
+import com.angatusistemas.whatsapp.model.ButtonClick;
+import com.angatusistemas.whatsapp.model.ButtonReply;
+import com.angatusistemas.whatsapp.model.ButtonStyle;
 import com.angatusistemas.whatsapp.model.Contact;
+import com.angatusistemas.whatsapp.model.ContactStatus;
 import com.angatusistemas.whatsapp.model.Group;
-import com.angatusistemas.whatsapp.model.MediaContent;
+import com.angatusistemas.whatsapp.model.GroupCheck;
+import com.angatusistemas.whatsapp.model.IncomingCall;
+import com.angatusistemas.whatsapp.model.MediaFile;
 import com.angatusistemas.whatsapp.model.Message;
 import com.angatusistemas.whatsapp.model.NumberCheck;
-import com.angatusistemas.whatsapp.pacing.HumanizationOptions;
-import com.angatusistemas.whatsapp.pacing.PacingOptions;
-import com.angatusistemas.whatsapp.pacing.QueuedSend;
-import com.angatusistemas.whatsapp.pacing.ReadReceiptMode;
-import com.angatusistemas.whatsapp.pacing.SendPacer;
-import com.angatusistemas.whatsapp.protocol.BridgeErrorCode;
-import com.angatusistemas.whatsapp.request.DeleteMessageRequest;
-import com.angatusistemas.whatsapp.request.EditMessageRequest;
+import com.angatusistemas.whatsapp.model.ParticipantAction;
+import com.angatusistemas.whatsapp.model.ParticipantResult;
+import com.angatusistemas.whatsapp.model.PendingInteraction;
+import com.angatusistemas.whatsapp.model.Presence;
+import com.angatusistemas.whatsapp.model.PrivacySetting;
+import com.angatusistemas.whatsapp.model.QrCode;
+import com.angatusistemas.whatsapp.model.SessionStatus;
+import com.angatusistemas.whatsapp.options.BridgeOptions;
+import com.angatusistemas.whatsapp.options.CallOptions;
+import com.angatusistemas.whatsapp.options.HumanizationOptions;
+import com.angatusistemas.whatsapp.options.PacingOptions;
+import com.angatusistemas.whatsapp.options.ReadReceiptMode;
+import com.angatusistemas.whatsapp.queue.ButtonMenus;
+import com.angatusistemas.whatsapp.queue.Interaction;
+import com.angatusistemas.whatsapp.queue.InteractionQueue;
+import com.angatusistemas.whatsapp.queue.Kind;
+import com.angatusistemas.whatsapp.request.MessageRef;
 import com.angatusistemas.whatsapp.request.SendAudioRequest;
+import com.angatusistemas.whatsapp.request.SendButtonsRequest;
 import com.angatusistemas.whatsapp.request.SendContactRequest;
 import com.angatusistemas.whatsapp.request.SendDocumentRequest;
 import com.angatusistemas.whatsapp.request.SendImageRequest;
 import com.angatusistemas.whatsapp.request.SendLocationRequest;
-import com.angatusistemas.whatsapp.request.SendReactionRequest;
 import com.angatusistemas.whatsapp.request.SendStickerRequest;
+import com.angatusistemas.whatsapp.request.SendTextRequest;
 import com.angatusistemas.whatsapp.request.SendVideoRequest;
-import com.angatusistemas.whatsapp.runtime.BridgeProcessManager;
-import com.angatusistemas.whatsapp.transport.BridgeConnection;
-import com.angatusistemas.whatsapp.transport.DisconnectInfo;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.node.ArrayNode;
-import com.fasterxml.jackson.databind.node.JsonNodeFactory;
-import com.fasterxml.jackson.databind.node.ObjectNode;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import java.net.URI;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Base64;
-import java.util.Collections;
+import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
-import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.Executors;
-import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
+import java.util.function.Function;
 
 /**
- * Facade for one WhatsApp connection. Each {@code WhatsAppClient} owns its
- * own bridge OS process (see {@link BridgeProcessManager}) rather than
- * sharing one process across every client in the JVM: the bridge's
- * {@code InstanceManager} does support multiple instances per process, but
- * running one process per client gives fault isolation (a crash in one
- * instance's Baileys socket cannot take down every other WhatsApp number an
- * application manages) at the cost of one extra Node process per connected
- * number - a reasonable trade for what this SDK is for. See README
- * "Arquitetura" for more, and "Proximas melhorias" for a possible opt-in
- * shared-process mode for very high instance counts.
+ * One WhatsApp account. Every operation that reaches WhatsApp is queued (InteractionQueue) and
+ * leaves at least 500 ms after the previous one, with the human signals around it; lifecycle calls
+ * (connect, pairing, logout) go straight to the bridge. All clients of a JVM share one bridge
+ * process. Only messages that arrive after the client starts are delivered; history is never
+ * requested. Calls return futures and never block the caller; listeners run on one virtual
+ * thread per client, in order.
  *
- * <p>Not reusable across a full lifecycle: once {@link #close()} is called,
- * build a new client to reconnect. {@link #connect()}/{@link #disconnect()}
- * on the other hand can be called repeatedly on the same instance.
+ * @author Angatu Sistemas
  */
 public final class WhatsAppClient implements AutoCloseable {
 
-    private static final Logger log = LoggerFactory.getLogger(WhatsAppClient.class);
-
-    private static final Duration BRIDGE_READY_TIMEOUT = Duration.ofSeconds(20);
-    private static final Duration HANDSHAKE_TIMEOUT = Duration.ofSeconds(15);
-    private static final Duration SHUTDOWN_REQUEST_TIMEOUT = Duration.ofSeconds(5);
-    private static final Duration SHUTDOWN_GRACE_PERIOD = Duration.ofSeconds(10);
-    private static final Duration DEFAULT_MIN_RECONNECT_DELAY = Duration.ofSeconds(1);
-    private static final Duration DEFAULT_MAX_RECONNECT_DELAY = Duration.ofSeconds(30);
-    private static final int DEFAULT_MAX_RECONNECT_ATTEMPTS = 10;
-    private static final Duration SEND_REQUEST_TIMEOUT = Duration.ofSeconds(120);
-
-    /**
-     * Teto do conjunto {@link #presencaAssinada}.
-     *
-     * <p>Sem ele, um processo de longa duracao acumula um {@code String} por
-     * conversa distinta que ja escreveu, para sempre. Vinte mil cabe folgado em
-     * memoria e cobre qualquer volume plausivel de conversas ativas; ao encher,
-     * o conjunto e esvaziado por inteiro - o mesmo padrao "capado, e ao encher,
-     * limpa tudo" que o bridge ja usa em {@code LidDirectory},
-     * {@code numerosVerificados} e {@code gruposEmCache}.
-     */
-    private static final int MAX_PRESENCAS_ASSINADAS = 20_000;
-
-    /**
-     * Intervalo entre tentativas depois que o backoff exponencial se esgotou.
-     *
-     * <p>Ver {@link Builder#reconnectCooldown(Duration)} para o porque de isto
-     * existir. Cinco minutos: devagar o bastante para nao martelar nada, rapido
-     * o bastante para o numero voltar sozinho dentro do mesmo turno de trabalho.
-     */
-    private static final Duration DEFAULT_RECONNECT_COOLDOWN = Duration.ofMinutes(5);
+    private static final Duration CONTROL_TIMEOUT = Duration.ofSeconds(60);
+    private static final Duration PAIRING_TIMEOUT = Duration.ofSeconds(45);
+    private static final Duration CLOSE_TIMEOUT = Duration.ofSeconds(5);
+    private static final long KEEP_ALIVE_MIN_MS = 4 * 60_000;
+    private static final long KEEP_ALIVE_JITTER_MS = 2 * 60_000;
 
     private final String instanceId;
     private final Path sessionDirectory;
-    private final String displayName;
-    private final Boolean markOnlineOnConnect;
+    private final String deviceName;
+    private final boolean includeRawData;
+    private final int maxLoginCycles;
     private final Duration minReconnectDelay;
     private final Duration maxReconnectDelay;
-    private final int maxReconnectAttempts;
-    /** {@code null} = desistir de vez apos {@link #maxReconnectAttempts} (comportamento antigo). */
-    private final Duration reconnectCooldown;
-    private final String nodeVersion;
-    private final String bridgeHost;
-    private final Integer bridgePort;
-    private final String logLevel;
-
+    private final BridgeOptions bridgeOptions;
+    private final long acceptSince;
+    private final BridgeHost host = BridgeHost.shared();
+    private final InteractionQueue queue;
+    private final EventInbox inbox;
+    private final Attachment attachment = new Attachment();
+    private final AtomicReference<ConnectionState> state = new AtomicReference<>(ConnectionState.DISCONNECTED);
+    private final AtomicBoolean closed = new AtomicBoolean();
     private final List<MessageListener> messageListeners = new CopyOnWriteArrayList<>();
     private final List<MessageUpdatedListener> messageUpdatedListeners = new CopyOnWriteArrayList<>();
     private final List<MessageDeletedListener> messageDeletedListeners = new CopyOnWriteArrayList<>();
@@ -138,191 +136,110 @@ public final class WhatsAppClient implements AutoCloseable {
     private final List<QrCodeListener> qrCodeListeners = new CopyOnWriteArrayList<>();
     private final List<GroupUpdateListener> groupUpdateListeners = new CopyOnWriteArrayList<>();
     private final List<PresenceListener> presenceListeners = new CopyOnWriteArrayList<>();
+    private final List<CallListener> callListeners = new CopyOnWriteArrayList<>();
+    private final List<ButtonListener> buttonListeners = new CopyOnWriteArrayList<>();
+    private final List<PollVoteListener> pollVoteListeners = new CopyOnWriteArrayList<>();
     private final List<ErrorListener> errorListeners = new CopyOnWriteArrayList<>();
-
-    private final ScheduledExecutorService reconnectExecutor =
-            Executors.newSingleThreadScheduledExecutor(this::newReconnectThread);
-    private final AtomicReference<ConnectionState> state = new AtomicReference<>(ConnectionState.DISCONNECTED);
-    private final AtomicInteger reconnectAttempts = new AtomicInteger(0);
-    private final AtomicBoolean closed = new AtomicBoolean(false);
-    private volatile boolean userInitiatedStop = true;
-    private volatile String currentQr;
-
-    private volatile BridgeProcessManager processManager;
-    private volatile BridgeConnection connection;
-
-    /**
-     * Trava contra duas tentativas simultaneas de criar processo/WebSocket.
-     *
-     * <p>Sem ela, duas chamadas concorrentes que cheguem a
-     * {@link #startBridgeAndConnectInstance()} sobem dois processos do bridge e
-     * so a referencia do segundo sobrevive em {@link #processManager} - o
-     * primeiro fica orfao, vivo, segurando a trava de sessao em disco e duas
-     * threads nao-daemon da biblioteca de WebSocket.
-     */
-    private final AtomicBoolean orchestratingConnection = new AtomicBoolean(false);
-
-    /**
-     * A fila de envio desta instancia: uma thread, nada em paralelo, com o
-     * intervalo humano e o "digitando..." embutidos. Ver {@link SendPacer}.
-     */
-    private final SendPacer pacer;
-    /** Conversas cuja presenca ja foi assinada, para nao repetir a consulta. */
-    private final java.util.Set<String> presencaAssinada = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private volatile PacingOptions pacing;
+    private volatile HumanizationOptions humanization;
+    private volatile CallOptions callOptions;
+    private volatile QrCode currentQr;
+    private volatile boolean wantConnected;
+    private volatile ScheduledFuture<?> keepAlive;
 
     private WhatsAppClient(Builder builder) {
         this.instanceId = builder.instanceId;
-        this.sessionDirectory = builder.sessionDirectory;
-        this.displayName = builder.displayName;
-        this.markOnlineOnConnect = builder.markOnlineOnConnect;
-        this.minReconnectDelay = builder.minReconnectDelay != null ? builder.minReconnectDelay : DEFAULT_MIN_RECONNECT_DELAY;
-        this.maxReconnectDelay = builder.maxReconnectDelay != null ? builder.maxReconnectDelay : DEFAULT_MAX_RECONNECT_DELAY;
-        this.maxReconnectAttempts = builder.maxReconnectAttempts != null ? builder.maxReconnectAttempts : DEFAULT_MAX_RECONNECT_ATTEMPTS;
-        this.reconnectCooldown = builder.reconnectCooldownSet ? builder.reconnectCooldown : DEFAULT_RECONNECT_COOLDOWN;
-        this.nodeVersion = builder.nodeVersion;
-        this.bridgeHost = builder.bridgeHost;
-        this.bridgePort = builder.bridgePort;
-        this.logLevel = builder.logLevel;
-        // O registro vem ANTES do pacer de proposito. SendPacer sobe a thread
-        // da fila no proprio construtor; se register() lancar (instanceId ou
-        // sessionDirectory repetido), o construtor do WhatsAppClient propaga a
-        // excecao sem devolver objeto nenhum - e ninguem teria como chamar
-        // pacer.close() na thread que acabou de nascer.
+        this.sessionDirectory = builder.sessionDirectory.toAbsolutePath().normalize();
+        this.deviceName = builder.deviceName;
+        this.includeRawData = builder.includeRawData;
+        this.maxLoginCycles = builder.maxLoginCycles;
+        this.minReconnectDelay = builder.minReconnectDelay;
+        this.maxReconnectDelay = builder.maxReconnectDelay;
+        this.bridgeOptions = builder.bridgeOptions;
+        this.pacing = builder.pacing;
+        this.humanization = builder.humanization;
+        this.callOptions = builder.callOptions;
+        this.acceptSince = Instant.now().getEpochSecond();
         InstanceRegistry.register(instanceId, sessionDirectory);
-
-        this.pacer = new SendPacer(instanceId, new PacerBackendImpl(),
-                builder.pacing != null ? builder.pacing : PacingOptions.padrao(),
-                builder.humanization != null ? builder.humanization : HumanizationOptions.padrao());
+        this.queue = new InteractionQueue(instanceId, new Gateway(), () -> pacing, () -> humanization);
+        this.inbox = new EventInbox(instanceId);
     }
 
     public static Builder builder() {
         return new Builder();
     }
 
-    // ---------------------------------------------------------------- lifecycle
+    public static SessionStatus inspectSession(Path sessionDirectory) {
+        return SessionInspector.inspect(sessionDirectory);
+    }
 
-    /**
-     * Conecta ao WhatsApp, reaproveitando o processo do bridge e o WebSocket
-     * que ja existirem.
-     *
-     * <p>Os tres caminhos, do mais barato ao mais caro, sao os mesmos que
-     * {@link #attemptReconnect(boolean)} ja escolhia internamente. Chamar
-     * {@code connect()} depois de {@link #disconnect()} - o ciclo de pausar e
-     * retomar documentado em EXAMPLES.md - cai no primeiro: {@code disconnect()}
-     * fecha a conexao do lado do WhatsApp e nao toca no processo nem no
-     * WebSocket entre Java e bridge, que continuam validos. Antes, este metodo
-     * subia um processo novo em toda chamada; o antigo, ainda vivo, ficava sem
-     * referencia nenhuma e ainda derrubava o novo com
-     * {@code INSTANCE_ALREADY_EXISTS} - a trava de sessao em disco pertencia a
-     * ele.
-     *
-     * <p>O caminho rapido nao precisa de trava propria: o {@code connect()} do
-     * lado do bridge ja e no-op quando existe socket ativo (uma conta, um
-     * socket).
-     */
+    // ------------------------------------------------------------------ lifecycle
+
     public CompletableFuture<Void> connect() {
         if (closed.get()) {
-            return CompletableFuture.failedFuture(
-                    new IllegalStateException("WhatsAppClient '" + instanceId + "' ja foi fechado (close())"));
+            return CompletableFuture.failedFuture(new QueueException(instanceId, BridgeErrorCode.QUEUE_CLOSED, "client is closed"));
         }
-        userInitiatedStop = false;
-        reconnectAttempts.set(0);
-
-        BridgeConnection existingConnection = this.connection;
-        if (existingConnection != null && existingConnection.isOpen()) {
-            return existingConnection.sendRequest("connect", instanceId, JsonNodeFactory.instance.objectNode())
-                    .thenApply(v -> (Void) null);
-        }
-        BridgeProcessManager existingProcess = this.processManager;
-        if (existingProcess != null && existingProcess.isAlive()) {
-            return reconnectWebSocketOnly();
-        }
-        return startBridgeAndConnectInstance();
-    }
-
-    public CompletableFuture<Void> disconnect() {
-        userInitiatedStop = true;
-        BridgeConnection current = this.connection;
-        if (current == null || !current.isOpen()) {
-            return CompletableFuture.completedFuture(null);
-        }
-        return current.sendRequest("disconnect", instanceId, JsonNodeFactory.instance.objectNode()).thenApply(v -> null);
-    }
-
-    public CompletableFuture<Void> logout() {
-        userInitiatedStop = true;
-        BridgeConnection current = this.connection;
-        if (current == null || !current.isOpen()) {
-            return CompletableFuture.failedFuture(new ConnectionException(instanceId, BridgeErrorCode.NOT_CONNECTED,
-                    "nao e possivel fazer logout: WhatsAppClient '" + instanceId + "' nao esta conectado ao bridge"));
-        }
-        return current.sendRequest("logout", instanceId, JsonNodeFactory.instance.objectNode()).thenApply(v -> null);
+        wantConnected = true;
+        queue.start();
+        host.attach(instanceId, attachment, bridgeOptions);
+        return host.ensureRunning()
+                .thenComposeAsync(ignored -> createInstance(), Threads.VIRTUAL)
+                .thenCompose(ignored -> control("connect", new JsonObject(), CONTROL_TIMEOUT))
+                .thenApply(ignored -> (Void) null);
     }
 
     public CompletableFuture<String> requestPairingCode(String phoneNumber) {
-        ObjectNode payload = JsonNodeFactory.instance.objectNode();
-        payload.put("phoneNumber", Objects.requireNonNull(phoneNumber, "phoneNumber"));
-        return connection().sendRequest("request_pairing_code", instanceId, payload)
-                .thenApply(data -> data.path("code").asText(null));
+        return requestPairingCode(phoneNumber, null);
     }
 
-    /**
-     * Closes sessions, closes the WebSocket, asks the bridge to shut down,
-     * waits for it to exit, and force-kills it if it does not - synchronous
-     * by design (unlike the rest of this API), matching {@link AutoCloseable}
-     * convention. Safe to call more than once; only the first call does
-     * anything. A JVM shutdown hook is not registered as a substitute for
-     * calling this explicitly - see README "Encerramento".
-     */
+    public CompletableFuture<String> requestPairingCode(String phoneNumber, String customCode) {
+        JsonObject payload = new JsonObject();
+        payload.addProperty("phoneNumber", Jids.digits(Objects.requireNonNull(phoneNumber, "phoneNumber")));
+        Json.put(payload, "customCode", customCode);
+        return connect().thenCompose(ignored -> control("request_pairing_code", payload, PAIRING_TIMEOUT))
+                .thenApply(data -> Json.str(data, "code"));
+    }
+
+    public CompletableFuture<Void> disconnect() {
+        wantConnected = false;
+        stopKeepAlive();
+        if (!host.isOpen()) {
+            return CompletableFuture.completedFuture(null);
+        }
+        return control("disconnect", new JsonObject(), CONTROL_TIMEOUT).thenApply(ignored -> null);
+    }
+
+    public CompletableFuture<Void> logout() {
+        wantConnected = false;
+        stopKeepAlive();
+        if (!host.isOpen()) {
+            return CompletableFuture.failedFuture(new ConnectionException(instanceId, BridgeErrorCode.NOT_CONNECTED,
+                    "cannot log out: the client is not connected"));
+        }
+        return control("logout", new JsonObject(), CONTROL_TIMEOUT).thenApply(ignored -> null);
+    }
+
     @Override
     public void close() {
         if (!closed.compareAndSet(false, true)) {
             return;
         }
-        userInitiatedStop = true;
+        wantConnected = false;
+        stopKeepAlive();
+        queue.close();
+        if (host.isOpen()) {
+            try {
+                control("destroy_instance", new JsonObject(), CLOSE_TIMEOUT).get(CLOSE_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } catch (ExecutionException | java.util.concurrent.TimeoutException e) {
+                Console.debug("[whatsapp] %s: destroy_instance did not finish: %s", instanceId, e.getMessage());
+            }
+        }
+        host.detach(instanceId);
+        inbox.close();
         InstanceRegistry.unregister(instanceId);
-        log.info("encerrando WhatsAppClient '{}'", instanceId);
-
-        // Antes de derrubar a conexao: o que esta na fila nao vai sair, e cada
-        // item precisa completar o future de quem o espera. Sem isto, quem
-        // chamou send*() e esta bloqueado em .get() ficaria pendurado para
-        // sempre depois de um close().
-        pacer.close();
-
-        BridgeConnection currentConnection = this.connection;
-        BridgeProcessManager currentProcess = this.processManager;
-
-        if (currentConnection != null && currentConnection.isOpen()) {
-            try {
-                currentConnection.sendRequest("shutdown", null, JsonNodeFactory.instance.objectNode())
-                        .get(SHUTDOWN_REQUEST_TIMEOUT.toSeconds(), TimeUnit.SECONDS);
-            } catch (Exception e) {
-                log.debug("pedido de shutdown educado ao bridge nao respondeu a tempo, prosseguindo com termino forcado: {}",
-                        e.getMessage());
-            }
-            try {
-                currentConnection.whenClosed().get(SHUTDOWN_GRACE_PERIOD.toSeconds(), TimeUnit.SECONDS);
-            } catch (Exception e) {
-                log.debug("conexao com o bridge nao fechou a tempo apos o pedido de shutdown: {}", e.getMessage());
-            }
-        }
-        // Fora do if de proposito: o caminho educado acima pode ter esgotado o
-        // timeout com a conexao ainda aberta, e ai ela tambem precisa ser
-        // fechada. close() e idempotente, entao chamar sempre nao custa nada e
-        // garante que as threads da biblioteca de WebSocket caiam.
-        if (currentConnection != null) {
-            currentConnection.close();
-        }
-
-        if (currentProcess != null && !currentProcess.stop(SHUTDOWN_GRACE_PERIOD)) {
-            log.warn("nao foi possivel confirmar o encerramento do processo do bridge de '{}' - "
-                    + "pode ter restado um processo node orfao", instanceId);
-        }
-
-        reconnectExecutor.shutdownNow();
     }
-
-    // ---------------------------------------------------------------- state
 
     public String getInstanceId() {
         return instanceId;
@@ -332,21 +249,42 @@ public final class WhatsAppClient implements AutoCloseable {
         return state.get();
     }
 
-    public String getCurrentQrCode() {
-        return currentQr;
+    public boolean isConnected() {
+        return state.get() == ConnectionState.CONNECTED && host.isOpen();
     }
 
-    /** Renders the current QR code (300x300); null if none is currently available. */
+    public SessionStatus sessionStatus() {
+        return SessionInspector.inspect(sessionDirectory);
+    }
+
+    public Optional<QrCode> getQrCode() {
+        return Optional.ofNullable(currentQr);
+    }
+
+    public String getCurrentQrCode() {
+        QrCode qr = currentQr;
+        return qr == null ? null : qr.value();
+    }
+
     public byte[] getQrCodePng() {
         return getQrCodePng(300);
     }
 
     public byte[] getQrCodePng(int sizePixels) {
-        String qr = this.currentQr;
-        return qr == null ? null : QrCodeRenderer.renderPng(qr, sizePixels);
+        QrCode qr = currentQr;
+        return qr == null ? null : QrCodeRenderer.png(qr.value(), sizePixels);
     }
 
-    // ---------------------------------------------------------------- listeners
+    public String getQrCodeText() {
+        QrCode qr = currentQr;
+        return qr == null ? null : QrCodeRenderer.text(qr.value());
+    }
+
+    public CompletableFuture<BridgeStats> bridgeStats() {
+        return host.request("bridge_stats", null, new JsonObject(), CONTROL_TIMEOUT).thenApply(Decode::stats);
+    }
+
+    // ------------------------------------------------------------------ listeners
 
     public void addMessageListener(MessageListener listener) {
         messageListeners.add(Objects.requireNonNull(listener));
@@ -380,1125 +318,879 @@ public final class WhatsAppClient implements AutoCloseable {
         presenceListeners.add(Objects.requireNonNull(listener));
     }
 
+    public void addCallListener(CallListener listener) {
+        callListeners.add(Objects.requireNonNull(listener));
+    }
+
+    public void addButtonListener(ButtonListener listener) {
+        buttonListeners.add(Objects.requireNonNull(listener));
+    }
+
+    public void addPollVoteListener(PollVoteListener listener) {
+        pollVoteListeners.add(Objects.requireNonNull(listener));
+    }
+
     public void addErrorListener(ErrorListener listener) {
         errorListeners.add(Objects.requireNonNull(listener));
     }
 
-    // ---------------------------------------------------------------- sending
-
-    /**
-     * Poe um envio na fila desta instancia.
-     *
-     * <p><b>Mudanca de comportamento que vale registrar:</b> antes, um envio com
-     * o cliente desconectado lancava {@link ConnectionException} na thread de
-     * quem chamou, enquanto qualquer outra falha vinha pelo {@code future} —
-     * uma inconsistencia que escapava de quem so envolvia tudo em
-     * {@code .exceptionally(...)}. Agora {@code connection()} e avaliado dentro
-     * da fila, entao <b>toda</b> falha chega pelo future.
-     */
-    private CompletableFuture<String> enfileirar(String to, QueuedSend.Kind kind, int textLength,
-                                                 String action, ObjectNode payload) {
-        return pacer.enqueue(to, kind, textLength,
-                () -> connection().sendRequest(action, instanceId, payload, SEND_REQUEST_TIMEOUT)
-                        .thenApply(WhatsAppClient::extractMessageId)).result();
-    }
-
-    private static int tamanho(String texto) {
-        return texto == null ? 0 : texto.length();
-    }
-
-    /** O que a fila precisa do cliente, sem que o {@link SendPacer} dependa dele. */
-    private final class PacerBackendImpl implements SendPacer.PacerBackend {
-        @Override
-        public CompletableFuture<Void> sendPresence(String chatId, String presence) {
-            return WhatsAppClient.this.sendPresence(chatId, presence);
-        }
-
-        @Override
-        public CompletableFuture<Void> markChatRead(String chatId) {
-            return WhatsAppClient.this.markChatRead(chatId);
-        }
-    }
+    // ------------------------------------------------------------------ messages
 
     public CompletableFuture<String> sendText(String to, String text) {
-        return sendText(to, text, null);
+        return sendText(SendTextRequest.of(to, text));
     }
 
-    public CompletableFuture<String> sendText(String to, String text, String quotedMessageId) {
-        ObjectNode payload = JsonNodeFactory.instance.objectNode();
-        payload.put("to", Objects.requireNonNull(to, "to"));
-        payload.put("text", Objects.requireNonNull(text, "text"));
-        putIfPresent(payload, "quotedMessageId", quotedMessageId);
-        return enfileirar(to, QueuedSend.Kind.TEXT, text.length(), "send_text", payload);
+    public CompletableFuture<String> sendText(SendTextRequest request) {
+        String chat = Jids.of(request.to());
+        JsonObject payload = target(chat, request.quotedMessageId());
+        payload.addProperty("text", request.text());
+        return messageId(queue.submit(Interaction.send("send_text", payload, chat, request.text().length(), request.typing(), Presence.COMPOSING)));
     }
 
     public CompletableFuture<String> sendImage(SendImageRequest request) {
-        ObjectNode payload = JsonNodeFactory.instance.objectNode();
-        payload.put("to", request.to());
-        payload.put("filePath", request.filePath());
-        putIfPresent(payload, "caption", request.caption());
-        putIfPresent(payload, "quotedMessageId", request.quotedMessageId());
-        return enfileirar(request.to(), QueuedSend.Kind.MEDIA, tamanho(request.caption()), "send_image", payload);
+        String chat = Jids.of(request.to());
+        JsonObject payload = target(chat, request.quotedMessageId());
+        payload.addProperty("filePath", existing(request.file()));
+        Json.put(payload, "caption", request.caption());
+        return messageId(queue.submit(Interaction.send("send_image", payload, chat, length(request.caption()), null, Presence.COMPOSING)));
     }
 
     public CompletableFuture<String> sendVideo(SendVideoRequest request) {
-        ObjectNode payload = JsonNodeFactory.instance.objectNode();
-        payload.put("to", request.to());
-        payload.put("filePath", request.filePath());
-        putIfPresent(payload, "caption", request.caption());
-        payload.put("gifPlayback", request.gifPlayback());
-        putIfPresent(payload, "quotedMessageId", request.quotedMessageId());
-        return enfileirar(request.to(), QueuedSend.Kind.MEDIA, tamanho(request.caption()), "send_video", payload);
+        String chat = Jids.of(request.to());
+        JsonObject payload = target(chat, request.quotedMessageId());
+        payload.addProperty("filePath", existing(request.file()));
+        Json.put(payload, "caption", request.caption());
+        payload.addProperty("gifPlayback", request.gifPlayback());
+        return messageId(queue.submit(Interaction.send("send_video", payload, chat, length(request.caption()), null, Presence.COMPOSING)));
     }
 
     public CompletableFuture<String> sendAudio(SendAudioRequest request) {
-        ObjectNode payload = JsonNodeFactory.instance.objectNode();
-        payload.put("to", request.to());
-        payload.put("filePath", request.filePath());
-        payload.put("ptt", request.ptt());
-        putIfPresent(payload, "quotedMessageId", request.quotedMessageId());
-        return enfileirar(request.to(), QueuedSend.Kind.AUDIO, 0, "send_audio", payload);
+        String chat = Jids.of(request.to());
+        JsonObject payload = target(chat, request.quotedMessageId());
+        payload.addProperty("filePath", existing(request.file()));
+        payload.addProperty("ptt", request.voiceNote());
+        Presence presence = request.voiceNote() ? Presence.RECORDING : Presence.COMPOSING;
+        return messageId(queue.submit(Interaction.send("send_audio", payload, chat, 0, null, presence)));
     }
 
     public CompletableFuture<String> sendDocument(SendDocumentRequest request) {
-        ObjectNode payload = JsonNodeFactory.instance.objectNode();
-        payload.put("to", request.to());
-        payload.put("filePath", request.filePath());
-        payload.put("fileName", request.fileName());
-        payload.put("mimetype", request.mimetype());
-        putIfPresent(payload, "caption", request.caption());
-        putIfPresent(payload, "quotedMessageId", request.quotedMessageId());
-        return enfileirar(request.to(), QueuedSend.Kind.MEDIA, tamanho(request.caption()), "send_document", payload);
+        String chat = Jids.of(request.to());
+        JsonObject payload = target(chat, request.quotedMessageId());
+        payload.addProperty("filePath", existing(request.file()));
+        payload.addProperty("fileName", request.fileName());
+        payload.addProperty("mimetype", request.mimetype());
+        Json.put(payload, "caption", request.caption());
+        return messageId(queue.submit(Interaction.send("send_document", payload, chat, length(request.caption()), null, Presence.COMPOSING)));
     }
 
     public CompletableFuture<String> sendSticker(SendStickerRequest request) {
-        ObjectNode payload = JsonNodeFactory.instance.objectNode();
-        payload.put("to", request.to());
-        payload.put("filePath", request.filePath());
-        putIfPresent(payload, "quotedMessageId", request.quotedMessageId());
-        return enfileirar(request.to(), QueuedSend.Kind.MEDIA, 0, "send_sticker", payload);
+        String chat = Jids.of(request.to());
+        JsonObject payload = target(chat, request.quotedMessageId());
+        payload.addProperty("filePath", existing(request.file()));
+        return messageId(queue.submit(Interaction.send("send_sticker", payload, chat, 0, Duration.ZERO, null)));
     }
 
     public CompletableFuture<String> sendLocation(SendLocationRequest request) {
-        ObjectNode payload = JsonNodeFactory.instance.objectNode();
-        payload.put("to", request.to());
-        payload.put("latitude", request.latitude());
-        payload.put("longitude", request.longitude());
-        putIfPresent(payload, "name", request.name());
-        putIfPresent(payload, "address", request.address());
-        putIfPresent(payload, "quotedMessageId", request.quotedMessageId());
-        return enfileirar(request.to(), QueuedSend.Kind.MEDIA, 0, "send_location", payload);
+        String chat = Jids.of(request.to());
+        JsonObject payload = target(chat, request.quotedMessageId());
+        payload.addProperty("latitude", request.latitude());
+        payload.addProperty("longitude", request.longitude());
+        Json.put(payload, "name", request.name());
+        Json.put(payload, "address", request.address());
+        return messageId(queue.submit(Interaction.send("send_location", payload, chat, 0, null, Presence.COMPOSING)));
     }
 
     public CompletableFuture<String> sendContact(SendContactRequest request) {
-        ObjectNode payload = JsonNodeFactory.instance.objectNode();
-        payload.put("to", request.to());
-        payload.put("displayName", request.displayName());
-        payload.put("phoneNumber", request.phoneNumber());
-        putIfPresent(payload, "organization", request.organization());
-        putIfPresent(payload, "quotedMessageId", request.quotedMessageId());
-        return enfileirar(request.to(), QueuedSend.Kind.MEDIA, 0, "send_contact", payload);
+        String chat = Jids.of(request.to());
+        JsonObject payload = target(chat, request.quotedMessageId());
+        payload.addProperty("displayName", request.displayName());
+        payload.addProperty("phoneNumber", request.phoneNumber());
+        Json.put(payload, "organization", request.organization());
+        return messageId(queue.submit(Interaction.send("send_contact", payload, chat, 0, null, Presence.COMPOSING)));
     }
 
-    /**
-     * Replaces the text of a message already sent by this instance.
-     *
-     * <p>WhatsApp keeps an edit window of a few minutes after delivery and
-     * does not publish the exact limit; past it the server refuses and the
-     * future completes exceptionally. There is no way to check in advance, so
-     * treat the refusal as the answer rather than as an unexpected error.
-     *
-     * @param request target message and its new text
-     * @return id of the edit message the server accepted
-     */
-    public CompletableFuture<String> editMessage(EditMessageRequest request) {
-        ObjectNode payload = JsonNodeFactory.instance.objectNode();
-        payload.put("chatId", request.chatId());
-        payload.put("messageId", request.messageId());
-        payload.put("text", request.text());
-        payload.put("fromMe", request.fromMe());
-        putIfPresent(payload, "participant", request.participant());
-        return connection().sendRequest("edit_message", instanceId, payload, SEND_REQUEST_TIMEOUT).thenApply(WhatsAppClient::extractMessageId);
+    public CompletableFuture<String> sendButtons(SendButtonsRequest request) {
+        String chat = Jids.of(request.to());
+        if (request.style() == ButtonStyle.TEXT) {
+            String menu = ButtonMenus.render(request.title(), request.text(), request.footer(), request.buttons());
+            return sendText(new SendTextRequest(chat, menu, request.quotedMessageId(), null)).thenApply(id -> {
+                ButtonMenus.remember(instanceId, chat, id, request.buttons());
+                return id;
+            });
+        }
+        JsonObject payload = target(chat, request.quotedMessageId());
+        payload.addProperty("text", request.text());
+        Json.put(payload, "title", request.title());
+        Json.put(payload, "footer", request.footer());
+        JsonArray buttons = new JsonArray(request.buttons().size());
+        request.buttons().forEach(button -> {
+            JsonObject item = new JsonObject();
+            item.addProperty("id", button.id());
+            item.addProperty("text", button.label());
+            buttons.add(item);
+        });
+        payload.add("buttons", buttons);
+        return messageId(queue.submit(Interaction.send("send_buttons", payload, chat, request.text().length(), null, Presence.COMPOSING)));
     }
 
-    /**
-     * Revokes a message for everyone ("delete for everyone").
-     *
-     * <p>Same window caveat as {@link #editMessage(EditMessageRequest)}.
-     *
-     * @param request target message
-     * @return future completed when the server accepts the revoke
-     */
-    public CompletableFuture<Void> deleteMessage(DeleteMessageRequest request) {
-        ObjectNode payload = JsonNodeFactory.instance.objectNode();
-        payload.put("chatId", request.chatId());
-        payload.put("messageId", request.messageId());
-        payload.put("fromMe", request.fromMe());
-        putIfPresent(payload, "participant", request.participant());
-        return connection().sendRequest("delete_message", instanceId, payload).thenApply(v -> null);
+    public CompletableFuture<String> sendPoll(String to, String question, List<String> options, int selectableCount) {
+        String chat = Jids.of(to);
+        JsonObject payload = target(chat, null);
+        payload.addProperty("name", Objects.requireNonNull(question, "question"));
+        payload.add("options", Json.stringArray(Objects.requireNonNull(options, "options")));
+        payload.addProperty("selectableCount", selectableCount);
+        return messageId(queue.submit(Interaction.send("send_poll", payload, chat, question.length(), null, Presence.COMPOSING)));
     }
 
-    public CompletableFuture<Void> sendReaction(SendReactionRequest request) {
-        ObjectNode payload = JsonNodeFactory.instance.objectNode();
-        payload.put("chatId", request.chatId());
-        payload.put("messageId", request.messageId());
-        putIfPresent(payload, "emoji", request.emoji());
-        payload.put("fromMe", request.fromMe());
-        putIfPresent(payload, "participant", request.participant());
-        return connection().sendRequest("send_reaction", instanceId, payload).thenApply(v -> null);
+    public CompletableFuture<String> forwardMessage(MessageRef message, String to) {
+        String chat = Jids.of(to);
+        JsonObject payload = new JsonObject();
+        payload.addProperty("chatId", message.chatId());
+        payload.addProperty("messageId", message.messageId());
+        payload.addProperty("to", chat);
+        return messageId(queue.submit(Interaction.send("forward_message", payload, chat, 0, null, Presence.COMPOSING)));
     }
 
-    /**
-     * Publishes our own presence in a chat: {@code composing} shows the
-     * recipient the "typing..." indicator, {@code recording} the voice-note
-     * one, {@code paused} clears it, and {@code available}/{@code unavailable}
-     * set online/offline.
-     *
-     * Presence is decoration around a message, never the message itself:
-     * callers are expected to treat a failure here as cosmetic and send
-     * anyway.
-     *
-     * @param chatId conversation to publish the presence in
-     * @param presence one of {@code unavailable}, {@code available},
-     *        {@code composing}, {@code recording}, {@code paused}
-     * @return future completed when the bridge acknowledges the update
-     */
-    public CompletableFuture<Void> sendPresence(String chatId, String presence) {
-        ObjectNode payload = JsonNodeFactory.instance.objectNode();
-        payload.put("chatId", Objects.requireNonNull(chatId, "chatId"));
-        payload.put("presence", Objects.requireNonNull(presence, "presence"));
-        return connection().sendRequest("send_presence", instanceId, payload).thenApply(v -> null);
+    public CompletableFuture<Void> sendReaction(MessageRef message, String emoji) {
+        JsonObject payload = ref(message);
+        payload.addProperty("emoji", Objects.requireNonNull(emoji, "emoji"));
+        return done(queue.submit(Interaction.of("send_reaction", Kind.ACTION, payload, message.chatId())));
     }
 
-    /**
-     * Marca uma mensagem recebida como lida — o "azulzinho" no celular de quem
-     * escreveu.
-     *
-     * <p>A mensagem precisa ter sido vista por este processo e ainda estar no
-     * cache do bridge: o WhatsApp exige a chave completa da mensagem
-     * ({@code remoteJid}, {@code id}, {@code participant}, {@code fromMe}), e
-     * inventar uma a partir do id faria o stanza ser aceito sem o azul nunca
-     * aparecer — falha silenciosa, que e pior que erro.
-     *
-     * <p>Se a conta estiver com "confirmacoes de leitura" desligada na
-     * privacidade do celular, a marcacao e aceita mas o remetente nao ve o azul.
-     * Isso nao depende da SDK.
-     *
-     * @param chatId conversa
-     * @param messageId mensagem a marcar
-     * @return future completado quando o bridge confirmar
-     * @see HumanizationOptions#readReceipts()
-     */
-    public CompletableFuture<Void> markRead(String chatId, String messageId) {
-        ObjectNode payload = JsonNodeFactory.instance.objectNode();
-        payload.put("chatId", Objects.requireNonNull(chatId, "chatId"));
-        payload.put("messageId", Objects.requireNonNull(messageId, "messageId"));
-        return connection().sendRequest("mark_read", instanceId, payload).thenApply(v -> null);
+    public CompletableFuture<Void> removeReaction(MessageRef message) {
+        return sendReaction(message, "");
     }
 
-    /**
-     * Marca a <b>ultima mensagem recebida</b> de uma conversa como lida.
-     *
-     * <p>E o que o modo {@link ReadReceiptMode#ON_REPLY} usa antes de enviar uma
-     * resposta. Falha se nenhuma mensagem daquela conversa foi vista por este
-     * processo.
-     *
-     * @param chatId conversa
-     * @return future completado quando o bridge confirmar
-     */
-    public CompletableFuture<Void> markChatRead(String chatId) {
-        ObjectNode payload = JsonNodeFactory.instance.objectNode();
-        payload.put("chatId", Objects.requireNonNull(chatId, "chatId"));
-        return connection().sendRequest("mark_read", instanceId, payload).thenApply(v -> null);
+    public CompletableFuture<String> editMessage(MessageRef message, String text) {
+        JsonObject payload = ref(message);
+        payload.addProperty("text", Objects.requireNonNull(text, "text"));
+        return messageId(queue.submit(Interaction.send("edit_message", payload, message.chatId(), text.length(), null, Presence.COMPOSING)));
     }
 
-    /**
-     * Assina a presenca de uma conversa, para o {@link PresenceListener} passar
-     * a receber o "digitando..." e o online <b>do contato</b>.
-     *
-     * <p>Sem esta assinatura o WhatsApp simplesmente nao envia presenca daquela
-     * conversa. Ate esta versao ela so acontecia como efeito colateral de
-     * publicar a nossa propria presenca, o que tornava impossivel observar um
-     * contato sem antes escrever para ele.
-     *
-     * <p>Chame nas conversas que importam, e nao em todas: cada assinatura e uma
-     * consulta, e leitura em volume e o que faz uma conta ser suspensa por
-     * coleta. Para assinar automaticamente toda conversa que escrever, ha
-     * {@code HumanizationOptions.builder().autoSubscribePresence(true)}.
-     *
-     * @param chatId conversa a observar
-     * @return future completado quando o bridge confirmar
-     */
+    public CompletableFuture<Void> deleteMessage(MessageRef message) {
+        return done(queue.submit(Interaction.of("delete_message", Kind.ACTION, ref(message), message.chatId())));
+    }
+
+    public CompletableFuture<Void> starMessage(MessageRef message, boolean star) {
+        JsonObject payload = ref(message);
+        payload.addProperty("star", star);
+        return done(queue.submit(Interaction.of("star_message", Kind.ACTION, payload, message.chatId())));
+    }
+
+    // ------------------------------------------------------------------ presence and receipts
+
+    public CompletableFuture<Void> sendTyping(String chatId, Duration duration) {
+        String chat = Jids.of(chatId);
+        CompletableFuture<Void> typing = sendPresence(chat, Presence.COMPOSING);
+        JsonObject paused = new JsonObject();
+        paused.addProperty("chatId", chat);
+        paused.addProperty("presence", Presence.PAUSED.wireValue());
+        queue.submit(Interaction.of("send_presence", Kind.PRESENCE, paused, chat).after(duration).replacing("paused:" + chat));
+        return typing;
+    }
+
+    public CompletableFuture<Void> sendPresence(String chatId, Presence presence) {
+        JsonObject payload = new JsonObject();
+        if (chatId != null) {
+            payload.addProperty("chatId", Jids.of(chatId));
+        }
+        payload.addProperty("presence", Objects.requireNonNull(presence, "presence").wireValue());
+        return done(queue.submit(Interaction.of("send_presence", Kind.PRESENCE, payload, chatId)));
+    }
+
+    public CompletableFuture<Void> setOnline(boolean online) {
+        return sendPresence(null, online ? Presence.AVAILABLE : Presence.UNAVAILABLE);
+    }
+
     public CompletableFuture<Void> subscribePresence(String chatId) {
-        ObjectNode payload = JsonNodeFactory.instance.objectNode();
-        payload.put("chatId", Objects.requireNonNull(chatId, "chatId"));
-        return connection().sendRequest("subscribe_presence", instanceId, payload).thenApply(v -> null);
+        String chat = Jids.of(chatId);
+        JsonObject payload = new JsonObject();
+        payload.addProperty("chatId", chat);
+        return done(queue.submit(Interaction.of("subscribe_presence", Kind.QUERY, payload, chat).replacing("subscribe:" + chat)));
     }
 
-    // ---------------------------------------------------------------- fila de envio
-
-    /** O ritmo em vigor nesta instancia. */
-    public PacingOptions pacing() {
-        return pacer.pacing();
+    public CompletableFuture<Void> markRead(Message message) {
+        return markRead(message.chatId(), message.messageId(), message.participant());
     }
 
-    /** Os sinais de humanizacao em vigor nesta instancia. */
-    public HumanizationOptions humanization() {
-        return pacer.humanization();
+    public CompletableFuture<Void> markRead(String chatId, String messageId) {
+        return markRead(chatId, messageId, null);
     }
 
-    /**
-     * Troca o ritmo em tempo de execucao; vale do proximo envio em diante.
-     *
-     * <p>Para quando uma campanha precisa de uma cadencia propria e o resto do
-     * sistema, de outra.
-     *
-     * @param pacing novo ritmo, ou {@code null} para voltar ao padrao
-     */
-    public void setPacing(PacingOptions pacing) {
-        pacer.setPacing(pacing);
+    public CompletableFuture<Void> markChatRead(String chatId) {
+        return markRead(chatId, null, null);
     }
 
-    /**
-     * Troca os sinais de humanizacao em tempo de execucao.
-     *
-     * @param humanization nova configuracao, ou {@code null} para o padrao
-     */
-    public void setHumanization(HumanizationOptions humanization) {
-        pacer.setHumanization(humanization);
+    private CompletableFuture<Void> markRead(String chatId, String messageId, String participant) {
+        String chat = Jids.of(chatId);
+        JsonObject payload = new JsonObject();
+        payload.addProperty("chatId", chat);
+        Json.put(payload, "messageId", messageId);
+        Json.put(payload, "participant", participant);
+        return done(queue.submit(Interaction.of("mark_read", Kind.RECEIPT, payload, chat)));
     }
 
-    /**
-     * Envios que ainda nao sairam, incluindo o que esta em andamento.
-     *
-     * <p>Para a aplicacao mostrar o que esta na fila e dar ao operador um botao
-     * de parar.
-     */
-    public List<QueuedSend> pendingSends() {
-        return pacer.pending();
+    public CompletableFuture<Void> rejectCall(IncomingCall call) {
+        JsonObject payload = new JsonObject();
+        payload.addProperty("callId", call.callId());
+        payload.addProperty("from", call.from());
+        return done(queue.submit(Interaction.of("reject_call", Kind.CALL, payload, call.chatId())));
     }
 
-    /**
-     * Cancela um envio que ainda nao comecou a sair.
-     *
-     * @param queuedSendId o {@link QueuedSend#id()}
-     * @return {@code true} se ele estava na fila e foi removido
-     */
-    public boolean cancelSend(String queuedSendId) {
-        return pacer.cancel(queuedSendId);
+    // ------------------------------------------------------------------ media
+
+    public CompletableFuture<MediaFile> downloadMedia(Message message, Path target) {
+        return downloadMedia(message.chatId(), message.messageId(), target);
     }
 
-    /**
-     * Esvazia a fila. O envio em andamento termina normalmente — aborta-lo no
-     * meio deixaria a duvida de se a mensagem saiu.
-     *
-     * @return quantos envios foram descartados
-     */
-    public int clearQueue() {
-        return pacer.clear();
+    public CompletableFuture<MediaFile> downloadMedia(String chatId, String messageId, Path target) {
+        Path destination = target.toAbsolutePath().normalize();
+        JsonObject payload = new JsonObject();
+        payload.addProperty("chatId", Jids.of(chatId));
+        payload.addProperty("messageId", Objects.requireNonNull(messageId, "messageId"));
+        payload.addProperty("targetPath", destination.toString());
+        return queue.submit(Interaction.of("download_media", Kind.QUERY, payload, chatId).withTimeout(Duration.ofMinutes(5)))
+                .thenApply(data -> new MediaFile(Path.of(Json.str(data, "path")), Json.str(data, "mimetype"), Json.number(data, "size", 0)));
     }
 
-    // ---------------------------------------------------------------- media / contacts / groups
+    // ------------------------------------------------------------------ contacts
 
-    public CompletableFuture<MediaContent> downloadMedia(String chatId, String messageId) {
-        ObjectNode payload = JsonNodeFactory.instance.objectNode();
-        payload.put("chatId", Objects.requireNonNull(chatId, "chatId"));
-        payload.put("messageId", Objects.requireNonNull(messageId, "messageId"));
-        return connection().sendRequest("download_media", instanceId, payload)
-                .thenApply(data -> new MediaContent(
-                        Base64.getDecoder().decode(data.path("base64").asText("")),
-                        data.path("mimetype").asText("application/octet-stream")));
-    }
-
-    /**
-     * Identity of the account this instance is logged in as.
-     *
-     * Only the pairing-code flow tells the caller which number it asked to
-     * connect; after a QR-code login nothing else reveals it, so this is the
-     * only way to label a connected session with its own phone number.
-     *
-     * @return {@code { jid, phoneNumber, name }} — any field may be null when
-     *         WhatsApp did not provide it
-     */
-    public CompletableFuture<JsonNode> getMe() {
-        return connection().sendRequest("get_me", instanceId, JsonNodeFactory.instance.objectNode());
-    }
-
-    /**
-     * Se um numero tem conta no WhatsApp — <b>uma</b> consulta, com cache.
-     *
-     * <p>E o que usar antes de enviar para um numero novo. Prefira sempre este
-     * metodo a {@link #getContact(String)}: aquele dispara <b>tres</b> consultas
-     * (existencia, foto e recado pessoal) e so a primeira interessa aqui. Ler
-     * foto e recado de gente com quem nao se esta conversando, em volume, e
-     * exatamente o comportamento que faz o WhatsApp suspender uma conta por
-     * coleta de dados.
-     *
-     * <p>A resposta fica em cache no bridge: 24h para um numero que existe, 6h
-     * para um que nao existe (menor, para um numero recem-criado nao ficar
-     * condenado o dia todo). Repetir a mesma pergunta sobre o mesmo numero
-     * tambem e um padrao de sondagem, entao o cache protege duas vezes.
-     *
-     * <p><b>Envie para o JID que voltar daqui</b>, e nao para o numero que voce
-     * digitou: e o servidor do WhatsApp quem sabe se a conta e a com ou a sem o
-     * nono digito.
-     *
-     * @param number numero em digitos, com DDI (ex.: {@code "5562999998888"})
-     * @return existencia e o JID canonico
-     */
     public CompletableFuture<NumberCheck> checkNumber(String number) {
-        ObjectNode payload = JsonNodeFactory.instance.objectNode();
-        payload.put("number", Objects.requireNonNull(number, "number"));
-        return connection().sendRequest("check_number", instanceId, payload).thenApply(NumberCheck::fromJson);
+        JsonObject payload = new JsonObject();
+        payload.addProperty("number", Jids.digits(Objects.requireNonNull(number, "number")));
+        return queue.submit(Interaction.of("check_number", Kind.QUERY, payload, null)).thenApply(Decode::numberCheck);
     }
 
-    /**
-     * Contato completo: existencia, foto e recado pessoal.
-     *
-     * <p><b>Custa tres consultas ao WhatsApp por chamada</b> — {@code onWhatsApp},
-     * {@code profilePictureUrl} e {@code fetchStatus} — e por isso pesa tres
-     * vezes no teto de leitura do bridge.
-     *
-     * <p>Foi este metodo, chamado em lista, que fez uma aplicacao ter a conta
-     * suspensa: uma tela pedia o avatar de 200 conversas ao abrir, o que virava
-     * ate 600 consultas em rajada logo apos conectar, sondando existencia de
-     * numero e lendo o recado pessoal de gente com quem ninguem estava
-     * conversando.
-     *
-     * <p>Quase sempre o que se quer e um dos dois metodos baratos:
-     * {@link #checkNumber(String)} (so existencia) ou
-     * {@link #getProfilePicture(String)} (so a foto).
-     *
-     * @param jid contato
-     * @return o contato, com os campos que o WhatsApp devolveu
-     */
+    public CompletableFuture<List<NumberCheck>> checkNumbers(Collection<String> numbers) {
+        JsonObject payload = new JsonObject();
+        payload.add("numbers", Json.stringArray(numbers.stream().map(Jids::digits).toList()));
+        return queue.submit(Interaction.of("check_numbers", Kind.QUERY, payload, null)).thenApply(Decode::numberChecks);
+    }
+
+    public CompletableFuture<Boolean> contactExists(String number) {
+        return checkNumber(number).thenApply(NumberCheck::exists);
+    }
+
     public CompletableFuture<Contact> getContact(String jid) {
-        ObjectNode payload = JsonNodeFactory.instance.objectNode();
-        payload.put("jid", Objects.requireNonNull(jid, "jid"));
-        return connection().sendRequest("get_contact", instanceId, payload).thenApply(Contact::fromJson);
+        return query("get_contact", "jid", Jids.of(jid)).thenApply(Decode::contact);
     }
 
-    /**
-     * URL da foto de perfil de um contato ou grupo, e nada alem disso.
-     *
-     * Prefira este metodo a {@link #getContact(String)} sempre que o objetivo
-     * for so exibir um avatar. O {@code getContact} faz TRES consultas ao
-     * WhatsApp por chamada — existencia do numero, foto e o recado pessoal do
-     * contato — e uma tela que mostra a foto de uma lista de contatos
-     * transforma isso numa varredura da agenda, lendo dados de terceiros que
-     * ela nao exibe. Aqui e uma consulta so, do unico dado que sera mostrado.
-     *
-     * @param jid contato ou grupo
-     * @return {@code { jid, profilePictureUrl }}, com a URL nula quando nao ha
-     *         foto ou ela nao esta visivel para esta conta
-     */
-    public CompletableFuture<JsonNode> getProfilePicture(String jid) {
-        ObjectNode payload = JsonNodeFactory.instance.objectNode();
-        payload.put("jid", Objects.requireNonNull(jid, "jid"));
-        return connection().sendRequest("get_profile_picture", instanceId, payload);
+    public CompletableFuture<Optional<String>> getProfilePicture(String jid) {
+        return query("get_profile_picture", "jid", Jids.of(jid)).thenApply(data -> Optional.ofNullable(Json.str(data, "profilePictureUrl")));
     }
 
-    public CompletableFuture<Group> getGroupMetadata(String groupJid) {
-        ObjectNode payload = JsonNodeFactory.instance.objectNode();
-        payload.put("groupJid", Objects.requireNonNull(groupJid, "groupJid"));
-        return connection().sendRequest("get_group_metadata", instanceId, payload).thenApply(Group::fromJson);
+    public CompletableFuture<ContactStatus> getContactStatus(String jid) {
+        return query("get_contact_status", "jid", Jids.of(jid)).thenApply(Decode::contactStatus);
     }
 
-    public CompletableFuture<List<Group>> listGroups() {
-        return connection().sendRequest("list_groups", instanceId, JsonNodeFactory.instance.objectNode())
-                .thenApply(data -> {
-                    List<Group> groups = new ArrayList<>();
-                    JsonNode groupsNode = data.get("groups");
-                    if (groupsNode != null && groupsNode.isArray()) {
-                        for (JsonNode groupNode : groupsNode) {
-                            groups.add(Group.fromJson(groupNode));
-                        }
-                    }
-                    return Collections.unmodifiableList(groups);
-                });
+    public CompletableFuture<Optional<BusinessProfile>> getBusinessProfile(String jid) {
+        return query("get_business_profile", "jid", Jids.of(jid))
+                .thenApply(data -> Optional.ofNullable(Json.object(data, "profile")).map(Decode::businessProfile));
     }
 
-    public CompletableFuture<Group> createGroup(String subject, List<String> participants) {
-        ObjectNode payload = JsonNodeFactory.instance.objectNode();
-        payload.put("subject", Objects.requireNonNull(subject, "subject"));
-        ArrayNode participantsArray = payload.putArray("participants");
-        Objects.requireNonNull(participants, "participants").forEach(participantsArray::add);
-        return connection().sendRequest("create_group", instanceId, payload).thenApply(Group::fromJson);
+    public CompletableFuture<Void> blockContact(String jid) {
+        return setBlocked(jid, true);
     }
 
-    public CompletableFuture<JsonNode> updateGroupParticipants(String groupJid, List<String> participants, GroupParticipantAction action) {
-        ObjectNode payload = JsonNodeFactory.instance.objectNode();
-        payload.put("groupJid", Objects.requireNonNull(groupJid, "groupJid"));
-        ArrayNode participantsArray = payload.putArray("participants");
-        Objects.requireNonNull(participants, "participants").forEach(participantsArray::add);
-        payload.put("action", Objects.requireNonNull(action, "action").name().toLowerCase(Locale.ROOT));
-        return connection().sendRequest("update_group_participants", instanceId, payload).thenApply(data -> data.get("result"));
+    public CompletableFuture<Void> unblockContact(String jid) {
+        return setBlocked(jid, false);
     }
 
-    public CompletableFuture<Void> updateGroupSubject(String groupJid, String subject) {
-        ObjectNode payload = JsonNodeFactory.instance.objectNode();
-        payload.put("groupJid", Objects.requireNonNull(groupJid, "groupJid"));
-        payload.put("subject", Objects.requireNonNull(subject, "subject"));
-        return connection().sendRequest("update_group_subject", instanceId, payload).thenApply(v -> null);
+    public CompletableFuture<List<String>> getBlocklist() {
+        return queue.submit(Interaction.of("get_blocklist", Kind.QUERY, new JsonObject(), null)).thenApply(data -> List.copyOf(Json.strings(data, "jids")));
     }
 
-    public CompletableFuture<Void> updateGroupDescription(String groupJid, String description) {
-        ObjectNode payload = JsonNodeFactory.instance.objectNode();
-        payload.put("groupJid", Objects.requireNonNull(groupJid, "groupJid"));
-        payload.put("description", Objects.requireNonNull(description, "description"));
-        return connection().sendRequest("update_group_description", instanceId, payload).thenApply(v -> null);
+    private CompletableFuture<Void> setBlocked(String jid, boolean blocked) {
+        JsonObject payload = new JsonObject();
+        payload.addProperty("jid", Jids.of(jid));
+        payload.addProperty("blocked", blocked);
+        return done(queue.submit(Interaction.of("set_blocked", Kind.ACTION, payload, null)));
     }
 
-    public CompletableFuture<Void> leaveGroup(String groupJid) {
-        ObjectNode payload = JsonNodeFactory.instance.objectNode();
-        payload.put("groupJid", Objects.requireNonNull(groupJid, "groupJid"));
-        return connection().sendRequest("leave_group", instanceId, payload).thenApply(v -> null);
+    // ------------------------------------------------------------------ own account
+
+    public CompletableFuture<Account> getMe() {
+        return queue.submit(Interaction.of("get_me", Kind.ACTION, new JsonObject(), null)).thenApply(Decode::account);
     }
 
-    public CompletableFuture<String> getGroupInviteCode(String groupJid) {
-        ObjectNode payload = JsonNodeFactory.instance.objectNode();
-        payload.put("groupJid", Objects.requireNonNull(groupJid, "groupJid"));
-        return connection().sendRequest("get_group_invite_code", instanceId, payload)
-                .thenApply(data -> data.hasNonNull("code") ? data.path("code").asText() : null);
+    public CompletableFuture<Void> updateProfileName(String name) {
+        return action("update_profile_name", "name", Objects.requireNonNull(name, "name"));
     }
 
-    public enum GroupParticipantAction {
-        ADD,
-        REMOVE,
-        PROMOTE,
-        DEMOTE
+    public CompletableFuture<Void> updateProfileStatus(String status) {
+        return action("update_profile_status", "status", Objects.requireNonNull(status, "status"));
     }
 
-    // ---------------------------------------------------------------- connection orchestration
-
-    /**
-     * Sobe um processo do bridge novo e conecta a instancia nele.
-     *
-     * <p>Protegido pela trava de orquestracao: junto de
-     * {@link #reconnectWebSocketOnly()}, e o unico lugar que cria recursos de
-     * sistema operacional. As duas entradas travam aqui dentro - e nao em quem
-     * chama - para que toda chamada fique coberta, venha ela de
-     * {@link #connect()} ou de {@link #attemptReconnect(boolean)}.
-     */
-    private CompletableFuture<Void> startBridgeAndConnectInstance() {
-        if (!orchestratingConnection.compareAndSet(false, true)) {
-            return jaHaConexaoEmAndamento();
-        }
-        return subirBridgeEConectar().whenComplete((v, ex) -> orchestratingConnection.set(false));
+    public CompletableFuture<Void> updateProfilePicture(Path image) {
+        return action("update_profile_picture", "filePath", existing(image));
     }
 
-    /** Corpo de {@link #startBridgeAndConnectInstance()}, ja com a trava tomada. */
-    private CompletableFuture<Void> subirBridgeEConectar() {
-        BridgeProcessManager newProcessManager;
-        try {
-            newProcessManager = BridgeProcessManager.start(
-                    new BridgeProcessManager.StartOptions(bridgeHost, bridgePort, logLevel, nodeVersion));
-        } catch (RuntimeException e) {
-            return CompletableFuture.failedFuture(e);
-        }
-        // O anterior so cai depois que o novo subiu: se start() falhar, nao vale
-        // a pena derrubar o que ainda estava de pe.
-        encerrarProcessoSubstituido(this.processManager);
-        this.processManager = newProcessManager;
-
-        return newProcessManager.portReady()
-                .orTimeout(BRIDGE_READY_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
-                .thenCompose(port -> openConnection(newProcessManager, port))
-                .thenCompose(ack -> sendCreateInstance())
-                .thenCompose(v -> connection().sendRequest("connect", instanceId, JsonNodeFactory.instance.objectNode()))
-                .thenApply(v -> (Void) null)
-                .exceptionallyCompose(this::abortStartupAndPropagate);
+    public CompletableFuture<Void> removeProfilePicture() {
+        return done(queue.submit(Interaction.of("remove_profile_picture", Kind.ACTION, new JsonObject(), null)));
     }
 
-    private CompletableFuture<ProtocolAck> openConnection(BridgeProcessManager processManagerForThisAttempt, int port) {
-        BridgeConnection newConnection = new BridgeConnection(URI.create("ws://127.0.0.1:" + port), processManagerForThisAttempt.authToken());
-        newConnection.setEventListener(this::handleBridgeEvent);
-        BridgeConnection previousConnection = this.connection;
-        this.connection = newConnection;
-        encerrarConexaoSubstituida(previousConnection);
-        return newConnection.connect(HANDSHAKE_TIMEOUT).thenApply(ack -> {
-            newConnection.whenClosed().thenAccept(info -> handleConnectionClosed(newConnection, info));
-            return new ProtocolAck();
+    public CompletableFuture<Map<String, String>> getPrivacySettings() {
+        return queue.submit(Interaction.of("get_privacy_settings", Kind.QUERY, new JsonObject(), null)).thenApply(data -> {
+            JsonObject settings = Json.object(data, "settings");
+            Map<String, String> values = new HashMap<>();
+            if (settings != null) {
+                for (Map.Entry<String, JsonElement> entry : settings.entrySet()) {
+                    values.put(entry.getKey(), entry.getValue().isJsonPrimitive() ? entry.getValue().getAsString() : entry.getValue().toString());
+                }
+            }
+            return Map.copyOf(values);
         });
     }
 
-    /**
-     * Fecha uma conexao que acaba de ser substituida por outra.
-     *
-     * <p>Diferente do processo, isto e inline: {@code close()} nao bloqueia em
-     * E/S e e idempotente. A troca de {@link #connection} vem antes da chamada
-     * de proposito - assim {@link #handleConnectionClosed} ja enxerga a nova
-     * como a atual e reconhece este fechamento como o da anterior, sem agendar
-     * uma reconexao que nao faz falta.
-     */
-    private void encerrarConexaoSubstituida(BridgeConnection anterior) {
-        if (anterior != null) {
-            anterior.close();
+    public CompletableFuture<Void> updatePrivacy(PrivacySetting setting, String value) {
+        if (!setting.accepted().contains(value)) {
+            return CompletableFuture.failedFuture(new IllegalArgumentException(setting + " accepts " + setting.accepted()));
         }
+        JsonObject payload = new JsonObject();
+        payload.addProperty("setting", setting.wireValue());
+        payload.addProperty("value", value);
+        return done(queue.submit(Interaction.of("update_privacy", Kind.ACTION, payload, null)));
     }
 
-    /**
-     * Encerra um processo do bridge que acaba de ser substituido.
-     *
-     * <p>Fora da thread chamadora porque {@code stop()} pode levar ate
-     * {@link #SHUTDOWN_GRACE_PERIOD} mais o tempo do termino forcado se o
-     * processo ainda estiver vivo, e a tentativa de conexao nova nao pode
-     * esperar por isso. Mesmo com o processo ja morto a chamada importa: e
-     * {@code stop()} quem remove o shutdown hook da JVM, e este e o caminho
-     * percorrido a cada recuperacao de {@code BRIDGE_CRASH} - sem a chamada,
-     * cada queda do bridge deixava uma {@code Thread} registrada para sempre
-     * dentro do processo Java, que e o de vida longa.
-     */
-    private void encerrarProcessoSubstituido(BridgeProcessManager anterior) {
-        if (anterior == null) {
-            return;
+    // ------------------------------------------------------------------ chats
+
+    public CompletableFuture<Void> muteChat(String chatId, Duration duration) {
+        JsonObject payload = chat(chatId, "mute");
+        if (duration != null) {
+            payload.addProperty("muteUntilMs", System.currentTimeMillis() + duration.toMillis());
         }
-        try {
-            reconnectExecutor.execute(() -> anterior.stop(SHUTDOWN_GRACE_PERIOD));
-        } catch (RejectedExecutionException e) {
-            // Executor ja encerrado por um close() concorrente: melhor segurar
-            // esta thread do que deixar um processo node orfao para tras.
-            anterior.stop(SHUTDOWN_GRACE_PERIOD);
-        }
+        return modifyChat(payload);
     }
 
-    private CompletableFuture<Void> jaHaConexaoEmAndamento() {
-        return CompletableFuture.failedFuture(new IllegalStateException(
-                "ja existe uma tentativa de conexao em andamento para '" + instanceId + "'"));
+    public CompletableFuture<Void> unmuteChat(String chatId) {
+        return modifyChat(chat(chatId, "unmute"));
     }
 
-    /** Marker return type so the connect chain above reads as a sequence of steps rather than juggling HandshakeAck. */
-    private static final class ProtocolAck {
+    public CompletableFuture<Void> pinChat(String chatId, boolean pin) {
+        return modifyChat(chat(chatId, pin ? "pin" : "unpin"));
     }
 
-    private CompletableFuture<Void> abortStartupAndPropagate(Throwable ex) {
-        BridgeProcessManager pm = this.processManager;
-        if (pm != null) {
-            pm.stop(SHUTDOWN_GRACE_PERIOD);
-        }
-        Throwable cause = unwrap(ex);
-        notifyConnectionState(ConnectionState.FAILED, DisconnectCause.UNKNOWN, cause.getMessage());
-        return CompletableFuture.failedFuture(cause);
+    public CompletableFuture<Void> archiveChat(String chatId, boolean archive) {
+        return modifyChat(chat(chatId, archive ? "archive" : "unarchive"));
     }
 
-    private CompletableFuture<JsonNode> sendCreateInstance() {
-        ObjectNode payload = JsonNodeFactory.instance.objectNode();
-        payload.put("sessionDirectory", sessionDirectory.toString());
-        putIfPresent(payload, "displayName", displayName);
-        if (markOnlineOnConnect != null) {
-            payload.put("markOnlineOnConnect", markOnlineOnConnect);
-        }
-        payload.put("minReconnectDelayMs", minReconnectDelay.toMillis());
-        payload.put("maxReconnectDelayMs", maxReconnectDelay.toMillis());
-        return connection().sendRequest("create_instance", instanceId, payload);
+    public CompletableFuture<Void> markChatUnread(String chatId) {
+        return modifyChat(chat(chatId, "mark_unread"));
     }
 
-    private void handleConnectionClosed(BridgeConnection closedConnection, DisconnectInfo info) {
-        if (userInitiatedStop || closed.get()) {
-            return;
-        }
-        if (closedConnection != this.connection) {
-            // Conexao ja substituida por outra: este fechamento e o encerramento
-            // esperado da anterior, nao a queda da atual - reagir a ele agendaria
-            // uma reconexao por cima de uma conexao que esta de pe.
-            log.debug("fechamento de uma conexao ja substituida de '{}' ignorado (code={})", instanceId, info.code());
-            return;
-        }
-        boolean bridgeStillAlive = processManager != null && processManager.isAlive();
-        DisconnectCause cause = bridgeStillAlive ? DisconnectCause.CONNECTION_LOST : DisconnectCause.BRIDGE_CRASH;
-        notifyConnectionState(ConnectionState.DISCONNECTED, cause,
-                "conexao com o bridge perdida (code=" + info.code() + ", reason=" + info.reason() + ", remote=" + info.remote() + ")");
-        scheduleReconnect(bridgeStillAlive);
+    public CompletableFuture<Void> setDisappearingMessages(String chatId, Duration expiration) {
+        JsonObject payload = new JsonObject();
+        payload.addProperty("chatId", Jids.of(chatId));
+        payload.addProperty("seconds", expiration == null ? 0 : expiration.toSeconds());
+        return done(queue.submit(Interaction.of("set_disappearing", Kind.ACTION, payload, chatId)));
     }
 
-    private void scheduleReconnect(boolean bridgeStillAlive) {
-        if (userInitiatedStop || closed.get()) {
-            return;
-        }
-        int attempt = reconnectAttempts.incrementAndGet();
-        long delayMs;
+    private CompletableFuture<Void> modifyChat(JsonObject payload) {
+        return done(queue.submit(Interaction.of("modify_chat", Kind.ACTION, payload, Json.str(payload, "chatId"))));
+    }
 
-        if (attempt > maxReconnectAttempts) {
-            if (reconnectCooldown == null) {
-                // Comportamento antigo, agora so sob pedido explicito
-                // (reconnectCooldown(null)): desiste de vez.
-                notifyConnectionState(ConnectionState.FAILED, DisconnectCause.UNKNOWN,
-                        "numero maximo de tentativas de reconexao excedido (" + maxReconnectAttempts + ")");
-                notifyError(new ConnectionException(instanceId, BridgeErrorCode.CONNECTION_FAILED,
-                        "desistindo de reconectar ao bridge para '" + instanceId + "' apos " + maxReconnectAttempts + " tentativas"));
-                return;
+    // ------------------------------------------------------------------ groups
+
+    public CompletableFuture<Group> getGroupMetadata(String groupJid) {
+        return query("get_group_metadata", "groupJid", groupJid).thenApply(Decode::group);
+    }
+
+    public CompletableFuture<GroupCheck> groupExists(String groupJid) {
+        return query("group_exists", "groupJid", groupJid).thenApply(Decode::groupCheck);
+    }
+
+    public CompletableFuture<List<Group>> listGroups() {
+        return queue.submit(Interaction.of("list_groups", Kind.QUERY, new JsonObject(), null)).thenApply(data -> {
+            List<Group> groups = new ArrayList<>();
+            for (JsonElement element : Json.array(data, "groups")) {
+                if (element.isJsonObject()) {
+                    groups.add(Decode.group(element.getAsJsonObject()));
+                }
             }
+            return List.copyOf(groups);
+        });
+    }
 
-            delayMs = reconnectCooldown.toMillis() + ThreadLocalRandom.current().nextLong(1_000);
-            if (attempt == maxReconnectAttempts + 1) {
-                // O aviso sai UMA vez, na virada. Repeti-lo a cada ciclo
-                // encheria o log (e o listener de erro da aplicacao) de uma
-                // linha identica a cada cinco minutos, para sempre.
-                notifyConnectionState(ConnectionState.FAILED, DisconnectCause.UNKNOWN,
-                        "backoff esgotado apos " + maxReconnectAttempts + " tentativas - novas tentativas a cada "
-                                + reconnectCooldown.toSeconds() + "s");
-                notifyError(new ConnectionException(instanceId, BridgeErrorCode.CONNECTION_FAILED,
-                        "bridge de '" + instanceId + "' nao voltou apos " + maxReconnectAttempts
-                                + " tentativas; seguindo em tentativas espacadas de " + reconnectCooldown.toSeconds() + "s"));
-                log.warn("bridge de '{}' nao voltou apos {} tentativas - passando a tentar a cada {}s, indefinidamente",
-                        instanceId, maxReconnectAttempts, reconnectCooldown.toSeconds());
-            } else {
-                log.info("nova tentativa de reconexao ao bridge para '{}' em {} ms (modo espacado)", instanceId, delayMs);
+    public CompletableFuture<Group> createGroup(String subject, List<String> participants) {
+        JsonObject payload = new JsonObject();
+        payload.addProperty("subject", Objects.requireNonNull(subject, "subject"));
+        payload.add("participants", Json.stringArray(participants.stream().map(Jids::of).toList()));
+        return queue.submit(Interaction.of("create_group", Kind.ACTION, payload, null)).thenApply(Decode::group);
+    }
+
+    public CompletableFuture<List<ParticipantResult>> updateGroupParticipants(String groupJid, List<String> participants, ParticipantAction action) {
+        JsonObject payload = new JsonObject();
+        payload.addProperty("groupJid", groupJid);
+        payload.add("participants", Json.stringArray(participants.stream().map(Jids::of).toList()));
+        payload.addProperty("action", action.wireValue());
+        return queue.submit(Interaction.of("update_group_participants", Kind.ACTION, payload, groupJid)).thenApply(Decode::participantResults);
+    }
+
+    public CompletableFuture<Void> updateGroupSubject(String groupJid, String subject) {
+        JsonObject payload = group(groupJid);
+        payload.addProperty("subject", Objects.requireNonNull(subject, "subject"));
+        return done(queue.submit(Interaction.of("update_group_subject", Kind.ACTION, payload, groupJid)));
+    }
+
+    public CompletableFuture<Void> updateGroupDescription(String groupJid, String description) {
+        JsonObject payload = group(groupJid);
+        payload.addProperty("description", Objects.requireNonNull(description, "description"));
+        return done(queue.submit(Interaction.of("update_group_description", Kind.ACTION, payload, groupJid)));
+    }
+
+    public CompletableFuture<Void> updateGroupPicture(String groupJid, Path image) {
+        JsonObject payload = new JsonObject();
+        payload.addProperty("jid", groupJid);
+        payload.addProperty("filePath", existing(image));
+        return done(queue.submit(Interaction.of("update_profile_picture", Kind.ACTION, payload, groupJid)));
+    }
+
+    public CompletableFuture<Void> setGroupAnnounceOnly(String groupJid, boolean announceOnly) {
+        return groupSetting(groupJid, announceOnly ? "announcement" : "not_announcement");
+    }
+
+    public CompletableFuture<Void> setGroupLocked(String groupJid, boolean locked) {
+        return groupSetting(groupJid, locked ? "locked" : "unlocked");
+    }
+
+    public CompletableFuture<Void> leaveGroup(String groupJid) {
+        return done(queue.submit(Interaction.of("leave_group", Kind.ACTION, group(groupJid), groupJid)));
+    }
+
+    public CompletableFuture<Optional<String>> getGroupInviteCode(String groupJid) {
+        return queue.submit(Interaction.of("get_group_invite_code", Kind.QUERY, group(groupJid), groupJid))
+                .thenApply(data -> Optional.ofNullable(Json.str(data, "code")));
+    }
+
+    public CompletableFuture<Optional<String>> revokeGroupInviteCode(String groupJid) {
+        return queue.submit(Interaction.of("revoke_invite_code", Kind.ACTION, group(groupJid), groupJid))
+                .thenApply(data -> Optional.ofNullable(Json.str(data, "code")));
+    }
+
+    public CompletableFuture<Group> getGroupInviteInfo(String inviteCodeOrLink) {
+        return query("get_invite_info", "code", inviteCodeOrLink).thenApply(Decode::group);
+    }
+
+    public CompletableFuture<Optional<String>> joinGroup(String inviteCodeOrLink) {
+        JsonObject payload = new JsonObject();
+        payload.addProperty("code", Objects.requireNonNull(inviteCodeOrLink, "inviteCodeOrLink"));
+        return queue.submit(Interaction.of("join_group", Kind.ACTION, payload, null)).thenApply(data -> Optional.ofNullable(Json.str(data, "groupJid")));
+    }
+
+    private CompletableFuture<Void> groupSetting(String groupJid, String setting) {
+        JsonObject payload = group(groupJid);
+        payload.addProperty("setting", setting);
+        return done(queue.submit(Interaction.of("group_setting", Kind.ACTION, payload, groupJid)));
+    }
+
+    // ------------------------------------------------------------------ queue and options
+
+    public List<PendingInteraction> pendingInteractions() {
+        return queue.pending();
+    }
+
+    public boolean cancelInteraction(String interactionId) {
+        return queue.cancel(interactionId);
+    }
+
+    public int clearQueue() {
+        return queue.clear();
+    }
+
+    public PacingOptions pacing() {
+        return pacing;
+    }
+
+    public void setPacing(PacingOptions options) {
+        this.pacing = Objects.requireNonNull(options, "options");
+        queue.wake();
+    }
+
+    public HumanizationOptions humanization() {
+        return humanization;
+    }
+
+    public void setHumanization(HumanizationOptions options) {
+        this.humanization = Objects.requireNonNull(options, "options");
+        if (options.alwaysOnline() && isConnected()) {
+            startKeepAlive();
+        } else if (!options.alwaysOnline()) {
+            stopKeepAlive();
+        }
+    }
+
+    public CallOptions callOptions() {
+        return callOptions;
+    }
+
+    public void setCallOptions(CallOptions options) {
+        this.callOptions = Objects.requireNonNull(options, "options");
+    }
+
+    // ------------------------------------------------------------------ bridge plumbing
+
+    private CompletableFuture<JsonObject> createInstance() {
+        OrphanBridges.reap(sessionDirectory, host.pid());
+        HumanizationOptions signals = humanization;
+        JsonObject payload = new JsonObject();
+        payload.addProperty("sessionDirectory", sessionDirectory.toString());
+        Json.put(payload, "displayName", deviceName);
+        payload.addProperty("alwaysOnline", signals.alwaysOnline());
+        payload.addProperty("includeRawData", includeRawData);
+        payload.addProperty("acceptSince", acceptSince);
+        payload.addProperty("readsPerMinute", pacing.maxReadsPerMinute());
+        payload.addProperty("minReconnectDelayMs", minReconnectDelay.toMillis());
+        payload.addProperty("maxReconnectDelayMs", maxReconnectDelay.toMillis());
+        payload.addProperty("maxLoginCycles", maxLoginCycles);
+        return control("create_instance", payload, CONTROL_TIMEOUT).thenApply(data -> {
+            updateState(ConnectionState.fromWire(Json.str(data, "state")), null, null);
+            return data;
+        });
+    }
+
+    private CompletableFuture<JsonObject> control(String action, JsonObject payload, Duration timeout) {
+        return host.request(action, instanceId, payload, timeout);
+    }
+
+    private CompletableFuture<JsonObject> query(String action, String field, String value) {
+        JsonObject payload = new JsonObject();
+        payload.addProperty(field, Objects.requireNonNull(value, field));
+        return queue.submit(Interaction.of(action, Kind.QUERY, payload, null));
+    }
+
+    private CompletableFuture<Void> action(String action, String field, String value) {
+        JsonObject payload = new JsonObject();
+        payload.addProperty(field, value);
+        return done(queue.submit(Interaction.of(action, Kind.ACTION, payload, null)));
+    }
+
+    private void onEvent(String event, JsonObject data) {
+        switch (event) {
+            case "connection_state_changed" -> onStateEvent(data);
+            case "qr_code" -> {
+                QrCode qr = new QrCode(Json.str(data, "qr"), (int) Json.number(data, "cycle", 1));
+                currentQr = qr;
+                notify(qrCodeListeners, listener -> listener.onQrCodeReceived(qr));
             }
-        } else {
-            long boundedExponent = Math.min(attempt - 1, 20);
-            delayMs = Math.min(maxReconnectDelay.toMillis(), minReconnectDelay.toMillis() * (1L << boundedExponent))
-                    + ThreadLocalRandom.current().nextLong(250);
-            log.info("agendando reconexao ao bridge para '{}' em {} ms (tentativa {}/{})", instanceId, delayMs, attempt, maxReconnectAttempts);
-        }
-
-        reconnectExecutor.schedule(() -> attemptReconnect(bridgeStillAlive), delayMs, TimeUnit.MILLISECONDS);
-    }
-
-    private void attemptReconnect(boolean assumedBridgeStillAlive) {
-        if (userInitiatedStop || closed.get()) {
-            return;
-        }
-        long attemptTimeoutSeconds = BRIDGE_READY_TIMEOUT.toSeconds() + HANDSHAKE_TIMEOUT.toSeconds();
-        try {
-            boolean bridgeActuallyAlive = assumedBridgeStillAlive && processManager != null && processManager.isAlive();
-            if (bridgeActuallyAlive) {
-                reconnectWebSocketOnly().get(attemptTimeoutSeconds, TimeUnit.SECONDS);
-            } else {
-                startBridgeAndConnectInstance().get(attemptTimeoutSeconds, TimeUnit.SECONDS);
-            }
-            reconnectAttempts.set(0);
-            log.info("reconexao ao bridge para '{}' bem-sucedida", instanceId);
-        } catch (Exception e) {
-            Throwable cause = unwrap(e);
-            log.warn("tentativa de reconexao ao bridge para '{}' falhou: {}", instanceId, cause.getMessage());
-            notifyError(cause instanceof WhatsAppException wae ? wae
-                    : new BridgeException("tentativa de reconexao falhou para '" + instanceId + "'", cause));
-            boolean stillAliveNow = processManager != null && processManager.isAlive();
-            scheduleReconnect(stillAliveNow);
+            case "message_received" -> onMessage(Decode.message(instanceId, data));
+            case "message_updated" -> notify(messageUpdatedListeners, listener -> listener.onMessageUpdated(Decode.messageUpdate(data)));
+            case "message_deleted" -> notify(messageDeletedListeners,
+                    listener -> listener.onMessageDeleted(Json.str(data, "chatId"), Json.str(data, "messageId")));
+            case "reaction_received" -> notify(reactionListeners, listener -> listener.onReaction(Decode.reaction(data)));
+            case "group_updated" -> notify(groupUpdateListeners, listener -> listener.onGroupUpdated(Decode.groupUpdate(data)));
+            case "presence_updated" -> notify(presenceListeners, listener -> listener.onPresenceUpdated(Decode.presence(data)));
+            case "call_received" -> onCall(Decode.call(data));
+            case "poll_vote" -> notify(pollVoteListeners, listener -> listener.onPollVote(Decode.pollVote(data)));
+            default -> Console.debug("[whatsapp] %s: ignoring bridge event %s", instanceId, event);
         }
     }
 
-    /**
-     * The bridge process survived; only the Java&lt;-&gt;bridge WebSocket needs to be
-     * re-established, not the WhatsApp connection itself.
-     *
-     * <p>Sob a mesma trava de {@link #startBridgeAndConnectInstance()}: as duas
-     * criam recursos que ninguem mais teria como fechar se ficassem sem
-     * referencia.
-     */
-    private CompletableFuture<Void> reconnectWebSocketOnly() {
-        if (!orchestratingConnection.compareAndSet(false, true)) {
-            return jaHaConexaoEmAndamento();
-        }
-        return reabrirWebSocket().whenComplete((v, ex) -> orchestratingConnection.set(false));
+    private void onStateEvent(JsonObject data) {
+        ConnectionState next = ConnectionState.fromWire(Json.str(data, "state"));
+        updateState(next, DisconnectCause.fromWire(Json.str(data, "cause")), Json.str(data, "detail"));
     }
 
-    /** Corpo de {@link #reconnectWebSocketOnly()}, ja com a trava tomada. */
-    private CompletableFuture<Void> reabrirWebSocket() {
-        BridgeProcessManager currentProcess = this.processManager;
-        int port;
-        try {
-            port = currentProcess.portReady().getNow(-1);
-        } catch (RuntimeException e) {
-            port = -1;
-        }
-        if (port <= 0) {
-            // Chama o corpo, nao o metodo travado: a trava ja e nossa.
-            return subirBridgeEConectar();
-        }
-
-        BridgeConnection newConnection = new BridgeConnection(URI.create("ws://127.0.0.1:" + port), currentProcess.authToken());
-        newConnection.setEventListener(this::handleBridgeEvent);
-        BridgeConnection previousConnection = this.connection;
-        this.connection = newConnection;
-        encerrarConexaoSubstituida(previousConnection);
-        return newConnection.connect(HANDSHAKE_TIMEOUT)
-                .thenCompose(ack -> {
-                    newConnection.whenClosed().thenAccept(info -> handleConnectionClosed(newConnection, info));
-                    return newConnection.sendRequest("get_status", instanceId, JsonNodeFactory.instance.objectNode());
-                })
-                .thenAccept(status -> notifyConnectionState(
-                        ConnectionState.fromWireValue(status.path("state").asText(null)),
-                        null,
-                        "estado resincronizado apos reconexao do websocket"));
-    }
-
-    // ---------------------------------------------------------------- event dispatch
-
-    private void handleBridgeEvent(com.angatusistemas.whatsapp.protocol.ProtocolMessage.Event event) {
-        try {
-            JsonNode data = event.data();
-            switch (event.event()) {
-                case "connection_state_changed" -> handleConnectionStateChangedEvent(data);
-                case "qr_code" -> handleQrCodeEvent(data);
-                case "pairing_code" -> { /* delivered via requestPairingCode()'s own return value */ }
-                case "message_received" -> notifyMessage(Message.fromJson(instanceId, data));
-                case "message_updated" -> notifyMessageUpdated(data);
-                case "message_deleted" -> notifyMessageDeleted(data);
-                case "reaction_received" -> notifyReaction(data);
-                case "group_updated" -> notifyGroupUpdated(data);
-                case "presence_updated" -> notifyPresenceUpdated(data);
-                default -> log.debug("evento desconhecido recebido do bridge para '{}': {}", instanceId, event.event());
-            }
-        } catch (RuntimeException e) {
-            log.warn("falha ao processar evento '{}' do bridge para '{}': {}", event.event(), instanceId, e.getMessage(), e);
-            notifyError(new BridgeException("falha ao processar evento '" + event.event() + "' do bridge", e));
-        }
-    }
-
-    private void handleConnectionStateChangedEvent(JsonNode data) {
-        ConnectionState newState = ConnectionState.fromWireValue(data.path("state").asText(null));
-        DisconnectCause cause = data.hasNonNull("cause") ? DisconnectCause.fromWireValue(data.path("cause").asText()) : null;
-        String detail = data.hasNonNull("detail") ? data.path("detail").asText() : null;
-        if (newState != ConnectionState.QR_PENDING) {
+    private void updateState(ConnectionState next, DisconnectCause cause, String detail) {
+        ConnectionState previous = state.getAndSet(next);
+        if (next != ConnectionState.QR_PENDING) {
             currentQr = null;
         }
-        notifyConnectionState(newState, cause, detail);
-    }
-
-    private void handleQrCodeEvent(JsonNode data) {
-        String qr = data.path("qr").asText(null);
-        this.currentQr = qr;
-        for (QrCodeListener listener : qrCodeListeners) {
-            safeInvoke(() -> listener.onQrCodeReceived(qr));
+        if (next == ConnectionState.CONNECTED) {
+            if (humanization.alwaysOnline()) {
+                startKeepAlive();
+            }
+            queue.wake();
+        } else {
+            stopKeepAlive();
+        }
+        if (previous != next || cause != null) {
+            notify(connectionStateListeners, listener -> listener.onConnectionStateChanged(next, cause, detail));
         }
     }
 
-    private void notifyConnectionState(ConnectionState newState, DisconnectCause cause, String detail) {
-        state.set(newState);
-        for (ConnectionStateListener listener : connectionStateListeners) {
-            safeInvoke(() -> listener.onConnectionStateChanged(newState, cause, detail));
+    private void onMessage(Message message) {
+        if (!message.isFromMe()) {
+            queue.noteIncoming(message.chatId());
+            HumanizationOptions signals = humanization;
+            if (signals.readReceipts() == ReadReceiptMode.AUTO) {
+                JsonObject payload = new JsonObject();
+                payload.addProperty("chatId", message.chatId());
+                queue.submit(Interaction.of("mark_read", Kind.RECEIPT, payload, message.chatId())
+                        .after(signals.readDelay(ThreadLocalRandom.current())).replacing("read:" + message.chatId()));
+            }
+            if (signals.autoSubscribePresence()) {
+                subscribePresence(message.chatId());
+            }
         }
-    }
-
-    private void notifyMessage(Message message) {
-        reagirAMensagemRecebida(message);
-        for (MessageListener listener : messageListeners) {
-            safeInvoke(() -> listener.onMessageReceived(message));
-        }
-    }
-
-    /**
-     * Os sinais automaticos disparados pela chegada de uma mensagem: o
-     * azulzinho no modo {@link ReadReceiptMode#AUTO} e a assinatura de presenca
-     * da conversa.
-     *
-     * <p>Roda <b>fora</b> da thread de eventos do bridge. Essa thread e unica e
-     * serve a todos os nove tipos de listener: segura-la por alguns segundos
-     * esperando um atraso de leitura atrasaria tambem os eventos de conexao e de
-     * QR Code da instancia inteira.
-     */
-    private void reagirAMensagemRecebida(Message message) {
-        if (message == null || message.isFromMe() || message.chatId() == null) {
+        notify(messageListeners, listener -> listener.onMessageReceived(message));
+        if (buttonListeners.isEmpty()) {
             return;
         }
-        HumanizationOptions sinais = pacer.humanization();
-        String chatId = message.chatId();
+        ButtonReply reply = message.buttonReply();
+        Optional<ButtonClick> click = reply != null
+                ? Optional.of(new ButtonClick(reply.buttonId(), reply.text(), reply.sourceMessageId(), message))
+                : ButtonMenus.match(message);
+        click.ifPresent(chosen -> notify(buttonListeners, listener -> listener.onButtonClicked(chosen)));
+    }
 
-        if (sinais.autoSubscribePresence()) {
-            if (presencaAssinada.size() >= MAX_PRESENCAS_ASSINADAS) {
-                // Capado, e ao encher, limpa tudo - o mesmo padrao dos caches do
-                // bridge. O pior caso e reassinar mais tarde uma conversa que ja
-                // estava assinada, e subscribePresence e idempotente.
-                log.debug("teto de {} presencas assinadas atingido em '{}' - recomecando o conjunto",
-                        MAX_PRESENCAS_ASSINADAS, instanceId);
-                presencaAssinada.clear();
-            }
-            if (presencaAssinada.add(chatId)) {
-                subscribePresence(chatId).exceptionally(e -> {
-                    // Nao conseguiu assinar: solta a marca para tentar de novo na
-                    // proxima mensagem, em vez de desistir daquela conversa para
-                    // sempre.
-                    presencaAssinada.remove(chatId);
-                    log.debug("nao foi possivel assinar a presenca de '{}': {}", chatId, e.getMessage());
+    private void onCall(IncomingCall call) {
+        notify(callListeners, listener -> listener.onCall(call));
+        CallOptions options = callOptions;
+        if (!options.rejectCalls()) {
+            return;
+        }
+        Duration delay = options.rejectDelay(ThreadLocalRandom.current());
+        JsonObject payload = new JsonObject();
+        payload.addProperty("callId", call.callId());
+        payload.addProperty("from", call.from());
+        queue.submit(Interaction.of("reject_call", Kind.CALL, payload, call.chatId()).after(delay))
+                .exceptionally(error -> {
+                    report(error);
                     return null;
                 });
+        if (options.replyText() != null && !call.isGroup()) {
+            sendText(SendTextRequest.of(call.chatId(), options.replyText())).exceptionally(error -> {
+                report(error);
+                return null;
+            });
+        }
+    }
+
+    private void startKeepAlive() {
+        if (keepAlive != null && !keepAlive.isDone()) {
+            return;
+        }
+        long delay = KEEP_ALIVE_MIN_MS + ThreadLocalRandom.current().nextLong(KEEP_ALIVE_JITTER_MS);
+        keepAlive = Threads.TIMER.schedule(() -> {
+            keepAlive = null;
+            if (closed.get() || state.get() != ConnectionState.CONNECTED || !humanization.alwaysOnline()) {
+                return;
+            }
+            JsonObject payload = new JsonObject();
+            payload.addProperty("presence", Presence.AVAILABLE.wireValue());
+            queue.submit(Interaction.of("send_presence", Kind.KEEPALIVE, payload, null).replacing("presence:keepalive"));
+            startKeepAlive();
+        }, delay, TimeUnit.MILLISECONDS);
+    }
+
+    private void stopKeepAlive() {
+        ScheduledFuture<?> current = keepAlive;
+        keepAlive = null;
+        if (current != null) {
+            current.cancel(false);
+        }
+    }
+
+    private <L> void notify(List<L> listeners, Consumer<L> call) {
+        for (L listener : listeners) {
+            try {
+                call.accept(listener);
+            } catch (RuntimeException e) {
+                Console.error("[whatsapp] " + instanceId + ": a listener threw " + e, e);
             }
         }
+    }
 
-        if (sinais.readReceipts() != ReadReceiptMode.AUTO) {
-            return;
+    private void report(Throwable error) {
+        Throwable cause = error instanceof CompletionException && error.getCause() != null ? error.getCause() : error;
+        WhatsAppException failure = cause instanceof WhatsAppException known ? known
+                : new WhatsAppException(instanceId, BridgeErrorCode.INTERNAL_ERROR, cause.getMessage(), cause);
+        notify(errorListeners, listener -> listener.onError(failure));
+    }
+
+    private static JsonObject target(String chat, String quotedMessageId) {
+        JsonObject payload = new JsonObject();
+        payload.addProperty("to", chat);
+        Json.put(payload, "quotedMessageId", quotedMessageId);
+        return payload;
+    }
+
+    private static JsonObject ref(MessageRef message) {
+        JsonObject payload = new JsonObject();
+        payload.addProperty("chatId", Jids.of(message.chatId()));
+        payload.addProperty("messageId", message.messageId());
+        payload.addProperty("fromMe", message.fromMe());
+        Json.put(payload, "participant", message.participant());
+        return payload;
+    }
+
+    private static JsonObject chat(String chatId, String change) {
+        JsonObject payload = new JsonObject();
+        payload.addProperty("chatId", Jids.of(chatId));
+        payload.addProperty("change", change);
+        return payload;
+    }
+
+    private static JsonObject group(String groupJid) {
+        JsonObject payload = new JsonObject();
+        payload.addProperty("groupJid", Objects.requireNonNull(groupJid, "groupJid"));
+        return payload;
+    }
+
+    // The bridge reads the file: a path that does not exist fails here, with a clear message, instead of there.
+    private static String existing(Path file) {
+        Path absolute = file.toAbsolutePath().normalize();
+        if (!Files.isRegularFile(absolute)) {
+            throw new UncheckedIOException(new IOException("file not found: " + absolute));
         }
-        String messageId = message.messageId();
-        if (messageId == null) {
-            return;
+        return absolute.toString();
+    }
+
+    private static int length(String text) {
+        return text == null ? 0 : text.length();
+    }
+
+    private static CompletableFuture<String> messageId(CompletableFuture<JsonObject> result) {
+        return result.thenApply(data -> Json.str(data, "messageId"));
+    }
+
+    private static CompletableFuture<Void> done(CompletableFuture<JsonObject> result) {
+        return result.thenApply(ignored -> null);
+    }
+
+    private final class Gateway implements InteractionQueue.Gateway {
+
+        @Override
+        public boolean isReady() {
+            return state.get() == ConnectionState.CONNECTED && host.isOpen();
         }
-        long atrasoMs = sinais.atrasoLeitura(ThreadLocalRandom.current()).toMillis();
-        reconnectExecutor.schedule(() -> markRead(chatId, messageId).exceptionally(e -> {
-            log.debug("nao foi possivel marcar '{}' como lida: {}", chatId, e.getMessage());
-            return null;
-        }), atrasoMs, TimeUnit.MILLISECONDS);
-    }
 
-    private void notifyMessageUpdated(JsonNode data) {
-        String chatId = data.path("chatId").asText(null);
-        String messageId = data.path("messageId").asText(null);
-        JsonNode updates = data.get("updates");
-        for (MessageUpdatedListener listener : messageUpdatedListeners) {
-            safeInvoke(() -> listener.onMessageUpdated(chatId, messageId, updates));
-        }
-    }
-
-    private void notifyMessageDeleted(JsonNode data) {
-        String chatId = data.path("chatId").asText(null);
-        String messageId = data.path("messageId").asText(null);
-        for (MessageDeletedListener listener : messageDeletedListeners) {
-            safeInvoke(() -> listener.onMessageDeleted(chatId, messageId));
-        }
-    }
-
-    private void notifyReaction(JsonNode data) {
-        String chatId = data.path("chatId").asText(null);
-        String messageId = data.path("messageId").asText(null);
-        String senderId = data.path("senderId").asText(null);
-        String emoji = data.hasNonNull("emoji") && !data.path("emoji").asText().isEmpty() ? data.path("emoji").asText() : null;
-        boolean removed = data.path("removed").asBoolean(false);
-        for (ReactionListener listener : reactionListeners) {
-            safeInvoke(() -> listener.onReactionReceived(chatId, messageId, senderId, emoji, removed));
-        }
-    }
-
-    private void notifyGroupUpdated(JsonNode data) {
-        String groupJid = data.path("groupJid").asText(null);
-        JsonNode updates = data.get("updates");
-        for (GroupUpdateListener listener : groupUpdateListeners) {
-            safeInvoke(() -> listener.onGroupUpdated(groupJid, updates));
-        }
-    }
-
-    private void notifyPresenceUpdated(JsonNode data) {
-        String chatId = data.path("chatId").asText(null);
-        JsonNode presences = data.get("presences");
-        for (PresenceListener listener : presenceListeners) {
-            safeInvoke(() -> listener.onPresenceUpdated(chatId, presences));
-        }
-    }
-
-    private void notifyError(WhatsAppException error) {
-        for (ErrorListener listener : errorListeners) {
-            safeInvoke(() -> listener.onError(error));
-        }
-    }
-
-    private void safeInvoke(Runnable action) {
-        try {
-            action.run();
-        } catch (RuntimeException e) {
-            log.warn("listener de '{}' lancou uma excecao nao tratada: {}", instanceId, e.getMessage(), e);
-        }
-    }
-
-    // ---------------------------------------------------------------- helpers
-
-    private BridgeConnection connection() {
-        BridgeConnection current = this.connection;
-        if (current == null || !current.isOpen()) {
-            throw new ConnectionException(instanceId, BridgeErrorCode.NOT_CONNECTED,
-                    "WhatsAppClient '" + instanceId + "' nao esta conectado ao bridge - chame connect() primeiro");
-        }
-        return current;
-    }
-
-    private Thread newReconnectThread(Runnable runnable) {
-        Thread thread = new Thread(runnable, "angatu-whatsapp-reconnect-" + instanceId);
-        thread.setDaemon(true);
-        return thread;
-    }
-
-    private static String extractMessageId(JsonNode data) {
-        return data.path("messageId").asText(null);
-    }
-
-    private static void putIfPresent(ObjectNode node, String field, String value) {
-        if (value != null) {
-            node.put(field, value);
+        @Override
+        public JsonObject call(String action, JsonObject payload, Duration timeout) {
+            try {
+                return host.request(action, instanceId, payload, timeout).get();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new QueueException(instanceId, BridgeErrorCode.QUEUE_CLOSED, "queue stopped");
+            } catch (ExecutionException e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof WhatsAppException known) {
+                    throw known;
+                }
+                throw new WhatsAppException(instanceId, BridgeErrorCode.INTERNAL_ERROR, String.valueOf(cause), cause);
+            }
         }
     }
 
-    private static Throwable unwrap(Throwable ex) {
-        Throwable cause = ex;
-        while ((cause instanceof java.util.concurrent.CompletionException || cause instanceof java.util.concurrent.ExecutionException)
-                && cause.getCause() != null) {
-            cause = cause.getCause();
-        }
-        return cause;
-    }
+    private final class Attachment implements BridgeHost.Attachment {
 
-    // ---------------------------------------------------------------- builder
+        @Override
+        public void onBridgeEvent(String event, JsonObject data) {
+            boolean droppable = "presence_updated".equals(event) || "message_updated".equals(event);
+            inbox.submit(() -> onEvent(event, data), droppable);
+        }
+
+        @Override
+        public void onBridgeReady() {
+            if (!wantConnected || closed.get()) {
+                return;
+            }
+            createInstance()
+                    .thenCompose(ignored -> control("connect", new JsonObject(), CONTROL_TIMEOUT))
+                    .whenComplete((ignored, error) -> {
+                        if (error != null) {
+                            report(error);
+                        }
+                        queue.wake();
+                    });
+        }
+
+        @Override
+        public void onBridgeLost(DisconnectCause cause, String detail) {
+            inbox.submit(() -> updateState(ConnectionState.RECONNECTING, cause, detail), false);
+        }
+    }
 
     public static final class Builder {
+
         private String instanceId;
         private Path sessionDirectory;
-        private String displayName;
-        private Boolean markOnlineOnConnect;
-        private Duration minReconnectDelay;
-        private Duration maxReconnectDelay;
-        private Integer maxReconnectAttempts;
-        private PacingOptions pacing;
-        private HumanizationOptions humanization;
-        private String logLevel;
-        private Duration reconnectCooldown;
-        /** Distingue "nao configurado" de "configurado como null" (= desistir de vez). */
-        private boolean reconnectCooldownSet;
-        private String nodeVersion;
-        private String bridgeHost;
-        private Integer bridgePort;
+        private String deviceName;
+        private boolean includeRawData;
+        private int maxLoginCycles = 5;
+        private Duration minReconnectDelay = Duration.ofSeconds(1);
+        private Duration maxReconnectDelay = Duration.ofSeconds(30);
+        private PacingOptions pacing = PacingOptions.defaults();
+        private HumanizationOptions humanization = HumanizationOptions.defaults();
+        private CallOptions callOptions = CallOptions.defaults();
+        private BridgeOptions bridgeOptions = BridgeOptions.defaults();
 
         private Builder() {
         }
 
-        public Builder instanceId(String instanceId) {
-            this.instanceId = instanceId;
+        public Builder instanceId(String id) {
+            this.instanceId = id;
             return this;
         }
 
-        public Builder sessionDirectory(String sessionDirectory) {
-            this.sessionDirectory = Paths.get(Objects.requireNonNull(sessionDirectory, "sessionDirectory"));
+        public Builder sessionDirectory(Path directory) {
+            this.sessionDirectory = directory;
             return this;
         }
 
-        public Builder sessionDirectory(Path sessionDirectory) {
-            this.sessionDirectory = sessionDirectory;
+        public Builder sessionDirectory(String directory) {
+            this.sessionDirectory = Path.of(directory);
             return this;
         }
 
-        /** Shown to WhatsApp as the linked device's name. Bridge default applies if unset. */
-        public Builder displayName(String displayName) {
-            this.displayName = displayName;
+        public Builder deviceName(String name) {
+            this.deviceName = name;
             return this;
         }
 
-        /** Whether to mark this device as "online" as soon as the connection opens. Bridge default (false) applies if unset. */
-        public Builder markOnlineOnConnect(boolean markOnlineOnConnect) {
-            this.markOnlineOnConnect = markOnlineOnConnect;
+        public Builder includeRawData(boolean include) {
+            this.includeRawData = include;
             return this;
         }
 
-        /** Shared by the bridge's own Baileys-level reconnect and this client's bridge-connection reconnect. Default 1s. */
-        public Builder minReconnectDelay(Duration minReconnectDelay) {
-            this.minReconnectDelay = minReconnectDelay;
+        public Builder maxLoginCycles(int cycles) {
+            if (cycles < 1) {
+                throw new IllegalArgumentException("maxLoginCycles must be at least 1");
+            }
+            this.maxLoginCycles = cycles;
             return this;
         }
 
-        /** Default 30s. */
-        public Builder maxReconnectDelay(Duration maxReconnectDelay) {
-            this.maxReconnectDelay = maxReconnectDelay;
+        public Builder reconnectDelay(Duration min, Duration max) {
+            if (min.isNegative() || max.compareTo(min) < 0) {
+                throw new IllegalArgumentException("reconnect delay must satisfy 0 <= min <= max");
+            }
+            this.minReconnectDelay = min;
+            this.maxReconnectDelay = max;
             return this;
         }
 
-        /** How many consecutive bridge-connection reconnect attempts before giving up and moving to FAILED. Default 10. */
-        /**
-         * Ritmo com que as mensagens saem deste numero. Padrao:
-         * {@link PacingOptions#padrao()} — 4 a 12 segundos entre envios, teto de
-         * 10 por minuto.
-         *
-         * <p>A fila em si nao desliga: mesmo com {@link PacingOptions#desligado()}
-         * os envios continuam saindo <b>um de cada vez</b>. Duas mensagens no
-         * mesmo segundo pelo mesmo numero e o padrao que denuncia automacao.
-         *
-         * @param pacing ritmo desejado, ou {@code null} para o padrao
-         * @return este builder
-         */
-        /**
-         * Nivel de log do processo bridge: {@code trace}, {@code debug},
-         * {@code info} (padrao), {@code warn}, {@code error} ou {@code fatal}.
-         *
-         * <p>Existia como variavel de ambiente ({@code ANGATU_BRIDGE_LOG_LEVEL})
-         * mas era inalcancavel pela API — o valor era passado sempre como
-         * {@code null} ao iniciar o processo. Em {@code debug} saem tambem as
-         * repeticoes de ruido de protocolo que o nivel padrao resume.
-         *
-         * @param logLevel nivel do pino no bridge, ou {@code null} para o padrao
-         * @return este builder
-         */
-        public Builder logLevel(String logLevel) {
-            this.logLevel = logLevel;
+        public Builder pacing(PacingOptions options) {
+            this.pacing = Objects.requireNonNull(options, "options");
             return this;
         }
 
-        public Builder pacing(PacingOptions pacing) {
-            this.pacing = pacing;
+        public Builder humanization(HumanizationOptions options) {
+            this.humanization = Objects.requireNonNull(options, "options");
             return this;
         }
 
-        /**
-         * Sinais que a conta emite em volta de um envio: "digitando...",
-         * "gravando audio...", online/offline e o azulzinho de leitura.
-         *
-         * <p>Padrao: {@link HumanizationOptions#padrao()} — digitando e gravando
-         * ligados, leitura em {@link ReadReceiptMode#MANUAL}.
-         *
-         * @param humanization configuracao desejada, ou {@code null} para o padrao
-         * @return este builder
-         */
-        public Builder humanization(HumanizationOptions humanization) {
-            this.humanization = humanization;
+        public Builder calls(CallOptions options) {
+            this.callOptions = Objects.requireNonNull(options, "options");
             return this;
         }
 
-        /**
-         * Intervalo entre tentativas depois que o backoff exponencial se
-         * esgotou. Padrao: 5 minutos.
-         *
-         * <p><b>O que isto conserta.</b> Ate esta versao, esgotados os
-         * {@link #maxReconnectAttempts(int)} o cliente ia para
-         * {@link ConnectionState#FAILED} e <b>ninguem mais tentava</b>. Era o
-         * caminho pelo qual um numero "desconectava e nao voltava": a queda de
-         * rede durava mais que as dez tentativas, o cliente desistia em
-         * silencio e so um restart da aplicacao o traria de volta. Quem usava a
-         * SDK tinha de escrever um vigia por fora so para isso.
-         *
-         * <p>Agora o estado {@code FAILED} continua sendo reportado — a
-         * aplicacao precisa saber que o numero esta fora do ar —, mas as
-         * tentativas <b>nao param</b>: elas passam a sair neste intervalo, para
-         * sempre, e a conexao volta sozinha quando a rede voltar.
-         *
-         * <p>O intervalo e longo de proposito. Reconectar sem parar e pior do
-         * que nao reconectar: cada tentativa reapresenta um cliente web ao
-         * WhatsApp, e uma conta que faz isso vinte vezes por hora tem a
-         * assinatura de uso automatizado que leva a suspensao.
-         *
-         * @param reconnectCooldown intervalo entre tentativas espacadas, ou
-         *        {@code null} para o comportamento antigo (desistir de vez
-         *        apos {@code maxReconnectAttempts})
-         * @return este builder
-         */
-        public Builder reconnectCooldown(Duration reconnectCooldown) {
-            this.reconnectCooldown = reconnectCooldown;
-            this.reconnectCooldownSet = true;
+        public Builder bridge(BridgeOptions options) {
+            this.bridgeOptions = Objects.requireNonNull(options, "options");
             return this;
         }
 
-        public Builder maxReconnectAttempts(int maxReconnectAttempts) {
-            this.maxReconnectAttempts = maxReconnectAttempts;
-            return this;
-        }
-
-        /** Node.js version to download if no compatible system installation is found. Defaults to {@code NodeRuntimeDownloader.DEFAULT_VERSION}. */
-        public Builder nodeVersion(String nodeVersion) {
-            this.nodeVersion = nodeVersion;
-            return this;
-        }
-
-        /** Advanced: bind the local bridge WebSocket server to a non-default host. Never expose this beyond loopback without understanding the security implications - see README "Seguranca". */
-        public Builder bridgeHost(String bridgeHost) {
-            this.bridgeHost = bridgeHost;
-            return this;
-        }
-
-        /** Advanced: use a fixed local port instead of an OS-assigned ephemeral one. */
-        public Builder bridgePort(int bridgePort) {
-            this.bridgePort = bridgePort;
+        public Builder bridge(Function<BridgeOptions, BridgeOptions> customize) {
+            this.bridgeOptions = customize.apply(bridgeOptions);
             return this;
         }
 
         public WhatsAppClient build() {
             if (instanceId == null || instanceId.isBlank()) {
-                throw new IllegalArgumentException("instanceId e obrigatorio");
+                throw new IllegalArgumentException("instanceId is required");
             }
             if (sessionDirectory == null) {
-                throw new IllegalArgumentException("sessionDirectory e obrigatorio");
+                throw new IllegalArgumentException("sessionDirectory is required");
             }
             return new WhatsAppClient(this);
         }

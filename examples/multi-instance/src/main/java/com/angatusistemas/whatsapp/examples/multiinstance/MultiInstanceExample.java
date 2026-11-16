@@ -1,70 +1,44 @@
 package com.angatusistemas.whatsapp.examples.multiinstance;
 
+import br.com.angatusistemas.lib.console.Console;
 import com.angatusistemas.whatsapp.WhatsAppClient;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 
 /**
- * Demonstrates running several independent WhatsApp connections in one JVM:
- * each {@link WhatsAppClient} gets its own instanceId and sessionDirectory,
- * so each is a fully separate WhatsApp number/login with its own bridge
- * process - a crash or disconnect on one never affects the others. Run
- * with the default two instances, or pass your own instance ids:
+ * Several numbers in one application: each client has its own session folder and queue, and all of
+ * them share one bridge process, so a second number costs a queue and a socket, not a second Node.js.
  *
- * <pre>
- * mvn install                                                  # uma vez, para publicar o sdk no repositorio local
- * mvn -pl examples/multi-instance exec:java -Dexec.args="sales support"
- * </pre>
+ * @author Angatu Sistemas
  */
 public final class MultiInstanceExample {
 
-    private static final Logger log = LoggerFactory.getLogger(MultiInstanceExample.class);
+    private MultiInstanceExample() {
+    }
 
     public static void main(String[] args) throws InterruptedException {
-        List<String> instanceIds = args.length > 0 ? List.of(args) : List.of("instance-a", "instance-b");
+        List<String> ids = args.length > 0 ? List.of(args) : List.of("loja-centro", "loja-norte");
         List<WhatsAppClient> clients = new ArrayList<>();
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> clients.forEach(WhatsAppClient::close), "shutdown-clients"));
 
-        Runtime.getRuntime().addShutdownHook(new Thread(
-                () -> clients.forEach(WhatsAppClient::close), "shutdown-all-instances"));
-
-        for (String instanceId : instanceIds) {
-            Path sessionDirectory = Path.of("./whatsapp-sessions/" + instanceId);
+        for (String id : ids) {
             WhatsAppClient client = WhatsAppClient.builder()
-                    .instanceId(instanceId)
-                    .sessionDirectory(sessionDirectory)
+                    .instanceId(id)
+                    .sessionDirectory(Path.of("whatsapp-sessions", id))
                     .build();
+            client.addConnectionStateListener((state, cause, detail) -> Console.info("[%s] %s %s", id, state, cause == null ? "" : cause));
+            client.addQrCodeListener(qr -> Console.info("[%s] QR Code pronto (ciclo %s):%n%s", id, qr.cycle(), client.getQrCodeText()));
+            client.addMessageListener(message -> Console.info("[%s] %s: %s", id, message.senderId(), message.text()));
+            client.addErrorListener(error -> Console.warn("[%s] %s", id, error.getMessage()));
             clients.add(client);
-            attachLogging(client, instanceId);
-        }
-
-        for (WhatsAppClient client : clients) {
-            log.info("conectando instancia '{}'...", client.getInstanceId());
-            client.connect().exceptionally(ex -> {
-                log.error("falha ao conectar '{}': {}", client.getInstanceId(), ex.getMessage(), ex);
+            Console.info("[%s] sessão: %s", id, client.sessionStatus().state());
+            client.connect().exceptionally(error -> {
+                Console.error("[" + id + "] não conectou: " + error.getMessage());
                 return null;
             });
         }
-
-        log.info("{} instancia(s) em inicializacao - Ctrl+C para encerrar todas.", clients.size());
         new CountDownLatch(1).await();
-    }
-
-    private static void attachLogging(WhatsAppClient client, String instanceId) {
-        client.addConnectionStateListener((state, cause, detail) ->
-                log.info("[{}] estado: {} (causa={}, detalhe={})", instanceId, state, cause, detail));
-        client.addQrCodeListener(qr ->
-                log.info("[{}] QR Code disponivel - use client.getQrCodePng() para exibi-lo", instanceId));
-        client.addMessageListener(message ->
-                log.info("[{}] mensagem de {}: {}", instanceId, message.senderId(), message.text()));
-        client.addErrorListener(error -> log.error("[{}] erro: {}", instanceId, error.getMessage(), error));
-    }
-
-    private MultiInstanceExample() {
     }
 }

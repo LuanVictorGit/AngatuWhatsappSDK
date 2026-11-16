@@ -3,13 +3,14 @@ package com.angatusistemas.whatsapp.runtime;
 import java.nio.file.Path;
 
 /**
- * A Node.js binary this SDK has decided to use to run the bridge, either
- * found on the host system ({@link NodeRuntimeLocator}) or fetched on
- * demand into the local cache ({@link NodeRuntimeDownloader}).
+ * The Node.js binary that runs the bridge, its version, and whether it came from the system or
+ * was downloaded by the SDK.
+ *
+ * @author Angatu Sistemas
  */
-public record NodeExecutable(Path path, NodeVersion version, NodeSource source) {
+public record NodeExecutable(Path path, NodeVersion version, Source source) {
 
-    public enum NodeSource {
+    public enum Source {
         SYSTEM,
         DOWNLOADED
     }

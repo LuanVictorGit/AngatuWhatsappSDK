@@ -1,9 +1,14 @@
 package com.angatusistemas.whatsapp.listener;
 
-import com.fasterxml.jackson.databind.JsonNode;
+import com.angatusistemas.whatsapp.model.MessageUpdate;
 
-/** {@code updates} carries whatever partial fields Baileys reported changed - there is no stable abstract shape for it. */
+/**
+ * Receives delivery-status changes and edits of messages already in a chat.
+ *
+ * @author Angatu Sistemas
+ */
 @FunctionalInterface
 public interface MessageUpdatedListener {
-    void onMessageUpdated(String chatId, String messageId, JsonNode updates);
+
+    void onMessageUpdated(MessageUpdate update);
 }

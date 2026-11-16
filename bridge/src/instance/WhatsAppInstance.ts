@@ -2,43 +2,29 @@ import { BaileysAdapter, type AdapterOptions } from '../adapter/BaileysAdapter.j
 import type { EventSink } from './EventSink.js';
 import type { Logger } from '../util/logger.js';
 
-/**
- * Binds one BaileysAdapter to the event transport. Kept deliberately thin -
- * all WhatsApp/Baileys behaviour lives in BaileysAdapter, all business
- * rules (conflict prevention, lookups) live in InstanceManager.
- */
+/** Binds one account's adapter to the event transport; behaviour lives in the adapter. */
 export class WhatsAppInstance {
     readonly adapter: BaileysAdapter;
     readonly instanceId: string;
     readonly sessionDirectory: string;
-    readonly createdAt: number;
+    readonly createdAt = Date.now();
 
-    constructor(options: AdapterOptions, logger: Logger, eventSink: EventSink) {
+    constructor(options: AdapterOptions, logger: Logger, sink: EventSink) {
         this.instanceId = options.instanceId;
         this.sessionDirectory = options.sessionDirectory;
-        this.createdAt = Date.now();
-
+        const id = options.instanceId;
         this.adapter = new BaileysAdapter(options, logger, {
-            onConnectionStateChanged: (state, cause, detail) =>
-                eventSink.emit(this.instanceId, 'connection_state_changed', { state, cause, detail }),
-            onQr: (qr) => eventSink.emit(this.instanceId, 'qr_code', { qr }),
-            onPairingCode: (code) => eventSink.emit(this.instanceId, 'pairing_code', { code }),
-            onMessage: (message) => eventSink.emit(this.instanceId, 'message_received', message),
-            onMessageUpdated: (chatId, messageId, updates) =>
-                eventSink.emit(this.instanceId, 'message_updated', { chatId, messageId, updates }),
-            onMessageDeleted: (chatId, messageId) =>
-                eventSink.emit(this.instanceId, 'message_deleted', { chatId, messageId }),
-            onReaction: (chatId, messageId, senderId, emoji) =>
-                eventSink.emit(this.instanceId, 'reaction_received', {
-                    chatId,
-                    messageId,
-                    senderId,
-                    emoji,
-                    removed: !emoji
-                }),
-            onGroupUpdated: (groupJid, updates) => eventSink.emit(this.instanceId, 'group_updated', { groupJid, updates }),
-            onPresenceUpdated: (chatId, presences) =>
-                eventSink.emit(this.instanceId, 'presence_updated', { chatId, presences })
+            onConnectionStateChanged: (state, cause, detail) => sink.emit(id, 'connection_state_changed', { state, cause, detail }),
+            onQr: (qr, cycle) => sink.emit(id, 'qr_code', { qr, cycle }),
+            onPairingCode: (code) => sink.emit(id, 'pairing_code', { code }),
+            onMessage: (message) => sink.emit(id, 'message_received', message),
+            onMessageUpdated: (update) => sink.emit(id, 'message_updated', update, true),
+            onMessageDeleted: (chatId, messageId) => sink.emit(id, 'message_deleted', { chatId, messageId }),
+            onReaction: (reaction) => sink.emit(id, 'reaction_received', reaction),
+            onGroupUpdated: (update) => sink.emit(id, 'group_updated', update),
+            onPresenceUpdated: (update) => sink.emit(id, 'presence_updated', update, true),
+            onCall: (call) => sink.emit(id, 'call_received', call),
+            onPollVote: (vote) => sink.emit(id, 'poll_vote', vote)
         });
     }
 }

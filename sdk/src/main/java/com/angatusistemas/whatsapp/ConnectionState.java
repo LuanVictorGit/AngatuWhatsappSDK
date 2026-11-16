@@ -1,8 +1,12 @@
 package com.angatusistemas.whatsapp;
 
-import java.util.Arrays;
+import java.util.Locale;
 
-/** Mirrors {@code ConnectionStateName} in {@code bridge/src/adapter/BaileysAdapter.ts}. */
+/**
+ * Where an instance stands with WhatsApp, as reported by the bridge.
+ *
+ * @author Angatu Sistemas
+ */
 public enum ConnectionState {
     DISCONNECTED,
     CONNECTING,
@@ -13,13 +17,18 @@ public enum ConnectionState {
     LOGGED_OUT,
     FAILED;
 
-    public static ConnectionState fromWireValue(String value) {
+    public static ConnectionState fromWire(String value) {
         if (value == null) {
             return DISCONNECTED;
         }
-        return Arrays.stream(values())
-                .filter(state -> state.name().equals(value))
-                .findFirst()
-                .orElse(DISCONNECTED);
+        try {
+            return valueOf(value.toUpperCase(Locale.ROOT));
+        } catch (IllegalArgumentException e) {
+            return DISCONNECTED;
+        }
+    }
+
+    public boolean isLoggingIn() {
+        return this == QR_PENDING || this == PAIRING_CODE_PENDING;
     }
 }

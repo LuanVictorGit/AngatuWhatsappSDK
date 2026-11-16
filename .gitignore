@@ -14,10 +14,8 @@ bridge/dist/
 bridge/*.tsbuildinfo
 npm-debug.log*
 
-# Bundled bridge artifact copied into the SDK jar at build time
-sdk/src/main/resources/bridge/*.mjs
+# The bridge bundle in sdk/src/main/resources/bridge/ is committed (JitPack has no Node.js); its map is not.
 sdk/src/main/resources/bridge/*.mjs.map
-sdk/src/main/resources/bridge/BUILD_INFO.json
 
 # WhatsApp session data / auth state (never commit credentials)
 sessions/
@@ -46,3 +44,15 @@ logs/
 
 # Test output
 sdk/src/test/resources/tmp/
+
+# graphify knowledge graph (local only)
+graphify-out/
+
+# Obsidian workspace state
+.obsidian/workspace*.json
+
+# Local runs
+*.db
+*.db-wal
+*.db-shm
+whatsapp-sessions/

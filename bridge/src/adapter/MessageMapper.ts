@@ -1,15 +1,13 @@
-import { getContentType, type WAMessage, type proto } from 'baileys';
+import { getContentType, normalizeMessageContent, type WAMessage, type proto } from 'baileys';
 import type { LidDirectory } from './LidDirectory.js';
 
-/**
- * Abstract message shape shared with the Java `Message` model. Anything
- * Baileys-specific that has no clean abstract equivalent is left out of
- * this type and only available through `rawData` on the Java side.
- */
+/** The message shape shared with the Java `Message` record. */
 export interface AbstractMessage {
     messageId: string;
     chatId: string;
+    chatIdLid: string | null;
     senderId: string;
+    participant: string | null;
     timestamp: number;
     text: string | null;
     type: string;
@@ -17,13 +15,10 @@ export interface AbstractMessage {
     isFromMe: boolean;
     pushName: string | null;
     quotedMessage: AbstractQuotedMessage | null;
-    /**
-     * LID original da conversa, quando `chatId` foi traduzido para o numero
-     * de telefone. Permite ao consumidor juntar uma conversa que ele ja tenha
-     * gravado sob o endereco anonimo.
-     */
-    chatIdLid: string | null;
-    rawData: unknown;
+    buttonReply: ButtonReply | null;
+    hasMedia: boolean;
+    mimetype: string | null;
+    rawJson: string | null;
 }
 
 export interface AbstractQuotedMessage {
@@ -32,11 +27,19 @@ export interface AbstractQuotedMessage {
     text: string | null;
 }
 
+/** Which button of which message a contact pressed. */
+export interface ButtonReply {
+    buttonId: string;
+    text: string | null;
+    sourceMessageId: string | null;
+}
+
 const TYPE_MAP: Record<string, string> = {
     conversation: 'TEXT',
     extendedTextMessage: 'TEXT',
     imageMessage: 'IMAGE',
     videoMessage: 'VIDEO',
+    ptvMessage: 'VIDEO',
     audioMessage: 'AUDIO',
     documentMessage: 'DOCUMENT',
     documentWithCaptionMessage: 'DOCUMENT',
@@ -52,86 +55,122 @@ const TYPE_MAP: Record<string, string> = {
     buttonsResponseMessage: 'INTERACTIVE_REPLY',
     listResponseMessage: 'INTERACTIVE_REPLY',
     templateButtonReplyMessage: 'INTERACTIVE_REPLY',
-    protocolMessage: 'PROTOCOL'
+    interactiveResponseMessage: 'INTERACTIVE_REPLY'
 };
 
-export function mapMessageType(contentType: string | undefined): string {
-    if (!contentType) return 'UNKNOWN';
-    return TYPE_MAP[contentType] ?? 'UNKNOWN';
+/** Content types that are protocol plumbing, never something a person wrote. */
+export const IGNORED_CONTENT = new Set([
+    'protocolMessage',
+    'senderKeyDistributionMessage',
+    'messageContextInfo',
+    'pollUpdateMessage',
+    'keepInChatMessage',
+    'encReactionMessage',
+    'peerDataOperationRequestResponseMessage'
+]);
+
+const MEDIA_TYPES = new Set(['imageMessage', 'videoMessage', 'ptvMessage', 'audioMessage', 'documentMessage', 'stickerMessage']);
+
+export function contentTypeOf(message: WAMessage): string | undefined {
+    const content = normalizeMessageContent(message.message);
+    return content ? getContentType(content) : undefined;
 }
 
-/** Best-effort human readable body: caption for media, text for text messages. */
-function extractText(message: proto.IMessage | null | undefined, contentType: string | undefined): string | null {
-    if (!message || !contentType) return null;
-    switch (contentType) {
+function extractText(content: proto.IMessage | null | undefined, type: string | undefined): string | null {
+    if (!content || !type) return null;
+    switch (type) {
         case 'conversation':
-            return message.conversation ?? null;
+            return content.conversation ?? null;
         case 'extendedTextMessage':
-            return message.extendedTextMessage?.text ?? null;
+            return content.extendedTextMessage?.text ?? null;
         case 'imageMessage':
-            return message.imageMessage?.caption ?? null;
+            return content.imageMessage?.caption ?? null;
         case 'videoMessage':
-            return message.videoMessage?.caption ?? null;
+            return content.videoMessage?.caption ?? null;
         case 'documentMessage':
-            return message.documentMessage?.caption ?? message.documentMessage?.fileName ?? null;
-        case 'documentWithCaptionMessage':
-            return (
-                message.documentWithCaptionMessage?.message?.documentMessage?.caption ??
-                message.documentWithCaptionMessage?.message?.documentMessage?.fileName ??
-                null
-            );
+            return content.documentMessage?.caption ?? content.documentMessage?.fileName ?? null;
         case 'buttonsResponseMessage':
-            return message.buttonsResponseMessage?.selectedDisplayText ?? null;
+            return content.buttonsResponseMessage?.selectedDisplayText ?? null;
         case 'listResponseMessage':
-            return message.listResponseMessage?.title ?? null;
+            return content.listResponseMessage?.title ?? null;
         case 'templateButtonReplyMessage':
-            return message.templateButtonReplyMessage?.selectedDisplayText ?? null;
+            return content.templateButtonReplyMessage?.selectedDisplayText ?? null;
+        case 'interactiveResponseMessage':
+            return content.interactiveResponseMessage?.body?.text ?? null;
         default:
             return null;
     }
 }
 
-/** contextInfo lives at a different nesting depth depending on the content type. */
-function extractContextInfo(message: proto.IMessage | null | undefined): proto.IContextInfo | undefined {
-    if (!message) return undefined;
-    return (
-        message.extendedTextMessage?.contextInfo ??
-        message.imageMessage?.contextInfo ??
-        message.videoMessage?.contextInfo ??
-        message.audioMessage?.contextInfo ??
-        message.documentMessage?.contextInfo ??
-        message.stickerMessage?.contextInfo ??
-        message.buttonsResponseMessage?.contextInfo ??
-        message.listResponseMessage?.contextInfo ??
-        undefined
-    );
+function contextInfoOf(content: proto.IMessage | null | undefined, type: string | undefined): proto.IContextInfo | undefined {
+    if (!content || !type) return undefined;
+    const inner = (content as Record<string, unknown>)[type] as { contextInfo?: proto.IContextInfo } | undefined;
+    return inner && typeof inner === 'object' ? inner.contextInfo ?? undefined : undefined;
 }
 
-function extractQuoted(message: proto.IMessage | null | undefined): AbstractQuotedMessage | null {
-    const ctx = extractContextInfo(message);
-    if (!ctx?.quotedMessage || !ctx.stanzaId) return null;
-    const quotedType = getContentType(ctx.quotedMessage);
+function extractQuoted(context: proto.IContextInfo | undefined): AbstractQuotedMessage | null {
+    if (!context?.quotedMessage || !context.stanzaId) return null;
+    const quoted = normalizeMessageContent(context.quotedMessage);
     return {
-        messageId: ctx.stanzaId,
-        senderId: ctx.participant ?? '',
-        text: extractText(ctx.quotedMessage, quotedType)
+        messageId: context.stanzaId,
+        senderId: context.participant ?? '',
+        text: extractText(quoted, quoted ? getContentType(quoted) : undefined)
     };
 }
 
-export function toAbstractMessage(waMessage: WAMessage, lids?: LidDirectory): AbstractMessage {
-    // O endereco que veio no stanza pode ser um LID anonimo; o resto do
-    // sistema so sabe conversar em numero de telefone.
-    const chatIdRaw = waMessage.key.remoteJid ?? '';
-    const chatId = lids ? lids.resolve(chatIdRaw) : chatIdRaw;
-    const chatIdLid = chatId !== chatIdRaw ? chatIdRaw : null;
+function extractButtonReply(content: proto.IMessage, type: string, context: proto.IContextInfo | undefined): ButtonReply | null {
+    const source = context?.stanzaId ?? null;
+    switch (type) {
+        case 'buttonsResponseMessage': {
+            const reply = content.buttonsResponseMessage;
+            return reply?.selectedButtonId
+                ? { buttonId: reply.selectedButtonId, text: reply.selectedDisplayText ?? null, sourceMessageId: source }
+                : null;
+        }
+        case 'templateButtonReplyMessage': {
+            const reply = content.templateButtonReplyMessage;
+            return reply?.selectedId
+                ? { buttonId: reply.selectedId, text: reply.selectedDisplayText ?? null, sourceMessageId: source }
+                : null;
+        }
+        case 'listResponseMessage': {
+            const reply = content.listResponseMessage;
+            const id = reply?.singleSelectReply?.selectedRowId;
+            return id ? { buttonId: id, text: reply?.title ?? null, sourceMessageId: source } : null;
+        }
+        case 'interactiveResponseMessage': {
+            const reply = content.interactiveResponseMessage;
+            const params = reply?.nativeFlowResponseMessage?.paramsJson;
+            if (!params) return null;
+            try {
+                const parsed = JSON.parse(params) as { id?: unknown };
+                return typeof parsed.id === 'string'
+                    ? { buttonId: parsed.id, text: reply?.body?.text ?? null, sourceMessageId: source }
+                    : null;
+            } catch {
+                return null;
+            }
+        }
+        default:
+            return null;
+    }
+}
+
+function mimetypeOf(content: proto.IMessage, type: string): string | null {
+    const inner = (content as Record<string, unknown>)[type] as { mimetype?: string | null } | undefined;
+    return inner?.mimetype ?? null;
+}
+
+export function toAbstractMessage(message: WAMessage, lids: LidDirectory, includeRaw: boolean): AbstractMessage {
+    const rawChatId = message.key.remoteJid ?? '';
+    const chatId = lids.resolve(rawChatId);
     const isGroup = chatId.endsWith('@g.us');
-    const isFromMe = waMessage.key.fromMe ?? false;
-    const participanteRaw = (isGroup ? waMessage.key.participant : chatIdRaw) ?? chatIdRaw;
-    const senderId = isFromMe
-        ? 'me'
-        : (lids ? lids.resolve(participanteRaw) : participanteRaw);
-    const contentType = getContentType(waMessage.message ?? undefined);
-    const timestampRaw = waMessage.messageTimestamp;
+    const isFromMe = message.key.fromMe ?? false;
+    const rawParticipant = isGroup ? message.key.participant ?? null : null;
+    const content = normalizeMessageContent(message.message);
+    const type = content ? getContentType(content) : undefined;
+    const context = contextInfoOf(content, type);
+    const timestampRaw = message.messageTimestamp;
     const timestamp =
         typeof timestampRaw === 'number'
             ? timestampRaw
@@ -140,17 +179,21 @@ export function toAbstractMessage(waMessage: WAMessage, lids?: LidDirectory): Ab
               : Math.floor(Date.now() / 1000);
 
     return {
-        messageId: waMessage.key.id ?? '',
+        messageId: message.key.id ?? '',
         chatId,
-        senderId: senderId ?? '',
+        chatIdLid: chatId !== rawChatId ? rawChatId : null,
+        senderId: isFromMe ? 'me' : lids.resolve(rawParticipant ?? rawChatId),
+        participant: rawParticipant,
         timestamp,
-        text: extractText(waMessage.message, contentType),
-        type: mapMessageType(contentType),
+        text: extractText(content, type),
+        type: type ? TYPE_MAP[type] ?? 'UNKNOWN' : 'UNKNOWN',
         isGroup,
         isFromMe,
-        pushName: waMessage.pushName ?? null,
-        quotedMessage: extractQuoted(waMessage.message),
-        chatIdLid,
-        rawData: waMessage
+        pushName: message.pushName ?? null,
+        quotedMessage: extractQuoted(context),
+        buttonReply: content && type ? extractButtonReply(content, type, context) : null,
+        hasMedia: type ? MEDIA_TYPES.has(type) : false,
+        mimetype: content && type && MEDIA_TYPES.has(type) ? mimetypeOf(content, type) : null,
+        rawJson: includeRaw ? JSON.stringify(message) : null
     };
 }

@@ -1,33 +1,20 @@
-// Named import (not default): pino's CJS->ESM default-export interop under
-// "moduleResolution": "NodeNext" resolves to a non-callable namespace type
-// with a plain default import. pino explicitly publishes `pino` as a named
-// export too, which types and bundles correctly.
+// Named import: pino's default export does not resolve to a callable type under NodeNext.
 import { pino, type LogFn } from 'pino';
 
 /**
- * Structured JSON logger written synchronously to stdout (one line per
- * record). The Java side's BridgeLogForwarder reads this stream line by
- * line and re-emits it through SLF4J, so the shape here (level, time,
- * msg, plus bindings) is deliberately kept pino-default rather than
- * customized - it is machine-parsed on the other end.
- *
- * No `transport` is configured on purpose: pino transports run in a
- * worker thread loaded via a dynamic path that does not survive being
- * bundled into a single file by esbuild.
+ * Structured JSON logging to stdout, one record per line. The Java side reads
+ * this stream and re-emits it, so the shape stays pino's default. No transport
+ * is configured: pino transports load a worker by dynamic path, which does not
+ * survive bundling into a single file.
  */
 const level = process.env.ANGATU_BRIDGE_LOG_LEVEL ?? 'info';
 
-export const rootLogger = pino({
-    level,
-    // Never let the WebSocket auth token, or full session credentials,
-    // reach a log line even if a caller accidentally logs an object
-    // that contains one of these keys.
-    redact: {
-        paths: ['token', '*.token', 'creds', '*.creds', 'authState', '*.authState'],
-        censor: '[redacted]'
-    },
-    timestamp: pino.stdTimeFunctions.isoTime
-});
+const REDACT = {
+    paths: ['token', '*.token', 'creds', '*.creds', 'authState', '*.authState'],
+    censor: '[redacted]'
+};
+
+export const rootLogger = pino({ level, redact: REDACT, timestamp: pino.stdTimeFunctions.isoTime });
 
 export function childLogger(bindings: Record<string, unknown>) {
     return rootLogger.child(bindings);
@@ -36,139 +23,83 @@ export function childLogger(bindings: Record<string, unknown>) {
 export type Logger = ReturnType<typeof childLogger>;
 
 /**
- * Mensagens que o Baileys registra como ERRO e que sao, na verdade, o
- * protocolo funcionando.
- *
- * `failed to decrypt message` numa conversa de grupo significa que chegou uma
- * mensagem cifrada por um aparelho com o qual ainda nao temos sessao Signal —
- * situacao normal para um aparelho vinculado depois, e para participantes que
- * entraram no grupo antes de nos. O Baileys responde com um `sent retry
- * receipt`, pedindo ao remetente que reenvie cifrado para nos; se ele
- * responder, a mensagem chega, e se nao responder, nao ha nada a fazer do
- * nosso lado.
- *
- * O problema pratico e o volume: em um grupo movimentado isso enche o
- * journalctl com paginas de stack trace por hora e enterra o log de envio, que
- * e o que se precisa ler quando algo da errado de verdade. Aqui cada uma
- * aparece UMA vez, com a explicacao, e as repeticoes caem para `debug` — quem
- * quiser ve-las liga `ANGATU_BRIDGE_LOG_LEVEL=debug`.
+ * Lines Baileys logs at error level that are the protocol working as designed:
+ * a group message from a device we have no Signal session with yet, answered
+ * with a retry receipt. In a busy group they bury every useful line, so each
+ * one is explained once and its repeats are only counted.
  */
-const RUIDO_DO_PROTOCOLO: ReadonlyArray<{ trecho: string; explicacao: string }> = [
+const PROTOCOL_NOISE: ReadonlyArray<{ fragment: string; explanation: string }> = [
     {
-        trecho: 'failed to decrypt message',
-        explicacao:
-            'mensagem de grupo que nao pudemos decifrar (sem sessao Signal com o aparelho que enviou). ' +
-            'O Baileys ja pediu o reenvio ao remetente; e comportamento normal do protocolo, nao falha da ' +
-            'aplicacao. As proximas ocorrencias ficam em nivel debug (ANGATU_BRIDGE_LOG_LEVEL=debug para ve-las).'
+        fragment: 'failed to decrypt message',
+        explanation:
+            'group message we could not decrypt (no Signal session with the sending device yet); ' +
+            'Baileys already asked the sender to resend. Normal protocol behaviour. Repeats are counted, ' +
+            'not logged (ANGATU_BRIDGE_LOG_LEVEL=debug shows them).'
     },
     {
-        trecho: 'sent retry receipt',
-        explicacao:
-            'pedido de reenvio mandado ao remetente de uma mensagem que nao pudemos decifrar. ' +
-            'As proximas ocorrencias ficam em nivel debug.'
+        fragment: 'sent retry receipt',
+        explanation: 'retry receipt sent for a message we could not decrypt. Repeats are counted, not logged.'
     }
 ];
 
-/** {@code true} quando o nivel configurado ja mostra tudo. */
-const MOSTRA_TUDO = level === 'debug' || level === 'trace';
+const SHOWS_EVERYTHING = level === 'debug' || level === 'trace';
 
-/**
- * Quantas vezes cada ruido de protocolo apareceu, por instancia.
- *
- * <p><b>Por que contar o que se resolveu esconder.</b> Silenciar as repeticoes
- * resolveu o log, mas apagou um sinal: uma <i>escalada</i> de falhas de decrypt
- * e o aviso precoce de que a sessao Signal esta se degradando — e, se o numero
- * passa a pedir reenvio o tempo todo, isso conta contra a reputacao dele. Sem
- * contador, essa escalada ficava invisivel no nivel padrao. O log continua
- * limpo; o numero fica disponivel em `get_status`.
- */
-const contadoresDeRuido = new Map<string, Map<string, number>>();
+const noiseCounters = new Map<string, Map<string, number>>();
 
-/**
- * Quantas vezes cada ruido de protocolo apareceu numa instancia.
- *
- * @param instanceId instancia
- * @return mapa trecho -> contagem (vazio se nada aconteceu)
- */
-export function ruidoDoProtocolo(instanceId: string): Record<string, number> {
-    const contagens = contadoresDeRuido.get(instanceId);
-    return contagens ? Object.fromEntries(contagens) : {};
+export function protocolNoise(instanceId: string): Record<string, number> {
+    const counters = noiseCounters.get(instanceId);
+    return counters ? Object.fromEntries(counters) : {};
 }
 
-/**
- * Esquece os contadores de uma instancia que deixou de existir.
- *
- * `contadoresDeRuido` e um mapa de nivel de modulo: sem isto, a entrada de
- * cada instancia destruida ficaria la ate o processo terminar. Chamado pelo
- * `destroy()` do adapter, nao pelo `disconnect()` - depois de um disconnect a
- * instancia ainda existe e a contagem ainda vale.
- *
- * @param instanceId instancia que esta sendo destruida
- */
-export function limparRuido(instanceId: string): void {
-    contadoresDeRuido.delete(instanceId);
+export function forgetProtocolNoise(instanceId: string): void {
+    noiseCounters.delete(instanceId);
 }
 
-function contarRuido(instanceId: string, trecho: string): number {
-    let contagens = contadoresDeRuido.get(instanceId);
-    if (!contagens) {
-        contagens = new Map();
-        contadoresDeRuido.set(instanceId, contagens);
+function countNoise(instanceId: string, fragment: string): number {
+    let counters = noiseCounters.get(instanceId);
+    if (!counters) {
+        counters = new Map();
+        noiseCounters.set(instanceId, counters);
     }
-    const total = (contagens.get(trecho) ?? 0) + 1;
-    contagens.set(trecho, total);
+    const total = (counters.get(fragment) ?? 0) + 1;
+    counters.set(fragment, total);
     return total;
 }
 
 /**
- * Logger entregue ao Baileys, com o ruido de protocolo resumido.
- *
- * Instancia separada (e nao um child do rootLogger) porque o filtro vive no
- * `hooks.logMethod`, que so existe na raiz. Escreve no mesmo stdout, no mesmo
- * formato — o BridgeLogForwarder do lado Java nao percebe diferenca.
- *
- * @param instanceId instancia a que este logger pertence
+ * Logger handed to Baileys for one account. A separate root (not a child)
+ * because the noise filter lives in `hooks.logMethod`, which only a root has.
  */
-export function loggerDoBaileys(instanceId: string) {
-    const jaExplicado = new Set<string>();
+export function baileysLogger(instanceId: string) {
+    const explained = new Set<string>();
     return pino({
         level,
-        redact: {
-            paths: ['token', '*.token', 'creds', '*.creds', 'authState', '*.authState'],
-            censor: '[redacted]'
-        },
+        redact: REDACT,
         timestamp: pino.stdTimeFunctions.isoTime,
         hooks: {
             logMethod(args: [msg: string, ...rest: unknown[]], method: LogFn) {
-                if (MOSTRA_TUDO) {
+                if (SHOWS_EVERYTHING) {
                     method.apply(this, args);
                     return;
                 }
-                // pino aceita (msg) e (obj, msg): a mensagem esta no primeiro
-                // argumento que for string.
-                const texto = (args as unknown[]).find((a) => typeof a === 'string') as string | undefined;
-                const ruido = texto
-                    ? RUIDO_DO_PROTOCOLO.find((r) => texto.includes(r.trecho))
-                    : undefined;
-                if (!ruido) {
+                const text = (args as unknown[]).find((a) => typeof a === 'string') as string | undefined;
+                const noise = text ? PROTOCOL_NOISE.find((n) => text.includes(n.fragment)) : undefined;
+                if (!noise) {
                     method.apply(this, args);
                     return;
                 }
-                const total = contarRuido(instanceId, ruido.trecho);
-                if (!jaExplicado.has(ruido.trecho)) {
-                    jaExplicado.add(ruido.trecho);
-                    method.apply(this, [ruido.explicacao]);
-                }
-                // Repeticoes: descartadas do log, mas contadas. Uma escalada
-                // dessas e o aviso precoce de sessao Signal degradando, e sem
-                // marco nenhum ela passaria despercebida ate o numero cair.
-                else if (total % 500 === 0) {
+                const total = countNoise(instanceId, noise.fragment);
+                if (!explained.has(noise.fragment)) {
+                    explained.add(noise.fragment);
+                    method.apply(this, [noise.explanation]);
+                } else if (total % 500 === 0) {
+                    // An escalation of decrypt failures is the early sign of a degrading Signal session.
                     method.apply(this, [
-                        { ocorrencias: total, trecho: ruido.trecho },
-                        'ruido de protocolo se repetindo muito - confira get_status se o numero estiver instavel'
+                        { occurrences: total, fragment: noise.fragment },
+                        'protocol noise repeating often - check get_status if the number is unstable'
                     ] as never);
                 }
             }
         }
-    }).child({ instanceId, componente: 'baileys' });
+    }).child({ instanceId, component: 'baileys' });
 }

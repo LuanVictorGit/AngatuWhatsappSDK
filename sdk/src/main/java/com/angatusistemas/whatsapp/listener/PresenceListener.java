@@ -1,8 +1,14 @@
 package com.angatusistemas.whatsapp.listener;
 
-import com.fasterxml.jackson.databind.JsonNode;
+import com.angatusistemas.whatsapp.model.PresenceUpdate;
 
+/**
+ * Receives online, typing and recording states of contacts in subscribed chats.
+ *
+ * @author Angatu Sistemas
+ */
 @FunctionalInterface
 public interface PresenceListener {
-    void onPresenceUpdated(String chatId, JsonNode presences);
+
+    void onPresenceUpdated(PresenceUpdate update);
 }

@@ -1,22 +1,17 @@
 package com.angatusistemas.whatsapp.exception;
 
-import com.angatusistemas.whatsapp.protocol.BridgeErrorCode;
-
-import java.util.Map;
-
-/** The instance is not connected, or the connection attempt itself failed. */
-public class ConnectionException extends WhatsAppException {
-
-    public ConnectionException(String message) {
-        super(message);
-    }
+/**
+ * The account or the bridge is not connected, or the connection could not be established.
+ *
+ * @author Angatu Sistemas
+ */
+public final class ConnectionException extends WhatsAppException {
 
     public ConnectionException(String instanceId, BridgeErrorCode errorCode, String message) {
         super(instanceId, errorCode, message);
     }
 
-    public ConnectionException(String instanceId, BridgeErrorCode errorCode, String message, Throwable cause,
-            Map<String, Object> details) {
-        super(instanceId, errorCode, message, cause, details);
+    public ConnectionException(String instanceId, BridgeErrorCode errorCode, String message, Throwable cause) {
+        super(instanceId, errorCode, message, cause);
     }
 }

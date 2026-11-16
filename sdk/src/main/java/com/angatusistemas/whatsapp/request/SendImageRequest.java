@@ -1,74 +1,29 @@
 package com.angatusistemas.whatsapp.request;
 
+import java.nio.file.Path;
 import java.util.Objects;
 
-public final class SendImageRequest {
+/**
+ * An image read from a file on this machine (the bridge process reads it), with an optional caption.
+ *
+ * @author Angatu Sistemas
+ */
+public record SendImageRequest(String to, Path file, String caption, String quotedMessageId) {
 
-    private final String to;
-    private final String filePath;
-    private final String caption;
-    private final String quotedMessageId;
-
-    private SendImageRequest(Builder builder) {
-        this.to = Objects.requireNonNull(builder.to, "to");
-        this.filePath = Objects.requireNonNull(builder.filePath, "filePath");
-        this.caption = builder.caption;
-        this.quotedMessageId = builder.quotedMessageId;
+    public SendImageRequest {
+        Objects.requireNonNull(to, "to");
+        Objects.requireNonNull(file, "file");
     }
 
-    public String to() {
-        return to;
+    public static SendImageRequest of(String to, Path file) {
+        return new SendImageRequest(to, file, null, null);
     }
 
-    public String filePath() {
-        return filePath;
+    public SendImageRequest withCaption(String text) {
+        return new SendImageRequest(to, file, text, quotedMessageId);
     }
 
-    public String caption() {
-        return caption;
-    }
-
-    public String quotedMessageId() {
-        return quotedMessageId;
-    }
-
-    public static Builder builder() {
-        return new Builder();
-    }
-
-    public static final class Builder {
-        private String to;
-        private String filePath;
-        private String caption;
-        private String quotedMessageId;
-
-        private Builder() {
-        }
-
-        /** Destination chat JID (individual {@code 5511999999999@s.whatsapp.net} or group {@code ...@g.us}). */
-        public Builder to(String to) {
-            this.to = to;
-            return this;
-        }
-
-        /** Absolute path, on the machine running the bridge, to the image file to send. */
-        public Builder filePath(String filePath) {
-            this.filePath = filePath;
-            return this;
-        }
-
-        public Builder caption(String caption) {
-            this.caption = caption;
-            return this;
-        }
-
-        public Builder quotedMessageId(String quotedMessageId) {
-            this.quotedMessageId = quotedMessageId;
-            return this;
-        }
-
-        public SendImageRequest build() {
-            return new SendImageRequest(this);
-        }
+    public SendImageRequest quoting(String messageId) {
+        return new SendImageRequest(to, file, caption, messageId);
     }
 }

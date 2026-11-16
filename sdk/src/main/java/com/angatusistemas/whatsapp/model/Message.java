@@ -1,82 +1,34 @@
 package com.angatusistemas.whatsapp.model;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.node.NullNode;
-
 import java.time.Instant;
 
 /**
- * Abstract, Baileys-independent view of a WhatsApp message. Mirrors
- * {@code AbstractMessage} in {@code bridge/src/adapter/MessageMapper.ts}.
+ * A message received live by an instance. Only messages newer than the start of the client are
+ * delivered; rawJson is filled only when raw data was enabled on the client, because the full
+ * protocol message is many times the size of everything else here.
  *
- * <p>{@code rawData} carries the underlying Baileys {@code WAMessage} object
- * exactly as received (as a {@link JsonNode}), for the rare case something
- * genuinely needs a field this abstraction does not expose - the rest of
- * this API is deliberately not coupled to Baileys' own message shape, since
- * that shape is not part of any stability contract Baileys makes.
+ * @author Angatu Sistemas
  */
 public record Message(
-        String messageId,
         String instanceId,
+        String messageId,
         String chatId,
+        String chatIdLid,
         String senderId,
-        long timestamp,
+        String participant,
+        Instant timestamp,
         String text,
         MessageType type,
         boolean isGroup,
         boolean isFromMe,
         String pushName,
         QuotedMessage quotedMessage,
-        String chatIdLid,
-        JsonNode rawData) {
+        ButtonReply buttonReply,
+        boolean hasMedia,
+        String mimetype,
+        String rawJson) {
 
-    public Instant timestampAsInstant() {
-        return Instant.ofEpochSecond(timestamp);
-    }
-
-    /**
-     * Endereco anonimo ({@code <id>@lid}) sob o qual esta conversa chegou,
-     * quando {@link #chatId()} ja veio traduzido para o numero de telefone.
-     *
-     * O WhatsApp esta migrando as conversas individuais para LID: a mesma
-     * pessoa passa a ter dois enderecos. Quem guarda historico precisa disto
-     * para juntar a conversa que tenha sido gravada sob o endereco antigo em
-     * vez de manter duas.
-     *
-     * @return o LID de origem, ou {@code null} se nao houve traducao
-     */
-    public String chatIdLid() {
-        return chatIdLid;
-    }
-
-    public static Message fromJson(String instanceId, JsonNode data) {
-        JsonNode quotedNode = data.get("quotedMessage");
-        QuotedMessage quoted = (quotedNode == null || quotedNode.isNull())
-                ? null
-                : new QuotedMessage(
-                        text(quotedNode, "messageId"),
-                        text(quotedNode, "senderId"),
-                        text(quotedNode, "text"));
-
-        JsonNode raw = data.get("rawData");
-        return new Message(
-                text(data, "messageId"),
-                instanceId,
-                text(data, "chatId"),
-                text(data, "senderId"),
-                data.path("timestamp").asLong(0),
-                text(data, "text"),
-                MessageType.fromWireValue(text(data, "type")),
-                data.path("isGroup").asBoolean(false),
-                data.path("isFromMe").asBoolean(false),
-                text(data, "pushName"),
-                quoted,
-                text(data, "chatIdLid"),
-                raw != null ? raw : NullNode.getInstance());
-    }
-
-    private static String text(JsonNode node, String field) {
-        JsonNode value = node.get(field);
-        return (value == null || value.isNull()) ? null : value.asText();
+    public boolean hasText() {
+        return text != null && !text.isBlank();
     }
 }

@@ -1,27 +1,17 @@
 package com.angatusistemas.whatsapp.runtime;
 
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.Locale;
 
 /**
- * Resolves the single local directory this SDK uses to cache things it
- * would otherwise have to re-fetch or re-extract on every JVM start: a
- * downloaded Node.js runtime ({@code node/}) and the bundled bridge script
- * extracted from the SDK jar ({@code bridge/}).
+ * Where the SDK keeps what it downloads and extracts (Node.js, the bridge script). Point
+ * ANGATU_WHATSAPP_HOME at a persistent volume in a container, or every deploy downloads Node again.
  *
- * <p>Override with the {@code ANGATU_WHATSAPP_HOME} environment variable
- * (useful for containers/CI where the default user-profile location is not
- * writable or should not be shared across jobs). Otherwise this follows
- * platform convention: {@code %LOCALAPPDATA%\angatu-whatsapp-sdk} on
- * Windows, {@code $XDG_CACHE_HOME/angatu-whatsapp-sdk} on Unix-likes when
- * set, else {@code ~/.angatu-whatsapp-sdk}.
+ * @author Angatu Sistemas
  */
 public final class RuntimeCacheDirectory {
 
     private static final String ENV_OVERRIDE = "ANGATU_WHATSAPP_HOME";
-    private static final String DIR_NAME_DOTTED = ".angatu-whatsapp-sdk";
-    private static final String DIR_NAME_PLAIN = "angatu-whatsapp-sdk";
 
     private RuntimeCacheDirectory() {
     }
@@ -29,23 +19,14 @@ public final class RuntimeCacheDirectory {
     public static Path resolve() {
         String override = System.getenv(ENV_OVERRIDE);
         if (override != null && !override.isBlank()) {
-            return Paths.get(override);
+            return Path.of(override);
         }
-
-        String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
-        if (os.contains("win")) {
-            String localAppData = System.getenv("LOCALAPPDATA");
-            if (localAppData != null && !localAppData.isBlank()) {
-                return Paths.get(localAppData, DIR_NAME_PLAIN);
-            }
-        } else {
-            String xdgCacheHome = System.getenv("XDG_CACHE_HOME");
-            if (xdgCacheHome != null && !xdgCacheHome.isBlank()) {
-                return Paths.get(xdgCacheHome, DIR_NAME_PLAIN);
-            }
+        boolean windows = System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win");
+        String base = windows ? System.getenv("LOCALAPPDATA") : System.getenv("XDG_CACHE_HOME");
+        if (base != null && !base.isBlank()) {
+            return Path.of(base, "angatu-whatsapp-sdk");
         }
-
-        return Paths.get(System.getProperty("user.home"), DIR_NAME_DOTTED);
+        return Path.of(System.getProperty("user.home"), ".angatu-whatsapp-sdk");
     }
 
     public static Path nodeDirectory() {

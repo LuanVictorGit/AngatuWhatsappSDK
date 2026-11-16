@@ -9,79 +9,74 @@ export interface CreateInstanceOptions {
     instanceId: string;
     sessionDirectory: string;
     displayName?: string;
-    markOnlineOnConnect?: boolean;
+    alwaysOnline?: boolean;
+    includeRawData?: boolean;
+    acceptSince?: number;
+    readsPerMinute?: number;
     minReconnectDelayMs?: number;
     maxReconnectDelayMs?: number;
+    maxLoginCycles?: number;
 }
 
+/** OS version Chrome reports on Windows 11; the tuple is [os, browser, os version]. */
+const DEFAULT_OS_VERSION = '10.0.22631';
+
 /**
- * Owns every WhatsAppInstance running in this bridge process and enforces
- * the invariants the SDK spec requires: an instanceId is unique, and two
- * instances can never share a session directory (that would corrupt both
- * Baileys auth states, since useMultiFileAuthState writes freely to it).
- *
- * O mapa {@link sessionDirsInUse} cobre so este processo. A garantia ENTRE
- * processos — um bridge orfao de um `kill -9` anterior, ou uma segunda JVM —
- * vem da {@link SessionLock}, um arquivo no proprio diretorio de sessao. Ver o
- * Javadoc dela para o porque: dois sockets na mesma conta e o que faz o
- * WhatsApp responder `connectionReplaced` em looping.
+ * Every account hosted by this bridge process. Enforces that an instance id is
+ * unique and that no two accounts share a session directory; the on-disk
+ * SessionLock extends the second guarantee to other processes, because two
+ * sockets on one account make WhatsApp answer connectionReplaced in a loop.
  */
 export class InstanceManager {
     private readonly instances = new Map<string, WhatsAppInstance>();
-    private readonly sessionDirsInUse = new Map<string, string>();
+    private readonly directories = new Map<string, string>();
     private readonly locks = new Map<string, SessionLock>();
 
     constructor(
         private readonly logger: Logger,
-        private readonly eventSink: EventSink
+        private readonly sink: EventSink
     ) {}
 
     create(options: CreateInstanceOptions): WhatsAppInstance {
-        if (this.instances.has(options.instanceId)) {
-            throw new BridgeCommandError(
-                ErrorCode.INSTANCE_ALREADY_EXISTS,
-                `Instancia '${options.instanceId}' ja existe neste processo bridge`
-            );
+        const existing = this.instances.get(options.instanceId);
+        const directory = resolve(options.sessionDirectory);
+        if (existing) {
+            // A Java client reattaching after a lost WebSocket: same account, same directory, nothing to redo.
+            if (existing.sessionDirectory === directory) {
+                return existing;
+            }
+            throw new BridgeCommandError(ErrorCode.INSTANCE_ALREADY_EXISTS, `instance '${options.instanceId}' already exists`);
         }
-
-        const resolvedDir = resolve(options.sessionDirectory);
-        const owner = this.sessionDirsInUse.get(resolvedDir);
+        const owner = this.directories.get(directory);
         if (owner) {
-            throw new BridgeCommandError(
-                ErrorCode.INSTANCE_ALREADY_EXISTS,
-                `sessionDirectory '${resolvedDir}' ja esta em uso pela instancia '${owner}'`
-            );
+            throw new BridgeCommandError(ErrorCode.INSTANCE_ALREADY_EXISTS, `session directory '${directory}' is used by '${owner}'`);
         }
 
-        // Antes de qualquer coisa: a trava em disco. Se outro processo detem a
-        // conta, e melhor falhar aqui do que subir um socket que vai brigar com
-        // o dele.
-        const lock = SessionLock.acquire(resolvedDir, options.instanceId, this.logger);
-
+        const lock = SessionLock.acquire(directory, options.instanceId, this.logger);
         let instance: WhatsAppInstance;
         try {
             instance = new WhatsAppInstance(
                 {
                     instanceId: options.instanceId,
-                    sessionDirectory: resolvedDir,
-                    displayName: options.displayName ?? 'Angatu WhatsApp SDK',
-                    markOnlineOnConnect: options.markOnlineOnConnect ?? false,
+                    sessionDirectory: directory,
+                    browser: [options.displayName ?? 'Windows', 'Chrome', DEFAULT_OS_VERSION],
+                    alwaysOnline: options.alwaysOnline ?? true,
+                    includeRawData: options.includeRawData ?? false,
+                    acceptSince: options.acceptSince ?? Math.floor(Date.now() / 1000),
+                    readsPerMinute: options.readsPerMinute ?? 30,
                     minReconnectDelayMs: options.minReconnectDelayMs ?? 1_000,
-                    maxReconnectDelayMs: options.maxReconnectDelayMs ?? 30_000
+                    maxReconnectDelayMs: options.maxReconnectDelayMs ?? 30_000,
+                    maxLoginCycles: options.maxLoginCycles ?? 5
                 },
                 this.logger.child({ instanceId: options.instanceId }),
-                this.eventSink
+                this.sink
             );
         } catch (err) {
-            // Sem isto, um erro de construcao deixaria a trava no disco sem
-            // dono vivo para libera-la — e a conta ficaria inacessivel ate o
-            // proximo processo considerar a trava orfa.
             lock.release();
             throw err;
         }
-
         this.instances.set(options.instanceId, instance);
-        this.sessionDirsInUse.set(resolvedDir, options.instanceId);
+        this.directories.set(directory, options.instanceId);
         this.locks.set(options.instanceId, lock);
         this.logger.info({ instanceId: options.instanceId }, 'instance created');
         return instance;
@@ -90,61 +85,39 @@ export class InstanceManager {
     get(instanceId: string): WhatsAppInstance {
         const instance = this.instances.get(instanceId);
         if (!instance) {
-            throw new BridgeCommandError(ErrorCode.INSTANCE_NOT_FOUND, `Instancia '${instanceId}' nao encontrada`);
+            throw new BridgeCommandError(ErrorCode.INSTANCE_NOT_FOUND, `instance '${instanceId}' not found`);
         }
         return instance;
     }
 
-    has(instanceId: string): boolean {
-        return this.instances.has(instanceId);
-    }
-
-    list(): string[] {
-        return [...this.instances.keys()];
+    list(): WhatsAppInstance[] {
+        return [...this.instances.values()];
     }
 
     async destroy(instanceId: string): Promise<void> {
-        const instance = this.get(instanceId);
+        const instance = this.instances.get(instanceId);
+        if (!instance) return;
         await instance.adapter.disconnect();
-        // Depois do disconnect: a instancia nao volta mais, entao o
-        // temporizador de manutencao e os contadores dela vao junto.
         instance.adapter.destroy();
         this.instances.delete(instanceId);
-        this.sessionDirsInUse.delete(resolve(instance.sessionDirectory));
-        this.liberarTrava(instanceId);
+        this.directories.delete(instance.sessionDirectory);
+        this.releaseLock(instanceId);
         this.logger.info({ instanceId }, 'instance destroyed');
     }
 
     async shutdownAll(): Promise<void> {
-        await Promise.all([...this.instances.values()].map(async (instance) => {
-            await instance.adapter.disconnect();
-            instance.adapter.destroy();
-        }));
-        this.instances.clear();
-        this.sessionDirsInUse.clear();
-        for (const instanceId of [...this.locks.keys()]) {
-            this.liberarTrava(instanceId);
-        }
+        await Promise.all([...this.instances.keys()].map((id) => this.destroy(id)));
     }
 
-    /**
-     * Libera as travas sem esperar desconexao nenhuma.
-     *
-     * Existe para os caminhos sincronos de encerramento (`exit`, sinal fatal),
-     * onde nao ha tempo para um `await`: perder a trava no disco custaria ao
-     * proximo processo esperar ela vencer como orfa.
-     */
+    /** For the synchronous exit paths, where there is no time to await a disconnect. */
     releaseAllLocks(): void {
-        for (const instanceId of [...this.locks.keys()]) {
-            this.liberarTrava(instanceId);
+        for (const id of [...this.locks.keys()]) {
+            this.releaseLock(id);
         }
     }
 
-    private liberarTrava(instanceId: string): void {
-        const lock = this.locks.get(instanceId);
-        if (lock) {
-            lock.release();
-            this.locks.delete(instanceId);
-        }
+    private releaseLock(instanceId: string): void {
+        this.locks.get(instanceId)?.release();
+        this.locks.delete(instanceId);
     }
 }

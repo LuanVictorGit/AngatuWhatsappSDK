@@ -1,92 +1,97 @@
 package com.angatusistemas.whatsapp.runtime;
 
+import br.com.angatusistemas.lib.console.Console;
+import com.angatusistemas.whatsapp.exception.BridgeErrorCode;
 import com.angatusistemas.whatsapp.exception.BridgeException;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
-import java.util.Arrays;
+import java.security.DigestInputStream;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.Comparator;
+import java.util.HexFormat;
+import java.util.stream.Stream;
 
 /**
- * Extracts the bundled {@code bridge.mjs} (built by {@code bridge/build.mjs}
- * and embedded as a classpath resource inside the SDK jar) into the local
- * runtime cache so it can be handed to {@code node} as a plain file path -
- * a script cannot be executed directly out of a jar.
+ * Extracts the bridge script shipped inside the jar into the cache directory, under a folder named
+ * after its content hash, so a new SDK version never runs an old script. The script is streamed,
+ * never loaded whole into the heap.
  *
- * <p>The install directory is named after the script's own SHA-256, so
- * upgrading the SDK to a jar with a different bridge build automatically
- * installs alongside (rather than over) any previous version's cache entry,
- * and re-running against an unchanged jar is a no-op after the first call.
+ * @author Angatu Sistemas
  */
 public final class BridgeInstaller {
 
-    private static final Logger log = LoggerFactory.getLogger(BridgeInstaller.class);
-
     private static final String SCRIPT_RESOURCE = "/bridge/bridge.mjs";
-    private static final String BUILD_INFO_RESOURCE = "/bridge/BUILD_INFO.json";
+    private static final long STALE_AFTER_MS = 24 * 60 * 60 * 1000L;
 
-    public Path install() {
-        byte[] script = readClasspathResource(SCRIPT_RESOURCE);
-        String contentHash = Sha256.hex(script);
-        Path targetDir = RuntimeCacheDirectory.bridgeDirectory().resolve(contentHash);
-        Path targetScript = targetDir.resolve("bridge.mjs");
-
-        if (alreadyInstalled(targetScript, script)) {
-            log.debug("bridge.mjs ja instalado em {}", targetScript);
-            return targetScript;
-        }
-
-        try {
-            Files.createDirectories(targetDir);
-            Path tempFile = Files.createTempFile(targetDir, "bridge", ".mjs.tmp");
-            Files.write(tempFile, script);
-            Files.move(tempFile, targetScript, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-        } catch (IOException e) {
-            throw new BridgeException("falha ao instalar o script do bridge em " + targetScript, e);
-        }
-
-        installBuildInfoBestEffort(targetDir);
-        log.info("bridge.mjs instalado em {}", targetScript);
-        return targetScript;
+    private BridgeInstaller() {
     }
 
-    private boolean alreadyInstalled(Path targetScript, byte[] expectedContent) {
-        if (!Files.isRegularFile(targetScript)) {
+    public static Path install() {
+        String hash = hashOfResource();
+        Path directory = RuntimeCacheDirectory.bridgeDirectory().resolve(hash.substring(0, 32));
+        Path script = directory.resolve("bridge.mjs");
+        if (Files.isRegularFile(script)) {
+            return script;
+        }
+        try (InputStream in = open()) {
+            Files.createDirectories(directory);
+            Path temporary = Files.createTempFile(directory, "bridge", ".tmp");
+            try (OutputStream out = Files.newOutputStream(temporary)) {
+                in.transferTo(out);
+            }
+            Files.move(temporary, script, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (IOException e) {
+            throw new BridgeException(null, BridgeErrorCode.INTERNAL_ERROR, "failed to install the bridge script at " + script, e);
+        }
+        Console.info("[whatsapp] bridge script installed at %s", script);
+        removeOldVersions(directory);
+        return script;
+    }
+
+    // Every SDK upgrade extracts a new folder; older ones untouched for a day belong to no running bridge.
+    private static void removeOldVersions(Path current) {
+        long cutoff = System.currentTimeMillis() - STALE_AFTER_MS;
+        try (Stream<Path> folders = Files.list(current.getParent())) {
+            folders.filter(folder -> !folder.equals(current)).filter(folder -> modifiedBefore(folder, cutoff)).forEach(folder -> {
+                try (Stream<Path> files = Files.walk(folder)) {
+                    files.sorted(Comparator.reverseOrder()).forEach(path -> path.toFile().delete());
+                } catch (IOException e) {
+                    Console.debug("[whatsapp] could not remove the old bridge folder %s: %s", folder, e.getMessage());
+                }
+            });
+        } catch (IOException e) {
+            Console.debug("[whatsapp] could not list old bridge folders: %s", e.getMessage());
+        }
+    }
+
+    private static boolean modifiedBefore(Path folder, long cutoff) {
+        try {
+            return Files.getLastModifiedTime(folder).toMillis() < cutoff;
+        } catch (IOException e) {
             return false;
         }
-        try {
-            return Arrays.equals(expectedContent, Files.readAllBytes(targetScript));
-        } catch (IOException e) {
-            log.debug("nao foi possivel verificar instalacao existente de bridge.mjs, reinstalando: {}", e.getMessage());
-            return false;
+    }
+
+    private static String hashOfResource() {
+        try (DigestInputStream in = new DigestInputStream(open(), MessageDigest.getInstance("SHA-256"))) {
+            in.transferTo(OutputStream.nullOutputStream());
+            return HexFormat.of().formatHex(in.getMessageDigest().digest());
+        } catch (IOException | NoSuchAlgorithmException e) {
+            throw new BridgeException(null, BridgeErrorCode.INTERNAL_ERROR, "failed to read the bundled bridge script", e);
         }
     }
 
-    private void installBuildInfoBestEffort(Path targetDir) {
-        try (InputStream in = BridgeInstaller.class.getResourceAsStream(BUILD_INFO_RESOURCE)) {
-            if (in == null) {
-                return;
-            }
-            Files.write(targetDir.resolve("BUILD_INFO.json"), in.readAllBytes());
-        } catch (IOException e) {
-            log.debug("nao foi possivel copiar BUILD_INFO.json para o cache local: {}", e.getMessage());
+    private static InputStream open() {
+        InputStream in = BridgeInstaller.class.getResourceAsStream(SCRIPT_RESOURCE);
+        if (in == null) {
+            throw new BridgeException(null, BridgeErrorCode.INTERNAL_ERROR,
+                    "bridge script missing from the classpath: the sdk jar was built without bridge/bridge.mjs");
         }
-    }
-
-    private byte[] readClasspathResource(String path) {
-        try (InputStream in = BridgeInstaller.class.getResourceAsStream(path)) {
-            if (in == null) {
-                throw new BridgeException("recurso '" + path + "' nao encontrado no classpath - o jar do SDK parece "
-                        + "ter sido construido sem o bridge embutido (execute o build do modulo 'sdk' sem "
-                        + "-Dskip.bridge.build=true, ou verifique bridge/build.mjs)");
-            }
-            return in.readAllBytes();
-        } catch (IOException e) {
-            throw new BridgeException("falha ao ler recurso '" + path + "' do classpath", e);
-        }
+        return in;
     }
 }

@@ -1,183 +1,141 @@
 package com.angatusistemas.whatsapp.runtime;
 
+import br.com.angatusistemas.lib.console.Console;
+import com.angatusistemas.whatsapp.exception.BridgeErrorCode;
 import com.angatusistemas.whatsapp.exception.BridgeException;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
+import java.io.File;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 /**
- * Looks for a Node.js installation already on the host system that is new
- * enough to run the bridge, before {@link NodeRuntimeDownloader} is asked
- * to fetch one. Order of precedence:
+ * Finds a Node.js already installed on the machine: an explicit path (system property
+ * angatu.whatsapp.node.path or ANGATU_WHATSAPP_NODE_PATH), then PATH, then the usual install
+ * locations. Each candidate is asked for its version and kept only when it is supported.
  *
- * <ol>
- *   <li>Explicit override ({@code angatu.whatsapp.node.path} system
- *       property, then {@code ANGATU_WHATSAPP_NODE_PATH} environment
- *       variable) - if set but invalid, this is a configuration error and
- *       is reported as such rather than silently falling through.</li>
- *   <li>{@code node}/{@code node.exe} on {@code PATH}.</li>
- *   <li>A short list of common per-OS install locations, for the (common
- *       in practice) case where the JVM's process environment does not
- *       carry the interactive shell's {@code PATH} - e.g. Windows Services,
- *       some IDE run configurations, or a login shell that appends to
- *       {@code PATH} in a profile script the JVM's launcher does not
- *       source.</li>
- * </ol>
+ * @author Angatu Sistemas
  */
 public final class NodeRuntimeLocator {
 
-    private static final Logger log = LoggerFactory.getLogger(NodeRuntimeLocator.class);
-
     private static final String PROPERTY_OVERRIDE = "angatu.whatsapp.node.path";
     private static final String ENV_OVERRIDE = "ANGATU_WHATSAPP_NODE_PATH";
-    private static final Duration PROBE_TIMEOUT = Duration.ofSeconds(5);
+    private static final long PROBE_TIMEOUT_MS = 5_000;
+    private static final Pattern PATH_SEPARATOR = Pattern.compile(Pattern.quote(File.pathSeparator));
 
-    public Optional<NodeExecutable> locate() {
+    private NodeRuntimeLocator() {
+    }
+
+    public static Optional<NodeExecutable> locate() {
         Optional<Path> override = explicitOverride();
         if (override.isPresent()) {
             Path path = override.get();
-            NodeVersion version = probe(path).orElseThrow(() -> new BridgeException(
-                    "Node.js indicado via " + PROPERTY_OVERRIDE + "/" + ENV_OVERRIDE + " nao pode ser executado: " + path));
-            if (!version.satisfiesMinimum()) {
-                throw new BridgeException("Node.js indicado via " + PROPERTY_OVERRIDE + "/" + ENV_OVERRIDE
-                        + " e " + version + ", mas a versao minima exigida e " + NodeVersion.MIN_SUPPORTED_MAJOR + ".x: " + path);
+            NodeVersion version = probe(path).orElseThrow(() -> new BridgeException(null, BridgeErrorCode.INTERNAL_ERROR,
+                    "the Node.js set in " + PROPERTY_OVERRIDE + "/" + ENV_OVERRIDE + " cannot run: " + path));
+            if (!version.isSupported()) {
+                throw new BridgeException(null, BridgeErrorCode.INTERNAL_ERROR, "the Node.js set in " + PROPERTY_OVERRIDE
+                        + " is " + version + "; " + NodeVersion.MIN_SUPPORTED_MAJOR + ".x or newer is required: " + path);
             }
-            log.info("usando Node.js {} configurado explicitamente em {}", version, path);
-            return Optional.of(new NodeExecutable(path, version, NodeExecutable.NodeSource.SYSTEM));
+            return Optional.of(new NodeExecutable(path, version, NodeExecutable.Source.SYSTEM));
         }
-
-        for (Path candidate : candidatePaths()) {
+        for (Path candidate : candidates()) {
             Optional<NodeVersion> version = probe(candidate);
-            if (version.isPresent() && version.get().satisfiesMinimum()) {
-                log.info("Node.js do sistema encontrado: {} ({})", candidate, version.get());
-                return Optional.of(new NodeExecutable(candidate, version.get(), NodeExecutable.NodeSource.SYSTEM));
-            }
-            if (version.isPresent()) {
-                log.debug("ignorando {} - versao {} abaixo do minimo exigido ({}.x)", candidate, version.get(),
-                        NodeVersion.MIN_SUPPORTED_MAJOR);
+            if (version.isPresent() && version.get().isSupported()) {
+                return Optional.of(new NodeExecutable(candidate, version.get(), NodeExecutable.Source.SYSTEM));
             }
         }
-
-        log.info("nenhuma instalacao compativel de Node.js encontrada no sistema");
+        Console.info("[whatsapp] no supported Node.js (%s.x+) found on this machine", NodeVersion.MIN_SUPPORTED_MAJOR);
         return Optional.empty();
     }
 
-    private Optional<Path> explicitOverride() {
-        String fromProperty = System.getProperty(PROPERTY_OVERRIDE);
-        if (fromProperty != null && !fromProperty.isBlank()) {
-            return Optional.of(Paths.get(fromProperty));
+    private static Optional<Path> explicitOverride() {
+        String value = System.getProperty(PROPERTY_OVERRIDE);
+        if (value == null || value.isBlank()) {
+            value = System.getenv(ENV_OVERRIDE);
         }
-        String fromEnv = System.getenv(ENV_OVERRIDE);
-        if (fromEnv != null && !fromEnv.isBlank()) {
-            return Optional.of(Paths.get(fromEnv));
-        }
-        return Optional.empty();
+        return value == null || value.isBlank() ? Optional.empty() : Optional.of(Path.of(value));
     }
 
-    private List<Path> candidatePaths() {
-        Set<Path> candidates = new LinkedHashSet<>();
+    private static List<Path> candidates() {
         boolean windows = isWindows();
-        String executableName = windows ? "node.exe" : "node";
-
-        String pathEnv = System.getenv("PATH");
-        if (pathEnv != null) {
-            for (String dir : pathEnv.split(java.util.regex.Pattern.quote(java.io.File.pathSeparator))) {
-                if (dir.isBlank()) {
-                    continue;
+        String executable = windows ? "node.exe" : "node";
+        Set<Path> found = new LinkedHashSet<>();
+        String path = System.getenv("PATH");
+        if (path != null) {
+            for (String directory : PATH_SEPARATOR.split(path)) {
+                if (!directory.isBlank()) {
+                    addIfFile(found, Path.of(directory, executable));
                 }
-                addIfRegularFile(candidates, Paths.get(dir, executableName));
             }
         }
-
-        for (Path commonLocation : commonInstallLocations(windows)) {
-            addIfRegularFile(candidates, commonLocation);
+        for (Path location : commonLocations(windows)) {
+            addIfFile(found, location);
         }
-
-        return new ArrayList<>(candidates);
+        return new ArrayList<>(found);
     }
 
-    private List<Path> commonInstallLocations(boolean windows) {
+    private static List<Path> commonLocations(boolean windows) {
         List<Path> locations = new ArrayList<>();
         if (windows) {
-            addEnvBasedPath(locations, "ProgramFiles", "nodejs", "node.exe");
-            addEnvBasedPath(locations, "ProgramFiles(x86)", "nodejs", "node.exe");
-            addEnvBasedPath(locations, "LOCALAPPDATA", "Programs" + java.io.File.separator + "nodejs", "node.exe");
-            String nvmSymlink = System.getenv("NVM_SYMLINK");
-            if (nvmSymlink != null && !nvmSymlink.isBlank()) {
-                locations.add(Paths.get(nvmSymlink, "node.exe"));
-            }
-        } else {
-            locations.add(Paths.get("/usr/local/bin/node"));
-            locations.add(Paths.get("/usr/bin/node"));
-            locations.add(Paths.get("/opt/homebrew/bin/node"));
-            String home = System.getProperty("user.home");
-            if (home != null) {
-                locations.add(Paths.get(home, ".volta", "bin", "node"));
-                locations.addAll(latestNvmVersion(Paths.get(home, ".nvm", "versions", "node")));
+            addFromEnv(locations, "ProgramFiles", "nodejs", "node.exe");
+            addFromEnv(locations, "ProgramFiles(x86)", "nodejs", "node.exe");
+            addFromEnv(locations, "LOCALAPPDATA", "Programs" + File.separator + "nodejs", "node.exe");
+            addFromEnv(locations, "NVM_SYMLINK", "", "node.exe");
+            return locations;
+        }
+        locations.add(Path.of("/usr/local/bin/node"));
+        locations.add(Path.of("/usr/bin/node"));
+        locations.add(Path.of("/opt/homebrew/bin/node"));
+        String home = System.getProperty("user.home");
+        if (home != null) {
+            locations.add(Path.of(home, ".volta", "bin", "node"));
+            Path nvm = Path.of(home, ".nvm", "versions", "node");
+            if (Files.isDirectory(nvm)) {
+                try (Stream<Path> versions = Files.list(nvm)) {
+                    versions.map(dir -> dir.resolve("bin").resolve("node")).sorted(Comparator.reverseOrder()).forEach(locations::add);
+                } catch (IOException e) {
+                    // an unreadable nvm folder only removes candidates
+                }
             }
         }
         return locations;
     }
 
-    /** nvm installs each version under {@code versions/node/vX.Y.Z/bin/node}; pick the highest if present. */
-    private List<Path> latestNvmVersion(Path nvmVersionsDir) {
-        if (!Files.isDirectory(nvmVersionsDir)) {
-            return List.of();
-        }
-        try (var stream = Files.list(nvmVersionsDir)) {
-            return stream
-                    .map(dir -> dir.resolve("bin").resolve("node"))
-                    .filter(Files::isRegularFile)
-                    .sorted((a, b) -> b.compareTo(a))
-                    .toList();
-        } catch (IOException e) {
-            return List.of();
-        }
-    }
-
-    private void addEnvBasedPath(List<Path> locations, String envVar, String subPath, String executable) {
-        String base = System.getenv(envVar);
+    private static void addFromEnv(List<Path> locations, String variable, String subPath, String executable) {
+        String base = System.getenv(variable);
         if (base != null && !base.isBlank()) {
-            locations.add(Paths.get(base, subPath, executable));
+            locations.add(Path.of(base, subPath, executable));
         }
     }
 
-    private void addIfRegularFile(Set<Path> candidates, Path path) {
+    private static void addIfFile(Set<Path> found, Path path) {
         if (Files.isRegularFile(path)) {
-            candidates.add(path.toAbsolutePath().normalize());
+            found.add(path.toAbsolutePath().normalize());
         }
     }
 
-    private Optional<NodeVersion> probe(Path executable) {
+    static Optional<NodeVersion> probe(Path executable) {
         if (!Files.isRegularFile(executable)) {
             return Optional.empty();
         }
         try {
-            Process process = new ProcessBuilder(executable.toString(), "--version")
-                    .redirectErrorStream(true)
-                    .start();
-            boolean finished = process.waitFor(PROBE_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-            if (!finished) {
+            Process process = new ProcessBuilder(executable.toString(), "--version").redirectErrorStream(true).start();
+            if (!process.waitFor(PROBE_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
                 process.destroyForcibly();
                 return Optional.empty();
             }
-            String output = new String(process.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
-            if (process.exitValue() != 0) {
-                return Optional.empty();
-            }
-            return NodeVersion.parse(output);
+            String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            return process.exitValue() == 0 ? NodeVersion.parse(output) : Optional.empty();
         } catch (IOException e) {
             return Optional.empty();
         } catch (InterruptedException e) {
@@ -186,7 +144,7 @@ public final class NodeRuntimeLocator {
         }
     }
 
-    private boolean isWindows() {
+    static boolean isWindows() {
         return System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win");
     }
 }

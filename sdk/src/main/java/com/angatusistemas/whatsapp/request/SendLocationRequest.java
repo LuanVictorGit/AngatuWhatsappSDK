@@ -2,88 +2,29 @@ package com.angatusistemas.whatsapp.request;
 
 import java.util.Objects;
 
-public final class SendLocationRequest {
+/**
+ * A map pin, optionally named and with an address line.
+ *
+ * @author Angatu Sistemas
+ */
+public record SendLocationRequest(String to, double latitude, double longitude, String name, String address, String quotedMessageId) {
 
-    private final String to;
-    private final double latitude;
-    private final double longitude;
-    private final String name;
-    private final String address;
-    private final String quotedMessageId;
-
-    private SendLocationRequest(Builder builder) {
-        this.to = Objects.requireNonNull(builder.to, "to");
-        this.latitude = builder.latitude;
-        this.longitude = builder.longitude;
-        this.name = builder.name;
-        this.address = builder.address;
-        this.quotedMessageId = builder.quotedMessageId;
-    }
-
-    public String to() {
-        return to;
-    }
-
-    public double latitude() {
-        return latitude;
-    }
-
-    public double longitude() {
-        return longitude;
-    }
-
-    public String name() {
-        return name;
-    }
-
-    public String address() {
-        return address;
-    }
-
-    public String quotedMessageId() {
-        return quotedMessageId;
-    }
-
-    /** Latitude/longitude are required, so they are constructor arguments rather than optional builder setters. */
-    public static Builder builder(double latitude, double longitude) {
-        return new Builder(latitude, longitude);
-    }
-
-    public static final class Builder {
-        private final double latitude;
-        private final double longitude;
-        private String to;
-        private String name;
-        private String address;
-        private String quotedMessageId;
-
-        private Builder(double latitude, double longitude) {
-            this.latitude = latitude;
-            this.longitude = longitude;
+    public SendLocationRequest {
+        Objects.requireNonNull(to, "to");
+        if (latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) {
+            throw new IllegalArgumentException("coordinates out of range");
         }
+    }
 
-        public Builder to(String to) {
-            this.to = to;
-            return this;
-        }
+    public static SendLocationRequest of(String to, double latitude, double longitude) {
+        return new SendLocationRequest(to, latitude, longitude, null, null, null);
+    }
 
-        public Builder name(String name) {
-            this.name = name;
-            return this;
-        }
+    public SendLocationRequest withName(String placeName, String placeAddress) {
+        return new SendLocationRequest(to, latitude, longitude, placeName, placeAddress, quotedMessageId);
+    }
 
-        public Builder address(String address) {
-            this.address = address;
-            return this;
-        }
-
-        public Builder quotedMessageId(String quotedMessageId) {
-            this.quotedMessageId = quotedMessageId;
-            return this;
-        }
-
-        public SendLocationRequest build() {
-            return new SendLocationRequest(this);
-        }
+    public SendLocationRequest quoting(String messageId) {
+        return new SendLocationRequest(to, latitude, longitude, name, address, messageId);
     }
 }

@@ -1,11 +1,11 @@
 import { childLogger } from './util/logger.js';
 import { readExpectedToken } from './server/AuthToken.js';
-import { BridgeServer } from './server/WebSocketServer.js';
+import { BridgeServer } from './server/BridgeServer.js';
 
-// @ts-expect-error extensao de toJSON para serializacao JSON nativa de BigInt
-if (!BigInt.prototype.toJSON) {
-    // @ts-expect-error extensao de toJSON para serializacao JSON nativa de BigInt
-    BigInt.prototype.toJSON = function () {
+// Baileys hands BigInt values to JSON.stringify (receipts, timestamps).
+const bigintPrototype = BigInt.prototype as unknown as { toJSON?: () => string };
+if (!bigintPrototype.toJSON) {
+    bigintPrototype.toJSON = function (this: bigint) {
         return this.toString();
     };
 }
@@ -13,29 +13,24 @@ if (!BigInt.prototype.toJSON) {
 const bridgeVersion = typeof __BRIDGE_VERSION__ !== 'undefined' ? __BRIDGE_VERSION__ : 'dev';
 const baileysVersion = typeof __BAILEYS_VERSION__ !== 'undefined' ? __BAILEYS_VERSION__ : 'dev';
 
+/** More than this many uncaught exceptions in the window means the process state cannot be trusted. */
+const MAX_FAULTS = 20;
+const FAULT_WINDOW_MS = 60_000;
+
 async function main(): Promise<void> {
-    // pino already includes pid/hostname on every line by default.
     const logger = childLogger({ component: 'bridge' });
     const token = readExpectedToken();
     const host = process.env.ANGATU_BRIDGE_HOST ?? '127.0.0.1';
-    const requestedPort = process.env.ANGATU_BRIDGE_PORT ? Number.parseInt(process.env.ANGATU_BRIDGE_PORT, 10) : 0;
-
+    const port = process.env.ANGATU_BRIDGE_PORT ? Number.parseInt(process.env.ANGATU_BRIDGE_PORT, 10) : 0;
     if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') {
-        logger.warn({ host }, 'bridge esta escutando fora de loopback - configuracao explicita, garanta que a rede e confiavel');
+        logger.warn({ host }, 'bridge listening outside loopback - make sure that network is trusted');
     }
 
-    const server = new BridgeServer(host, requestedPort, token, logger, { bridgeVersion, baileysVersion });
+    const server = new BridgeServer(host, port, token, logger, { bridgeVersion, baileysVersion });
     await server.waitUntilListening();
+    // Sentinel line the Java side watches for to learn the port the OS assigned.
+    logger.info({ port: server.port, bridgeVersion, baileysVersion }, 'bridge_ready');
 
-    // Sentinel log line the Java BridgeProcessManager watches for on stdout
-    // to learn which port the OS actually assigned (avoids any pre-allocate
-    // then hand off race between two separate processes).
-    logger.info({ port: server.actualPort, bridgeVersion, baileysVersion }, 'bridge_ready');
-
-    // Ficar sem cliente por tempo demais significa que a JVM que nos subiu
-    // morreu sem executar hook nenhum. Continuar vivo manteria o socket do
-    // WhatsApp aberto sem dono — e um segundo socket na mesma conta e o que faz
-    // o servidor responder connectionReplaced em looping.
     server.onIdleShutdown = () => process.exit(0);
 
     let shuttingDown = false;
@@ -51,35 +46,36 @@ async function main(): Promise<void> {
             process.exit(1);
         }
     };
-
     process.on('SIGINT', () => void shutdown('SIGINT'));
     process.on('SIGTERM', () => void shutdown('SIGTERM'));
-
-    // Ultima linha de defesa para a trava de sessao: 'exit' e sincrono e roda
-    // em qualquer saida do processo, inclusive nas fatais abaixo. Deixar a
-    // trava para tras nao trava a conta para sempre (o proximo processo a
-    // reconhece como orfa), mas gera um aviso e um susto desnecessarios.
     process.on('exit', () => {
         try {
-            server.instanceManager.releaseAllLocks();
+            server.instances.releaseAllLocks();
         } catch {
-            // saida do processo nao e lugar de lancar
+            // exiting: nowhere left to report
         }
     });
 
-    process.on('uncaughtException', (err) => {
-        logger.fatal({ err }, 'uncaught exception - terminating process');
-        process.exit(1);
-    });
+    // Baileys leaves stray rejections behind (a query that loses its socket mid-flight).
+    // Dying on one took every account in the process down and forced all of them to
+    // reconnect - the single largest source of "random" disconnections.
     process.on('unhandledRejection', (reason) => {
-        logger.fatal({ err: reason }, 'unhandled rejection - terminating process');
-        process.exit(1);
+        logger.error({ err: reason }, 'unhandled rejection (process kept alive)');
+    });
+    const faults: number[] = [];
+    process.on('uncaughtException', (err) => {
+        const now = Date.now();
+        faults.push(now);
+        while (faults.length > 0 && now - faults[0]! > FAULT_WINDOW_MS) faults.shift();
+        if (faults.length > MAX_FAULTS) {
+            logger.fatal({ err }, 'too many uncaught exceptions - terminating so the SDK restarts a clean bridge');
+            process.exit(1);
+        }
+        logger.error({ err }, 'uncaught exception (process kept alive)');
     });
 }
 
 main().catch((err) => {
-    // Logger may not be available yet if construction itself failed
-    // (e.g. missing token), so fall back to stderr for this one case.
     console.error('[bridge] fatal startup error:', err);
     process.exit(1);
 });

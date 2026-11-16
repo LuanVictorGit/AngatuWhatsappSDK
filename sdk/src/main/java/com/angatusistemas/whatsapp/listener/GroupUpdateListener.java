@@ -1,8 +1,14 @@
 package com.angatusistemas.whatsapp.listener;
 
-import com.fasterxml.jackson.databind.JsonNode;
+import com.angatusistemas.whatsapp.model.GroupUpdate;
 
+/**
+ * Receives member and metadata changes of groups the account belongs to.
+ *
+ * @author Angatu Sistemas
+ */
 @FunctionalInterface
 public interface GroupUpdateListener {
-    void onGroupUpdated(String groupJid, JsonNode updates);
+
+    void onGroupUpdated(GroupUpdate update);
 }

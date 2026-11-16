@@ -1,8 +1,12 @@
 package com.angatusistemas.whatsapp.model;
 
-import java.util.Arrays;
+import java.util.Locale;
 
-/** Mirrors the abstract type strings {@code bridge/src/adapter/MessageMapper.ts} maps Baileys content types to. */
+/**
+ * Kind of content a message carries, reduced to what an application branches on.
+ *
+ * @author Angatu Sistemas
+ */
 public enum MessageType {
     TEXT,
     IMAGE,
@@ -15,17 +19,16 @@ public enum MessageType {
     REACTION,
     POLL,
     INTERACTIVE_REPLY,
-    PROTOCOL,
-    /** A content type this SDK version does not (yet) map to a specific type. */
     UNKNOWN;
 
-    public static MessageType fromWireValue(String value) {
+    public static MessageType fromWire(String value) {
         if (value == null) {
             return UNKNOWN;
         }
-        return Arrays.stream(values())
-                .filter(type -> type.name().equals(value))
-                .findFirst()
-                .orElse(UNKNOWN);
+        try {
+            return valueOf(value.toUpperCase(Locale.ROOT));
+        } catch (IllegalArgumentException e) {
+            return UNKNOWN;
+        }
     }
 }

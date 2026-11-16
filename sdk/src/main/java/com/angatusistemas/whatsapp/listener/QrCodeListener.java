@@ -1,7 +1,14 @@
 package com.angatusistemas.whatsapp.listener;
 
+import com.angatusistemas.whatsapp.model.QrCode;
+
+/**
+ * Receives each QR code to show to whoever pairs the phone; it is a credential in flight, never log it.
+ *
+ * @author Angatu Sistemas
+ */
 @FunctionalInterface
 public interface QrCodeListener {
-    /** {@code qrCode} is the raw QR payload string; render it with {@code WhatsAppClient.getQrCodePng()}. */
-    void onQrCodeReceived(String qrCode);
+
+    void onQrCodeReceived(QrCode qrCode);
 }
