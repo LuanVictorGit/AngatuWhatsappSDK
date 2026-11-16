@@ -178,4 +178,4 @@ O Maven desta máquina usa o JDK 21 por padrão: apontar `JAVA_HOME` para o JDK 
 
 ## Publicação
 - Versões pelo JitPack, por hash de commit: `com.github.LuanVictorGit.AngatuWhatsappSDK:angatu-whatsapp:<hash>` (projeto multi-módulo). O `jitpack.yml` instala o JDK 25 pelo SDKMAN e compila com `-Dskip.bridge.build`.
-- Commits na `development` (R3); a `main` só recebe com confirmação explícita do dono.
+- **Branch:** por decisão do dono (2026-11-15), neste projeto todo commit e push vão direto para a `main`, sem pedir — exceção registrada ao R3. A `development` ficou só como histórico. O R31 continua valendo: conferir o grep antes de todo push.
