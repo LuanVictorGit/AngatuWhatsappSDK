@@ -1,91 +1,65 @@
 package com.angatusistemas.whatsapp.examples.simplebot;
 
+import br.com.angatusistemas.lib.console.Console;
 import com.angatusistemas.whatsapp.WhatsAppClient;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import java.io.IOException;
-import java.nio.file.Files;
+import com.angatusistemas.whatsapp.model.Button;
+import com.angatusistemas.whatsapp.options.CallOptions;
+import com.angatusistemas.whatsapp.options.HumanizationOptions;
+import com.angatusistemas.whatsapp.options.ReadReceiptMode;
+import com.angatusistemas.whatsapp.request.SendButtonsRequest;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
 
 /**
- * Minimal end-to-end usage of the SDK: connect one WhatsApp instance, save
- * the QR Code to a PNG file whenever pairing is needed, and echo back any
- * text message received. Run with:
+ * A small attendant bot: answers "oi" with a menu of buttons, reacts to the chosen button, declines
+ * calls with a polite message, and reads messages the way a person does, right before replying.
  *
- * <pre>
- * mvn install                          # uma vez, para publicar o sdk no repositorio local
- * mvn -pl examples/simple-bot exec:java
- * </pre>
- *
- * or pass an instanceId and a session directory explicitly:
- * {@code exec:java -Dexec.args="my-bot ./my-bot-session"}.
+ * @author Angatu Sistemas
  */
 public final class SimpleBotExample {
 
-    private static final Logger log = LoggerFactory.getLogger(SimpleBotExample.class);
+    private SimpleBotExample() {
+    }
 
-    public static void main(String[] args) throws Exception {
-        String instanceId = args.length > 0 ? args[0] : "simple-bot";
-        Path sessionDirectory = Path.of(args.length > 1 ? args[1] : "./whatsapp-sessions/" + instanceId);
-
+    public static void main(String[] args) throws InterruptedException {
         WhatsAppClient client = WhatsAppClient.builder()
-                .instanceId(instanceId)
-                .sessionDirectory(sessionDirectory)
-                .displayName("Angatu Simple Bot")
+                .instanceId("atendimento")
+                .sessionDirectory(Path.of("whatsapp-sessions", "atendimento"))
+                .humanization(HumanizationOptions.defaults()
+                        .withTyping(Duration.ofSeconds(2), Duration.ofSeconds(6))
+                        .withReadReceipts(ReadReceiptMode.ON_REPLY))
+                .calls(CallOptions.rejectAll().withReply("Não atendemos ligações por aqui. Pode mandar uma mensagem que respondemos já!"))
                 .build();
+        Runtime.getRuntime().addShutdownHook(new Thread(client::close, "shutdown-bot"));
 
-        Runtime.getRuntime().addShutdownHook(new Thread(client::close, "shutdown-" + instanceId));
-
-        client.addConnectionStateListener((state, cause, detail) ->
-                log.info("estado da conexao: {} (causa={}, detalhe={})", state, cause, detail));
-
-        client.addQrCodeListener(qr -> saveQrCode(client, sessionDirectory));
-
-        client.addErrorListener(error -> log.error("erro reportado pelo SDK: {}", error.getMessage(), error));
-
+        client.addQrCodeListener(qr -> Console.info("Escaneie o QR Code:%n%s", client.getQrCodeText()));
+        client.addConnectionStateListener((state, cause, detail) -> Console.info("Estado: %s %s", state, cause == null ? "" : cause));
         client.addMessageListener(message -> {
-            if (message.isFromMe() || message.text() == null || message.text().isBlank()) {
+            if (message.isFromMe() || message.isGroup() || !message.hasText()) {
                 return;
             }
-            log.info("mensagem recebida de {}: {}", message.senderId(), message.text());
-            client.sendText(message.chatId(), "Echo: " + message.text())
-                    .exceptionally(ex -> {
-                        log.error("falha ao responder mensagem em {}: {}", message.chatId(), ex.getMessage(), ex);
-                        return null;
-                    });
+            if (message.text().strip().equalsIgnoreCase("oi")) {
+                client.sendButtons(SendButtonsRequest.of(message.chatId(), "Olá! Como podemos ajudar?",
+                                Button.of("pedido", "Fazer um pedido"),
+                                Button.of("status", "Status do pedido"),
+                                Button.of("humano", "Falar com atendente"))
+                        .withFooter("Angatu Sistemas"));
+            }
+        });
+        client.addButtonListener(click -> {
+            String reply = switch (click.buttonId()) {
+                case "pedido" -> "Perfeito! Mande o nome do produto e a quantidade.";
+                case "status" -> "Me informe o número do pedido, por favor.";
+                default -> "Certo, já chamo alguém da equipe para falar com você.";
+            };
+            client.sendText(click.chatId(), reply);
         });
 
-        log.info("conectando instancia '{}' (sessao em {})...", instanceId, sessionDirectory.toAbsolutePath());
-        try {
-            client.connect().join();
-        } catch (RuntimeException e) {
-            log.error("falha ao iniciar conexao: {}", e.getMessage(), e);
-            System.exit(1);
-            return;
+        if (client.sessionStatus().canResume()) {
+            Console.info("Sessão salva encontrada: reconectando sem QR Code.");
         }
-
-        log.info("bot em execucao - aguardando QR Code (se necessario) e mensagens. Ctrl+C para encerrar.");
+        client.connect().join();
         new CountDownLatch(1).await();
-    }
-
-    private static void saveQrCode(WhatsAppClient client, Path sessionDirectory) {
-        byte[] png = client.getQrCodePng();
-        if (png == null) {
-            return;
-        }
-        try {
-            Files.createDirectories(sessionDirectory);
-            Path qrFile = sessionDirectory.resolve("qrcode.png");
-            Files.write(qrFile, png);
-            log.info("QR Code atualizado - escaneie o arquivo: {}", qrFile.toAbsolutePath());
-        } catch (IOException e) {
-            log.error("falha ao salvar QR Code em disco: {}", e.getMessage(), e);
-        }
-    }
-
-    private SimpleBotExample() {
     }
 }

@@ -1,4 +1,8 @@
-/** Decouples instance/adapter code from the WebSocket transport that actually delivers events. */
+/**
+ * Decouples accounts from the transport that delivers their events.
+ * `droppable` events (presence, delivery status) may be skipped when the
+ * consumer is not keeping up; everything else is always delivered.
+ */
 export interface EventSink {
-    emit(instanceId: string, event: string, data: unknown): void;
+    emit(instanceId: string, event: string, data: unknown, droppable?: boolean): void;
 }

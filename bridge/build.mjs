@@ -19,9 +19,10 @@ const result = await build({
     outfile: 'dist/bridge.mjs',
     bundle: true,
     platform: 'node',
-    target: 'node20',
+    target: 'node22',
     format: 'esm',
-    minify: false,
+    minify: true,
+    keepNames: true,
     // Kept for local dist/ debugging only - deliberately NOT copied into the
     // sdk resources below, since it would roughly double the embedded
     // artifact size for a use case (attaching a debugger to the bundled

@@ -1,33 +1,34 @@
+import { createHash } from 'node:crypto';
+import { createWriteStream } from 'node:fs';
+import { rename, stat, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
+import { pipeline } from 'node:stream/promises';
 import makeWASocket, {
     DisconnectReason,
+    decryptPollVote,
     downloadMediaMessage,
-    type WASocket,
-    type WAMessage,
-    type GroupMetadata,
-    type Contact as BaileysContact,
+    generateWAMessageFromContent,
+    jidNormalizedUser,
+    normalizeMessageContent,
+    proto,
     type AnyMessageContent,
+    type BaileysEventMap,
+    type GroupMetadata,
+    type WAMessage,
     type WAPresence,
-    type BaileysEventMap
+    type WASocket
 } from 'baileys';
-import { Boom } from '@hapi/boom';
-import { limparRuido, loggerDoBaileys, ruidoDoProtocolo, type Logger } from '../util/logger.js';
-import { useDurableAuthState, limparCredenciais } from './AuthState.js';
+import type { Boom } from '@hapi/boom';
+import { baileysLogger, forgetProtocolNoise, protocolNoise, type Logger } from '../util/logger.js';
+import { BoundedMap, TtlCache } from '../util/TtlCache.js';
+import { useDurableAuthState, wipeCredentials } from './AuthState.js';
 import { ReadBudget } from './ReadBudget.js';
-import { MessageCache } from './MessageCache.js';
+import { RecentMessages, SentMessageStore } from './MessageStore.js';
 import { LidDirectory } from './LidDirectory.js';
-import { resolverVersaoWhatsApp } from './WaVersion.js';
-import { toAbstractMessage, type AbstractMessage } from './MessageMapper.js';
+import { resolveWhatsAppVersion } from './WaVersion.js';
+import { IGNORED_CONTENT, contentTypeOf, toAbstractMessage, type AbstractMessage } from './MessageMapper.js';
 import { BridgeCommandError, ErrorCode } from '../protocol/errors.js';
 import * as Content from './ContentBuilder.js';
-
-// @ts-expect-error extensao de toJSON para serializacao JSON nativa de BigInt
-if (!BigInt.prototype.toJSON) {
-    // @ts-expect-error extensao de toJSON para serializacao JSON nativa de BigInt
-    BigInt.prototype.toJSON = function () {
-        return this.toString();
-    };
-}
 
 export type ConnectionStateName =
     | 'DISCONNECTED'
@@ -45,352 +46,168 @@ export type DisconnectCause =
     | 'WHATSAPP_RESTART'
     | 'AUTH_FAILURE'
     | 'CONNECTION_REPLACED'
+    | 'LOGIN_TIMEOUT'
     | 'UNKNOWN';
 
-export interface BaileysAdapterCallbacks {
+export interface IncomingCall {
+    callId: string;
+    from: string;
+    chatId: string;
+    isVideo: boolean;
+    isGroup: boolean;
+    timestamp: number;
+}
+
+export interface AdapterCallbacks {
     onConnectionStateChanged(state: ConnectionStateName, cause: DisconnectCause | null, detail: string | null): void;
-    onQr(qr: string): void;
+    onQr(qr: string, cycle: number): void;
     onPairingCode(code: string): void;
     onMessage(message: AbstractMessage): void;
-    onMessageUpdated(chatId: string, messageId: string, updates: unknown): void;
+    onMessageUpdated(update: Record<string, unknown>): void;
     onMessageDeleted(chatId: string, messageId: string): void;
-    onReaction(chatId: string, messageId: string, senderId: string, emoji: string | null): void;
-    onGroupUpdated(groupJid: string, updates: unknown): void;
-    onPresenceUpdated(chatId: string, presences: unknown): void;
+    onReaction(reaction: Record<string, unknown>): void;
+    onGroupUpdated(update: Record<string, unknown>): void;
+    onPresenceUpdated(update: Record<string, unknown>): void;
+    onCall(call: IncomingCall): void;
+    onPollVote(vote: Record<string, unknown>): void;
 }
+
+export type ChatChange = 'mute' | 'unmute' | 'pin' | 'unpin' | 'archive' | 'unarchive' | 'mark_unread';
+
+export type PrivacySetting = 'last_seen' | 'online' | 'profile_picture' | 'status' | 'read_receipts' | 'groups_add';
+
+const PRIVACY_VALUES: Record<PrivacySetting, ReadonlySet<string>> = {
+    last_seen: new Set(['all', 'contacts', 'contact_blacklist', 'none']),
+    online: new Set(['all', 'match_last_seen']),
+    profile_picture: new Set(['all', 'contacts', 'contact_blacklist', 'none']),
+    status: new Set(['all', 'contacts', 'contact_blacklist', 'none']),
+    read_receipts: new Set(['all', 'none']),
+    groups_add: new Set(['all', 'contacts', 'contact_blacklist'])
+};
 
 export interface AdapterOptions {
     instanceId: string;
     sessionDirectory: string;
-    displayName: string;
-    markOnlineOnConnect: boolean;
+    browser: [string, string, string];
+    alwaysOnline: boolean;
+    includeRawData: boolean;
+    /** Epoch seconds; anything older never reaches the application. */
+    acceptSince: number;
+    readsPerMinute: number;
     minReconnectDelayMs: number;
     maxReconnectDelayMs: number;
+    maxLoginCycles: number;
 }
 
-const DISCONNECT_CAUSE_BY_STATUS_CODE: Record<number, DisconnectCause> = {
+const CAUSE_BY_STATUS: Record<number, DisconnectCause> = {
     [DisconnectReason.loggedOut]: 'USER_LOGOUT',
-    // 440 NAO e logout. Outro cliente assumiu a sessao; a credencial continua
-    // valida. Reporta-lo como USER_LOGOUT fazia qualquer aplicacao que reage a
-    // "deslogou" apagando a credencial transformar um conflito recuperavel em
-    // repareamento forcado. Ver o tratamento em handleClose().
+    // 440 is not a logout: another client took the session and the credentials are still good.
     [DisconnectReason.connectionReplaced]: 'CONNECTION_REPLACED',
-    [DisconnectReason.badSession]: 'AUTH_FAILURE',
     [DisconnectReason.multideviceMismatch]: 'AUTH_FAILURE',
     [DisconnectReason.forbidden]: 'AUTH_FAILURE',
     [DisconnectReason.restartRequired]: 'WHATSAPP_RESTART',
-    // DisconnectReason.timedOut shares the same numeric value (408) as
-    // connectionLost, so a single entry covers both.
     [DisconnectReason.connectionLost]: 'CONNECTION_LOST',
     [DisconnectReason.connectionClosed]: 'CONNECTION_LOST',
-    [DisconnectReason.unavailableService]: 'CONNECTION_LOST'
+    [DisconnectReason.unavailableService]: 'CONNECTION_LOST',
+    // 500 is a server-side stream error, not invalid credentials: wiping on it forced a needless re-pair.
+    [DisconnectReason.badSession]: 'CONNECTION_LOST'
 };
 
 /**
- * Quanto esperar o handshake do WhatsApp antes de pedir o codigo de
- * pareamento. Generoso de proposito: quem esta conectando um numero novo
- * prefere esperar 20s a receber "erro" e nao saber o motivo.
+ * Codes after which WhatsApp will only ever answer the stored credentials with
+ * the same refusal, so they are wiped to let the next connect() show a QR code.
+ * 403 is not here (an account restriction can lift, and re-pairing a flagged
+ * account is the worst possible move), nor 440 or 500.
  */
+const CREDENTIALS_REVOKED: ReadonlySet<number> = new Set([DisconnectReason.loggedOut, DisconnectReason.multideviceMismatch]);
+
+/** Shorter than Baileys' 30 s: a NAT drops an idle connection sooner, and each drop costs a full handshake. */
+const KEEP_ALIVE_MS = 20_000;
+const CONNECT_TIMEOUT_MS = 30_000;
+const QUERY_TIMEOUT_MS = 45_000;
+const SEND_TIMEOUT_MS = 100_000;
 const PAIRING_READY_TIMEOUT_MS = 20_000;
 
-/**
- * Enderecos cujo conteudo o painel nunca usa e por isso nem chega a ser
- * decifrado.
- *
- * `shouldIgnoreJid` e avaliado pelo Baileys no `handleMessage`, ANTES de abrir
- * o envelope: o stanza e reconhecido, respondido com ack e descartado. A
- * diferenca em relacao a filtrar depois (o que o painel ja fazia em
- * `WaEngineSdk.descartavel`) e o que interessa aqui:
- *
- * - `status@broadcast` e o "Recado" de TODOS os contatos da agenda. Sem este
- *   filtro, a aplicacao recebia, decifrava e guardava em cache cada foto,
- *   video e texto que qualquer contato publicasse — dado pessoal de terceiros
- *   que o painel nunca exibiu e nunca teve motivo para ter;
- * - `@newsletter` sao os Canais que a conta segue, igualmente irrelevantes;
- * - `@broadcast` (listas de transmissao) idem.
- *
- * Grupos (`@g.us`) e conversas (`@s.whatsapp.net`, `@lid`) passam: sao o que o
- * painel de fato usa.
- */
-function enderecoIgnorado(jid: string | undefined | null): boolean {
-    if (!jid) return false;
-    const servidor = jid.includes('@') ? jid.slice(jid.indexOf('@') + 1) : '';
-    return servidor === 'broadcast' || servidor === 'newsletter';
-}
+/** A 515 asks for an immediate restart once, right after pairing; repeated, it must back off. */
+const MAX_IMMEDIATE_RECONNECTS = 3;
+/** Another client took the account: coming back fast starts a reconnect war that reads as automation. */
+const REPLACED_RETRY_MS = 5 * 60_000;
+/** After this many failures in a row the retries space out to the cool-down below. */
+const FAILURES_BEFORE_COOLDOWN = 10;
+const COOLDOWN_MS = 5 * 60_000;
 
-/**
- * Intervalo do ping que mantem o socket vivo.
- *
- * O padrao do Baileys e 30s. Aqui e mais curto porque uma VPS atras de NAT
- * perde conexao ociosa antes disso — e cada queda dessas custava uma
- * reconexao completa, com novo handshake e novas consultas de inicializacao.
- * Menos quedas e menos reconexao e exatamente o que reduz o volume de
- * requisicoes que a aplicacao faz ao WhatsApp.
- */
-const KEEP_ALIVE_MS = 20_000;
+const SWEEP_INTERVAL_MS = 30 * 60_000;
 
-/** Teto do handshake. Curto o bastante para nao ficar meia conexao pendurada. */
-const CONNECT_TIMEOUT_MS = 30_000;
-
-/** Teto de uma consulta (metadados de grupo, existencia de numero). */
-const QUERY_TIMEOUT_MS = 45_000;
-
-/**
- * Quantas reconexoes seguidas podem sair sem espera nenhuma.
- *
- * O 515 (`restartRequired`) pede religar na hora, e isso e normal <b>uma vez</b>,
- * logo apos o pareamento. O problema e que o caminho imediato ignorava o
- * contador de tentativas: se o servidor respondesse 515 repetidamente — versao
- * de WhatsApp Web errada em cache por 6h, por exemplo — o resultado era um laco
- * abrir->515->abrir sem freio nenhum, martelando o servidor do WhatsApp com
- * handshakes. A partir da quarta seguida, o 515 passa a esperar como qualquer
- * outra queda.
- */
-const MAX_RECONEXOES_IMEDIATAS = 3;
-
-/**
- * Espera antes de tentar voltar depois de um `connectionReplaced` (440).
- *
- * Longa de proposito. 440 significa que OUTRO cliente assumiu a conta. Voltar
- * correndo derrubaria o dele, que voltaria correndo e derrubaria o nosso — a
- * guerra de reconexao que faz a conta apresentar clientes web entrando e saindo
- * sem parar, que e exatamente a assinatura de automacao que se quer evitar.
- * Cinco minutos e devagar o bastante para nao ser guerra e rapido o bastante
- * para a conta voltar sozinha quando o outro cliente era um bridge orfao (que
- * se encerra por ociosidade em 120s).
- */
-const RECONEXAO_APOS_SUBSTITUICAO_MS = 5 * 60_000;
-
-/** Validade de um "este numero existe" em cache. */
-const CACHE_NUMERO_OK_MS = 24 * 60 * 60 * 1000;
-
-/**
- * Validade de um "este numero nao existe".
- *
- * Menor que a do positivo de proposito: um numero recem-criado no WhatsApp nao
- * pode ficar marcado como inexistente pelo resto do dia.
- */
-const CACHE_NUMERO_NAO_MS = 6 * 60 * 60 * 1000;
-
-/**
- * Teto do cache de numeros ja consultados.
- *
- * Sem teto, o mapa guardava uma entrada por telefone ja perguntado e nunca
- * soltava nenhuma — uma campanha para uma base grande enchia a memoria de
- * respostas vencidas num processo que fica meses no ar.
- */
-const MAX_NUMEROS_EM_CACHE = 50_000;
-
-/**
- * Validade do metadata de um grupo em cache.
- *
- * Curto: participante entra e sai de grupo, e cifrar para uma lista velha faz
- * a mensagem nao chegar a quem entrou depois. Cinco minutos cobre a rajada de
- * envios de um disparo sem envelhecer a lista.
- */
-const CACHE_GRUPO_MS = 5 * 60_000;
-
-/** Teto do cache de grupos. */
-const MAX_GRUPOS_EM_CACHE = 500;
-
-/** De quanto em quanto tempo o cache de mensagens e varrido. */
-const MANUTENCAO_CACHE_MS = 30 * 60_000;
-
-/**
- * Versao informada no identificador do cliente.
- *
- * <p>Era `'1.0.0'`, que nao existe como versao de Chrome nenhuma — e o
- * identificador do cliente e um dos dados que o servidor ve em toda conexao.
- * Nao se ganha nada declarando um numero impossivel: o que se quer aqui e nao
- * destoar, e o proprio Baileys usa uma versao plausivel nos helpers dele. O
- * campo anterior da tupla continua sendo o `displayName` da aplicacao, que e o
- * que aparece em "Aparelhos conectados" e por onde o operador reconhece a
- * sessao.
- */
-const VERSAO_DO_NAVEGADOR = '131.0.6778.85';
-
-/**
- * Esconde o miolo de um telefone, deixando so os quatro ultimos digitos.
- *
- * <p>O numero inteiro saia em nivel `info` no pareamento. Log de aplicacao
- * costuma ir para agregador, e telefone e dado pessoal: quatro digitos bastam
- * para conferir qual conta esta sendo conectada.
- */
-function mascarar(numero: string | null | undefined): string {
-    const digitos = (numero ?? '').replace(/[^0-9]/g, '');
-    if (digitos.length <= 4) {
-        return digitos.length === 0 ? '(vazio)' : '*'.repeat(digitos.length);
-    }
-    return '*'.repeat(digitos.length - 4) + digitos.slice(-4);
-}
-
-/**
- * Codigos em que o WhatsApp deu a credencial por invalida, e guardar o disco
- * so faria a reconexao repetir a mesma recusa para sempre.
- *
- * <p><b>403 `forbidden` foi retirado desta lista de proposito.</b> Ele nao quer
- * dizer "estas credenciais nao valem": quer dizer que a conta esta restrita
- * neste momento. Apagar o diretorio ali destruia credencial boa e obrigava um
- * novo pareamento — e repareamento numa conta ja sinalizada e o oposto do que
- * se quer fazer, porque reapresenta um cliente web novo justamente quando o
- * numero esta sob observacao. Agora o 403 reporta AUTH_FAILURE e <b>preserva o
- * disco</b>: se a restricao passar, a mesma credencial volta a conectar.
- *
- * <p>`connectionReplaced` (440) nunca esteve aqui, pelo mesmo motivo: a
- * credencial continua valida, outro socket apenas assumiu a sessao.
- *
- * <p>O que sobra na lista sao os codigos em que o Baileys so voltaria a emitir
- * QR depois de o diretorio ficar vazio — sem a limpeza, todo connect() recarrega
- * a sessao morta, leva a mesma recusa e volta a LOGGED_OUT sem nunca produzir um
- * QR, deixando o operador com um botao de "reconectar" que nao pode funcionar.
- */
-const CREDENTIALS_INVALIDATED_STATUS_CODES: ReadonlySet<number> = new Set([
-    DisconnectReason.loggedOut,
-    DisconnectReason.badSession,
-    DisconnectReason.multideviceMismatch
+const HISTORY_KEPT_FOR_LID_MAPPINGS: ReadonlySet<number> = new Set([
+    proto.HistorySync.HistorySyncType.INITIAL_BOOTSTRAP,
+    proto.HistorySync.HistorySyncType.PUSH_NAME,
+    proto.HistorySync.HistorySyncType.NON_BLOCKING_DATA
 ]);
 
+const KNOWN_NUMBER_TTL_MS = 24 * 60 * 60_000;
+/** Shorter: a number created today must not stay "unknown" all day. */
+const UNKNOWN_NUMBER_TTL_MS = 6 * 60 * 60_000;
+const GROUP_METADATA_TTL_MS = 5 * 60_000;
+
 /**
- * Owns exactly one WhatsApp connection (one Baileys socket) and translates
- * between Baileys' native API/events and the abstract shapes the rest of
- * the bridge (and, through it, the Java SDK) speak. Nothing outside this
- * file should import from the `baileys` package directly - that is the
- * "camada de adaptacao" the SDK spec asks for.
+ * Owns one WhatsApp account: at most one Baileys socket at a time, its
+ * reconnection, and the translation between Baileys and the bridge protocol.
+ * Nothing outside this file imports the socket.
+ *
+ * Reading rules that keep the account safe: no history sync, no contact or
+ * chat import, no message older than `acceptSince` delivered, and every query
+ * charged to a per-minute budget. What it remembers of received messages is a
+ * short, stripped window (see MessageStore).
  */
 export class BaileysAdapter {
     private socket: WASocket | null = null;
-    private saveCreds: (() => Promise<void>) | null = null;
     private state: ConnectionStateName = 'DISCONNECTED';
     private currentQr: string | null = null;
-    private reconnectAttempts = 0;
-    /** Reconexoes "na hora" (515) seguidas, para o caminho imediato ter teto. */
-    private reconexoesImediatas = 0;
-    /** Teto de consultas por minuto: e leitura em rajada que suspende conta. */
-    private readonly leituras = new ReadBudget();
-    /** Respostas de "este numero tem WhatsApp?", com prazo de validade. */
-    private readonly numerosVerificados = new Map<string, { jid: string; exists: boolean; ateMs: number }>();
-    /** Metadata de grupo em cache, servindo tambem ao `cachedGroupMetadata` do Baileys. */
-    private readonly gruposEmCache = new Map<string, { metadata: GroupMetadata; ateMs: number }>();
+    private generation = 0;
+    private subscriptions: Array<() => void> = [];
+    private opening: Promise<void> | null = null;
+    private sessionWipe: Promise<void> | null = null;
     private reconnectTimer: NodeJS.Timeout | null = null;
-    /**
-     * Which deliberate local action (if any) is in flight. Not a plain boolean:
-     * handleClose() needs to know not just *that* the closure was local, but
-     * which target state it implies (disconnect -> DISCONNECTED, logout ->
-     * LOGGED_OUT), since Baileys' own 'connection.update' close event can fire
-     * either before or after the explicit setState() call in disconnect()/logout()
-     * (emit() is synchronous, but whether socket.end()/logout() triggers it
-     * within the same tick is not something this code controls) - both paths
-     * must therefore agree on the same outcome regardless of which runs first.
-     */
+    private reconnectAttempts = 0;
+    private immediateReconnects = 0;
+    private loginCycles = 0;
+    private qrInCycle = 0;
     private closedByUser: false | 'disconnect' | 'logout' = false;
-    /**
-     * In-flight deletion of an invalidated session, awaited by openSocket().
-     *
-     * handleClose() reacts to a synchronous Baileys event, so it cannot await
-     * the removal itself; without this gate a fast reconnect could read the
-     * credentials back while they are still being deleted.
-     */
-    private sessionCleanup: Promise<void> | null = null;
+    private available = false;
+    private readyForPairing: Promise<void> | null = null;
+    private markReady: (() => void) | null = null;
+    /** Kept across sockets: Baileys renews the socket while the operator is still typing the code. */
+    private pairing: { phone: string; code: string } | null = null;
+    private pairingRegisteredOn: WASocket | null = null;
+    private backupCreds: (() => Promise<void>) | null = null;
 
-    /**
-     * Abertura de socket em andamento.
-     *
-     * `openSocket()` tem tres pontos de espera antes de criar o socket (limpeza
-     * da sessao invalidada, leitura das credenciais em disco e a consulta da
-     * versao do WhatsApp Web, que sozinha pode levar 9s). Duas chamadas
-     * concorrentes atravessavam essa janela juntas e criavam DOIS sockets para a
-     * mesma conta — o servidor ve dois clientes web no mesmo aparelho, derruba
-     * um com `connectionReplaced`, o que dispara outra reconexao, que abre outro
-     * socket. E o loop que faz uma conta parecer estar sendo usada por varios
-     * clientes ao mesmo tempo. Uma promessa unica fecha a porta.
-     */
-    private abrindo: Promise<void> | null = null;
-
-    /**
-     * Numero de serie do socket vivo.
-     *
-     * Cada listener guarda a geracao em que foi registrado e desiste quando ela
-     * nao e mais a atual. Sem isso, um evento atrasado do socket anterior
-     * (recibo, presenca, estado de conexao) era processado como se fosse do
-     * novo: mensagem entrando duas vezes e estado de conexao voltando para tras
-     * sozinho.
-     */
-    private geracao = 0;
-
-    /** Como desassinar os listeners do socket atual. */
-    private assinaturas: Array<() => void> = [];
-
-    /**
-     * Logger entregue ao Baileys, com o ruido de protocolo resumido.
-     *
-     * Separado do `this.logger` (que continua registrando tudo do adapter) para
-     * o resumo valer so para o que a biblioteca emite. Um por adapter, e nao um
-     * por socket: assim a explicacao sai uma vez por instancia, e nao uma vez
-     * por reconexao.
-     */
-    private readonly loggerBaileys: Logger;
-
-    private readonly messageCache: MessageCache;
-    /** Faxina periodica do cache em memoria e do que esta em disco. */
-    private manutencaoTimer: NodeJS.Timeout | null = null;
-
-    /** Traducao LID -> telefone; ver LidDirectory para o porque. */
+    private readonly baileysLog: Logger;
+    private readonly reads: ReadBudget;
     private readonly lids = new LidDirectory();
-
-    /**
-     * Resolve quando o socket esta REALMENTE pronto para mandar stanza.
-     *
-     * `makeWASocket()` volta na hora, com o handshake ainda por acontecer:
-     * quem chamar `requestPairingCode` logo depois de `connect()` cai no
-     * `sendRawMessage` do Baileys com `ws.isOpen === false` e leva um
-     * "Connection Closed" — que era exatamente o erro de quem tentava conectar
-     * pelo numero de telefone.
-     *
-     * O sinal usado e o primeiro `qr` do `connection.update`: ele so e emitido
-     * depois do handshake, e significa "o servidor aceitou a conexao e esta
-     * esperando o pareamento". `connection: 'open'` tambem serve (sessao ja
-     * pareada, sem QR nenhum).
-     */
-    private prontoParaParear: Promise<void> | null = null;
-    private marcarPronto: (() => void) | null = null;
-
-    /**
-     * Pareamento por telefone em andamento: numero e codigo mostrados ao
-     * operador.
-     *
-     * Guardado porque o codigo tem de SOBREVIVER A TROCA DE SOCKET. O Baileys
-     * renova o QR a cada 20s e, quando as refs acabam (~2 min), derruba a
-     * conexao com `QR refs attempts ended`; o adapter reconecta e o socket novo
-     * nao tem registro de pareamento nenhum. Como abrir o WhatsApp, achar
-     * "Aparelhos conectados", digitar o numero e digitar o codigo leva mais que
-     * isso, o operador quase sempre digitava um codigo que ja estava morto — e
-     * a tela nao tinha como saber.
-     *
-     * O Baileys aceita um codigo customizado de 8 caracteres em
-     * `requestPairingCode(numero, codigo)`. E o que permite reapresentar o
-     * MESMO codigo ao servidor a cada socket novo, mantendo valido o que o
-     * operador esta digitando.
-     */
-    private pareamento: { numero: string; codigo: string } | null = null;
-
-    /** Em qual socket o pareamento ja foi registrado (evita registrar 2x). */
-    private pareamentoRegistradoEm: WASocket | null = null;
+    private readonly recent = new RecentMessages();
+    private readonly sent: SentMessageStore;
+    private readonly subscribedPresence = new BoundedMap<string, true>(5_000);
+    private readonly knownNumbers = new TtlCache(KNOWN_NUMBER_TTL_MS, 2_500);
+    private readonly unknownNumbers = new TtlCache(UNKNOWN_NUMBER_TTL_MS, 2_500);
+    private readonly groups = new TtlCache(GROUP_METADATA_TTL_MS, 200);
+    // One set of Baileys caches per account, reused by every socket it opens (see TtlCache).
+    private readonly retryCounters = new TtlCache(60 * 60_000, 2_000);
+    private readonly userDevices = new TtlCache(5 * 60_000, 2_000);
+    private readonly callOffers = new TtlCache(5 * 60_000, 100);
+    private readonly placeholderResends = new TtlCache(60 * 60_000, 1_000);
+    private sweepTimer: NodeJS.Timeout | null;
 
     constructor(
         private readonly options: AdapterOptions,
         private readonly logger: Logger,
-        private readonly callbacks: BaileysAdapterCallbacks
+        private readonly callbacks: AdapterCallbacks
     ) {
-        this.loggerBaileys = loggerDoBaileys(options.instanceId);
-        // As mensagens que enviamos vao para o disco, dentro do proprio
-        // diretorio de sessao: e o que permite atender um pedido de reenvio
-        // feito depois de um restart.
-        this.messageCache = new MessageCache(2000, 60 * 60 * 1000,
-            join(options.sessionDirectory, 'sent-messages'));
-        // sweepExpired existia mas nunca era chamado: nada saia do cache a nao
-        // ser por excesso de tamanho.
-        this.manutencaoTimer = setInterval(() => this.messageCache.manutencao(), MANUTENCAO_CACHE_MS);
-        this.manutencaoTimer.unref?.();
+        this.baileysLog = baileysLogger(options.instanceId);
+        this.reads = new ReadBudget(options.readsPerMinute);
+        this.sent = new SentMessageStore(join(options.sessionDirectory, 'sent-messages'));
+        this.sweepTimer = setInterval(() => void this.sent.sweep(), SWEEP_INTERVAL_MS);
+        this.sweepTimer.unref?.();
+        void this.sent.sweep();
     }
 
     getState(): ConnectionStateName {
@@ -405,493 +222,410 @@ export class BaileysAdapter {
         return this.socket?.user?.id ?? null;
     }
 
-    /**
-     * Quantas vezes cada ruido de protocolo apareceu nesta instancia.
-     *
-     * <p>O log resume as repeticoes para nao enterrar o resto, entao sem este
-     * contador uma <i>escalada</i> de falhas de decrypt — o aviso precoce de que
-     * a sessao Signal esta degradando, e de que o numero esta pedindo reenvio
-     * demais — ficaria invisivel no nivel padrao.
-     */
-    protocolNoise(): Record<string, number> {
-        return ruidoDoProtocolo(this.options.instanceId);
+    stats(): Record<string, unknown> {
+        return {
+            state: this.state,
+            recent: this.recent.size,
+            lids: this.lids.size,
+            knownNumbers: this.knownNumbers.size + this.unknownNumbers.size,
+            groups: this.groups.size,
+            baileysCaches: {
+                retryCounters: this.retryCounters.size,
+                userDevices: this.userDevices.size,
+                callOffers: this.callOffers.size,
+                placeholderResends: this.placeholderResends.size
+            },
+            readsRemaining: this.reads.remaining,
+            protocolNoise: protocolNoise(this.options.instanceId)
+        };
     }
 
-    /** Quantas consultas ao WhatsApp ainda cabem neste minuto. */
-    readBudgetRemaining(): number {
-        return this.leituras.disponiveis;
-    }
+    // ------------------------------------------------------------ lifecycle
 
     async connect(): Promise<void> {
         this.closedByUser = false;
-        // Ja conectado ou conectando: NAO abre outro socket.
-        //
-        // `connect()` e chamado pelo boot do painel, pela tela de sessoes e
-        // pelo watchdog. Antes, cada uma dessas chamadas abria mais um socket
-        // por cima do que ja existia; a conta aparecia para o WhatsApp como
-        // varios clientes web simultaneos, e a reconexao que o servidor
-        // provoca ao derrubar o duplicado realimentava o ciclo.
-        if (this.socket && (this.state === 'CONNECTED' || this.state === 'CONNECTING'
-            || this.state === 'QR_PENDING' || this.state === 'PAIRING_CODE_PENDING')) {
-            this.logger.debug({ state: this.state }, 'connect() ignorado: ja ha socket ativo');
+        if (this.socket && this.state !== 'RECONNECTING' && this.state !== 'DISCONNECTED' && this.state !== 'FAILED'
+            && this.state !== 'LOGGED_OUT') {
             return;
         }
+        this.loginCycles = 0;
         await this.openSocket();
     }
 
-    /**
-     * Abre o socket, garantindo que exista no maximo um por instancia.
-     *
-     * A abertura e serializada por `this.abrindo`: enquanto uma esta em curso,
-     * qualquer outra chamada espera a mesma promessa em vez de comecar a sua.
-     */
-    private async openSocket(): Promise<void> {
-        if (this.abrindo) {
-            return this.abrindo;
-        }
-        this.abrindo = this.abrirSocket().finally(() => {
-            this.abrindo = null;
-        });
-        return this.abrindo;
+    async disconnect(): Promise<void> {
+        this.closedByUser = 'disconnect';
+        this.pairing = null;
+        this.cancelReconnect();
+        // A pending open sees the generation changed and gives up instead of raising a socket for a stopped account.
+        this.generation++;
+        this.dropSocket();
+        this.setState('DISCONNECTED', 'USER_LOGOUT', 'disconnect() requested');
     }
 
-    private async abrirSocket(): Promise<void> {
-        // Um temporizador de reconexao pendente abriria um segundo socket
-        // alguns segundos depois deste.
-        this.cancelarReconexao();
-        // O socket anterior, se houver, sai de cena ANTES de o novo existir:
-        // dois sockets vivos na mesma conta e o cenario que o WhatsApp trata
-        // como uso anomalo.
-        this.descartarSocket();
+    async logout(): Promise<void> {
+        this.closedByUser = 'logout';
+        this.pairing = null;
+        this.cancelReconnect();
+        try {
+            await this.socket?.logout();
+        } catch (err) {
+            this.logger.warn({ err }, 'logout on WhatsApp failed; cleaning up locally');
+        }
+        this.generation++;
+        this.dropSocket();
+        await wipeCredentials(this.options.sessionDirectory, this.logger);
+        this.setState('LOGGED_OUT', 'USER_LOGOUT', 'logout() requested');
+    }
 
-        const geracao = ++this.geracao;
+    /** Releases what lives outside the socket; the account is gone for good. */
+    destroy(): void {
+        if (this.sweepTimer) {
+            clearInterval(this.sweepTimer);
+            this.sweepTimer = null;
+        }
+        this.retryCounters.flushAll();
+        this.userDevices.flushAll();
+        this.callOffers.flushAll();
+        this.placeholderResends.flushAll();
+        forgetProtocolNoise(this.options.instanceId);
+    }
+
+    private openSocket(): Promise<void> {
+        // One open at a time: two concurrent opens raised two sockets on one account,
+        // and the server's connectionReplaced on the duplicate fed the loop.
+        this.opening ??= this.open().finally(() => {
+            this.opening = null;
+        });
+        return this.opening;
+    }
+
+    private async open(): Promise<void> {
+        this.cancelReconnect();
+        this.dropSocket();
+        const generation = ++this.generation;
         this.setState('CONNECTING', null, null);
-        this.prontoParaParear = new Promise<void>((resolve) => {
-            this.marcarPronto = resolve;
+        this.readyForPairing = new Promise<void>((resolve) => {
+            this.markReady = resolve;
         });
 
-        // A session invalidated by WhatsApp is deleted asynchronously; reading
-        // the credentials before that finishes would load the very files that
-        // are on their way out.
-        if (this.sessionCleanup) {
-            await this.sessionCleanup;
-            this.sessionCleanup = null;
+        if (this.sessionWipe) {
+            await this.sessionWipe;
+            this.sessionWipe = null;
         }
-
-        const { state, saveCreds } = await useDurableAuthState(this.options.sessionDirectory, this.logger);
-
-        const rawKeysSet = state.keys.set;
-        state.keys.set = async (data) => {
-            try {
-                await rawKeysSet(data);
-            } catch (err) {
-                this.logger.error(
-                    { err, categories: Object.keys(data) },
-                    'falha ao persistir mutacoes/chaves de autenticacao do Baileys no disco'
-                );
-                throw err;
-            }
-        };
-
-        // Perguntada ao WhatsApp, nao lida da constante do pacote: cliente
-        // velho tem o pareamento recusado pelo servidor. Ver WaVersion.ts.
-        // `null` = nao deu para descobrir; a chave e OMITIDA para o Baileys usar
-        // a dele. Mandar `undefined` sobrescreveria o padrao e subiria o socket
-        // sem versao nenhuma - sem QR e sem codigo de pareamento.
-        const version = await resolverVersaoWhatsApp(this.logger);
-
-        // Alguem desconectou/deslogou enquanto esperavamos o disco e a rede.
-        if (this.geracao !== geracao) {
-            this.logger.info('abertura abortada: outra operacao assumiu a instancia');
+        const { state, saveCreds, backupCreds } = await useDurableAuthState(this.options.sessionDirectory, this.logger);
+        const version = await resolveWhatsAppVersion(this.logger);
+        if (this.generation !== generation) {
             return;
         }
+        this.backupCreds = backupCreds;
 
         const socket = makeWASocket({
             auth: state,
             ...(version ? { version } : {}),
-            logger: this.loggerBaileys as never,
-            browser: [this.options.displayName, 'Chrome', VERSAO_DO_NAVEGADOR],
-            markOnlineOnConnect: this.options.markOnlineOnConnect,
+            logger: this.baileysLog as never,
+            browser: this.options.browser,
+            markOnlineOnConnect: this.options.alwaysOnline,
             keepAliveIntervalMs: KEEP_ALIVE_MS,
             connectTimeoutMs: CONNECT_TIMEOUT_MS,
             defaultQueryTimeoutMs: QUERY_TIMEOUT_MS,
-            transactionOpts: {
-                maxCommitRetries: 5,
-                delayBetweenTriesMs: 500
-            },
-
-            // ---- ACESSO MINIMO: o que este cliente NAO pede ao WhatsApp ----
-            //
-            // `syncFullHistory: false` sozinho ja desliga a sincronizacao de
-            // historico nesta versao (o Baileys deriva `shouldSyncHistoryMessage`
-            // dele quando a opcao nao e passada), mas essa derivacao e um
-            // detalhe interno do pacote e uma atualizacao pode mudar o padrao
-            // sem aviso. Declarar as duas deixa a intencao escrita no codigo: o
-            // painel NAO importa conversa antiga do celular. O historico dele
-            // comeca no momento em que a sessao conecta, e e so isso que ele
-            // exibe.
-            // Sem isto o Baileys pede o metadata do grupo A CADA envio para
-            // grupo, e cada pedido traz numero e nome de todos os
-            // participantes. Tres mensagens seguidas ao mesmo grupo custavam
-            // tres varreduras da lista de membros.
-            cachedGroupMetadata: async (jid) => {
-                const emCache = this.gruposEmCache.get(jid);
-                return emCache && Date.now() < emCache.ateMs ? emCache.metadata : undefined;
-            },
+            transactionOpts: { maxCommitRetries: 5, delayBetweenTriesMs: 500 },
+            // Old messages are never requested. The phone still pushes one bootstrap right after
+            // pairing, and Baileys 7 needs it for the LID mappings (without them it warns of session
+            // errors); its messages go to messaging-history.set, which nothing here listens to.
             syncFullHistory: false,
-            shouldSyncHistoryMessage: () => false,
-
-            // Descarta antes de decifrar tudo que o painel nunca usa - em
-            // especial o "Recado" de todos os contatos da agenda. Ver
-            // enderecoIgnorado().
-            shouldIgnoreJid: (jid) => enderecoIgnorado(jid),
-
-            // O painel grava a mensagem que ele proprio envia no momento do
-            // envio (WaChatStore.registrar, em WaEngineSdk). Com o eco ligado,
-            // a mesma mensagem voltava pelo `messages.upsert` e era processada
-            // de novo do zero - trabalho duplicado a cada envio de campanha.
+            shouldSyncHistoryMessage: (history) => HISTORY_KEPT_FOR_LID_MAPPINGS.has(history.syncType ?? -1),
+            // Status updates, channels and broadcast lists are acknowledged and dropped before decryption.
+            shouldIgnoreJid: (jid) => isIgnoredAddress(jid),
             emitOwnEvents: false,
-
-            // Previa de link exige baixar a pagina de destino. O painel nunca
-            // mostrou previa nenhuma.
             generateHighQualityLinkPreview: false,
-
-            // Quando o aparelho do destinatario nao consegue decifrar algo que
-            // mandamos, ele pede o reenvio (retry receipt) e o Baileys chama
-            // isto para recifrar. Sem a funcao, o pedido nunca e atendido: o
-            // outro lado insiste, a sessao de criptografia com aquele contato
-            // vai se degradando e o socket acaba caindo. O cache ja existia e
-            // ja era alimentado em `messages.upsert` - so nao estava ligado.
-            getMessage: async (key) => {
-                const chatId = key.remoteJid;
-                if (!chatId || !key.id) {
-                    return undefined;
-                }
-                return this.messageCache.get(chatId, key.id)?.message ?? undefined;
-            }
+            // Retries read our sent messages from disk through getMessage; no second copy in the heap.
+            enableRecentMessageCache: false,
+            msgRetryCounterCache: this.retryCounters,
+            userDevicesCache: this.userDevices,
+            callOfferCache: this.callOffers,
+            placeholderResendCache: this.placeholderResends,
+            cachedGroupMetadata: async (jid) => this.groups.get<GroupMetadata>(jid),
+            getMessage: async (key) => this.sent.get(key)
         });
 
         this.socket = socket;
-        this.saveCreds = saveCreds;
-        this.registrarListeners(socket, saveCreds, geracao);
+        this.available = this.options.alwaysOnline;
+        this.subscribedPresence.clear();
+        this.qrInCycle = 0;
+        this.listen(socket, saveCreds, generation);
     }
 
-    /**
-     * Liga os listeners de UM socket, presos a geracao dele.
-     *
-     * Cada assinatura vira uma funcao de cancelamento em `this.assinaturas`.
-     * Antes elas eram registradas e nunca removidas: a cada reconexao o socket
-     * novo trazia listeners novos e os do anterior continuavam vivos enquanto o
-     * objeto existisse. O sintoma era mensagem processada duas, tres, N vezes -
-     * uma por reconexao acumulada.
-     */
-    private registrarListeners(socket: WASocket, saveCreds: () => Promise<void>, geracao: number): void {
-        const assinar = <T extends keyof BaileysEventMap>(
-            evento: T,
-            ouvinte: (arg: BaileysEventMap[T]) => void
-        ): void => {
-            const protegido = (arg: BaileysEventMap[T]): void => {
-                // Evento atrasado de um socket que ja saiu de cena.
-                if (this.geracao !== geracao) return;
-                ouvinte(arg);
+    private listen(socket: WASocket, saveCreds: () => Promise<void>, generation: number): void {
+        const on = <T extends keyof BaileysEventMap>(event: T, handler: (arg: BaileysEventMap[T]) => void): void => {
+            const guarded = (arg: BaileysEventMap[T]): void => {
+                // A late event from a socket that was already replaced.
+                if (this.generation !== generation) return;
+                try {
+                    handler(arg);
+                } catch (err) {
+                    this.logger.error({ err, event }, 'handler failed');
+                }
             };
-            socket.ev.on(evento, protegido);
-            this.assinaturas.push(() => socket.ev.off(evento, protegido));
+            socket.ev.on(event, guarded);
+            this.subscriptions.push(() => socket.ev.off(event, guarded));
         };
 
-        assinar('creds.update', () => {
-            // saveCreds do PROPRIO socket, e nao `this.saveCreds`: durante uma
-            // troca de socket o campo ja aponta para o novo, e gravar as
-            // credenciais de um pelo escritor do outro corrompe a sessao em
-            // disco - que aparece depois como "pediu QR do nada".
-            //
-            // O catch nao e decoracao: sem ele a rejeicao subia sem dono, o
-            // handler de `unhandledRejection` do index.ts derrubava o processo
-            // INTEIRO (todas as instancias dele) por causa de um ENOSPC
-            // passageiro, e ainda por cima no momento exato em que uma
-            // credencial estava sendo gravada. Perder uma gravacao e ruim;
-            // derrubar o bridge no meio dela e muito pior.
-            void saveCreds().catch((err) => {
-                this.logger.error({ err }, 'falha ao gravar as credenciais no disco - a sessao segue em memoria');
+        on('creds.update', () => {
+            // This socket's own writer: during a swap `this` already points at the next one.
+            void saveCreds().catch((err) => this.logger.error({ err }, 'failed to write credentials; session kept in memory'));
+        });
+        on('connection.update', (update) => this.onConnectionUpdate(update));
+        on('lid-mapping.update', (mapping) => {
+            const pair = mapping as unknown as { lid?: string; pn?: string };
+            this.lids.remember(pair.lid, pair.pn);
+        });
+        on('messages.upsert', ({ messages, type }) => {
+            if (type !== 'notify' && type !== 'append') return;
+            for (const message of messages) {
+                this.onIncoming(message);
+            }
+        });
+        on('messages.update', (updates) => {
+            for (const { key, update } of updates) {
+                if (!key.remoteJid || !key.id) continue;
+                if (update.messageStubType === proto.WebMessageInfo.StubType.REVOKE) {
+                    this.callbacks.onMessageDeleted(this.lids.resolve(key.remoteJid), key.id);
+                    continue;
+                }
+                const status = typeof update.status === 'number' ? STATUS_NAMES[update.status] ?? null : null;
+                const edited = update.message?.editedMessage?.message ?? update.message?.protocolMessage?.editedMessage;
+                const editedText = edited?.conversation ?? edited?.extendedTextMessage?.text ?? null;
+                if (!status && !editedText) continue;
+                this.callbacks.onMessageUpdated({
+                    chatId: this.lids.resolve(key.remoteJid),
+                    messageId: key.id,
+                    fromMe: key.fromMe ?? false,
+                    status,
+                    editedText
+                });
+            }
+        });
+        on('messages.delete', (payload) => {
+            if (!('keys' in payload)) return;
+            for (const key of payload.keys) {
+                if (key.remoteJid && key.id) {
+                    this.callbacks.onMessageDeleted(this.lids.resolve(key.remoteJid), key.id);
+                }
+            }
+        });
+        on('messages.reaction', (reactions) => {
+            for (const { key, reaction } of reactions) {
+                if (!key.remoteJid || !key.id) continue;
+                const chatId = this.lids.resolve(key.remoteJid);
+                const emoji = reaction.text ?? '';
+                this.callbacks.onReaction({
+                    chatId,
+                    messageId: key.id,
+                    senderId: reaction.key?.fromMe ? 'me' : this.lids.resolve(reaction.key?.participant ?? key.remoteJid),
+                    emoji: emoji.length > 0 ? emoji : null,
+                    removed: emoji.length === 0
+                });
+            }
+        });
+        on('groups.update', (updates) => {
+            for (const update of updates) {
+                if (!update.id) continue;
+                this.groups.del(update.id);
+                this.callbacks.onGroupUpdated({
+                    groupJid: update.id,
+                    action: 'update',
+                    participants: [],
+                    subject: update.subject ?? null,
+                    description: update.desc ?? null
+                });
+            }
+        });
+        on('group-participants.update', (event) => {
+            this.groups.del(event.id);
+            this.callbacks.onGroupUpdated({
+                groupJid: event.id,
+                action: event.action,
+                participants: event.participants.map((p) => this.lids.resolve(typeof p === 'string' ? p : String(p))),
+                subject: null,
+                description: null
             });
         });
-
-        assinar('connection.update', (update) => this.handleConnectionUpdate(update));
-
-        assinar('messages.upsert', ({ messages, type }) => {
-            // `notify` = mensagem chegando agora.
-            // `append` = mensagem que chegou enquanto estavamos offline (o
-            //            Baileys marca o stanza com `offline`). NAO e
-            //            sincronizacao de historico - essa vem por
-            //            `messaging-history.set`, que este adapter nunca
-            //            assina. Descartar `append` perderia respostas reais
-            //            recebidas durante uma queda de conexao.
-            if (type !== 'notify' && type !== 'append') return;
-            for (const msg of messages) {
-                // O par LID/telefone vem no proprio stanza: aprender antes de
-                // mapear e o que faz a PRIMEIRA mensagem ja cair na conversa
-                // certa, e nao so a segunda.
-                this.learnLids(msg);
-                this.messageCache.put(msg);
-                if (!msg.message) continue;
-                this.callbacks.onMessage(toAbstractMessage(msg, this.lids));
+        on('presence.update', ({ id, presences }) => {
+            const chatId = this.lids.resolve(id);
+            for (const [participant, presence] of Object.entries(presences)) {
+                this.callbacks.onPresenceUpdated({
+                    chatId,
+                    participant: this.lids.resolve(participant),
+                    presence: presence.lastKnownPresence,
+                    lastSeen: presence.lastSeen ?? null
+                });
             }
         });
-
-        // NAO ha listener de `contacts.upsert`/`contacts.update` aqui, e a
-        // ausencia e deliberada. `contacts.upsert` entrega a AGENDA INTEIRA da
-        // conta de uma vez, e o adapter guardava o par LID/telefone de cada
-        // contato - inclusive de gente com quem o painel nunca trocou uma
-        // mensagem. Era coleta de dado de terceiro sem nenhum uso: o unico
-        // motivo de existir do LidDirectory e nao separar em duas a conversa de
-        // quem escreveu para nos, e para isso learnLids(msg) - que le o par no
-        // proprio stanza daquela conversa - resolve por completo.
-
-        assinar('messages.update', (updates) => {
-            for (const update of updates) {
-                const chatId = update.key.remoteJid;
-                const messageId = update.key.id;
-                if (!chatId || !messageId) continue;
-                this.callbacks.onMessageUpdated(chatId, messageId, update.update);
+        on('call', (calls) => {
+            for (const call of calls) {
+                // An offer delivered after a reconnect rang while we were away: there is nothing left to answer.
+                if (call.status !== 'offer' || call.offline) continue;
+                this.callbacks.onCall({
+                    callId: call.id,
+                    from: call.from,
+                    chatId: this.lids.resolve(call.chatId),
+                    isVideo: call.isVideo ?? false,
+                    isGroup: call.isGroup ?? false,
+                    timestamp: Math.floor(new Date(call.date).getTime() / 1000)
+                });
             }
-        });
-
-        assinar('messages.delete', (payload) => {
-            if ('keys' in payload) {
-                for (const key of payload.keys) {
-                    if (key.remoteJid && key.id) {
-                        this.callbacks.onMessageDeleted(key.remoteJid, key.id);
-                    }
-                }
-            }
-        });
-
-        assinar('messages.reaction', (reactions) => {
-            for (const r of reactions) {
-                const chatId = r.key.remoteJid;
-                const messageId = r.key.id;
-                if (!chatId || !messageId) continue;
-                this.callbacks.onReaction(chatId, messageId, r.reaction.key?.participant ?? chatId, r.reaction.text ?? null);
-            }
-        });
-
-        assinar('groups.update', (updates) => {
-            for (const update of updates) {
-                if (update.id) {
-                    this.callbacks.onGroupUpdated(update.id, update);
-                }
-            }
-        });
-
-        assinar('group-participants.update', (event) => {
-            this.callbacks.onGroupUpdated(event.id, event);
-        });
-
-        assinar('presence.update', (event) => {
-            this.callbacks.onPresenceUpdated(event.id, event.presences);
         });
     }
 
-    /**
-     * Tira o socket atual de cena: desassina, fecha e esquece.
-     *
-     * Chamado antes de abrir outro e nas saidas deliberadas. Fechar sem
-     * desassinar deixaria os callbacks do socket morto disparando; desassinar
-     * sem fechar deixaria a conexao viva contando como mais um cliente web na
-     * conta.
-     */
-    private descartarSocket(): void {
-        for (const cancelar of this.assinaturas) {
+    private onIncoming(message: WAMessage): void {
+        this.learnLids(message);
+        if (!message.message || !message.key.remoteJid || !message.key.id) return;
+        if (timestampOf(message) < this.options.acceptSince) return;
+        const type = contentTypeOf(message);
+        if (type === 'pollUpdateMessage') {
+            void this.onPollVote(message);
+            return;
+        }
+        if (!type || IGNORED_CONTENT.has(type)) return;
+        this.recent.remember(message);
+        this.callbacks.onMessage(toAbstractMessage(message, this.lids, this.options.includeRawData));
+    }
+
+    private dropSocket(): void {
+        for (const unsubscribe of this.subscriptions) {
             try {
-                cancelar();
+                unsubscribe();
             } catch {
-                // Emissor ja descartado: nada a fazer.
+                // emitter already gone
             }
         }
-        this.assinaturas = [];
-
+        this.subscriptions = [];
         const socket = this.socket;
         this.socket = null;
-        this.saveCreds = null;
         if (!socket) return;
         try {
             socket.end(undefined);
         } catch {
-            // Ja fechado.
+            // already closed
         }
     }
 
-    /** Cancela uma reconexao agendada, se houver. */
-    private cancelarReconexao(): void {
+    private cancelReconnect(): void {
         if (this.reconnectTimer) {
             clearTimeout(this.reconnectTimer);
             this.reconnectTimer = null;
         }
     }
 
-    private handleConnectionUpdate(update: {
-        connection?: string;
-        qr?: string;
-        lastDisconnect?: { error?: Error };
-    }): void {
+    private onConnectionUpdate(update: { connection?: string; qr?: string; lastDisconnect?: { error?: Error } }): void {
         if (update.qr) {
-            // Handshake concluido: o socket ja aceita stanza. E o que
-            // requestPairingCode espera.
-            this.marcarPronto?.();
-
-            // Com pareamento por telefone em curso o QR nao interessa: o
-            // operador esta digitando um codigo. Emiti-lo trocaria o estado
-            // para QR_PENDING no meio do processo e, pior, deixaria o socket
-            // seguir para o fim das refs e morrer levando o codigo junto.
-            if (this.pareamento) {
-                this.reregistrarPareamento();
+            this.markReady?.();
+            if (this.pairing) {
+                // The operator is typing a code; a QR would flip the state and let the code die with this socket.
+                this.reregisterPairing();
                 return;
             }
-
+            this.qrInCycle++;
             this.currentQr = update.qr;
             this.setState('QR_PENDING', null, null);
-            this.callbacks.onQr(update.qr);
+            this.callbacks.onQr(update.qr, this.loginCycles + 1);
             return;
         }
-
         if (update.connection === 'open') {
-            this.marcarPronto?.();
+            this.markReady?.();
             this.currentQr = null;
             this.reconnectAttempts = 0;
-            this.reconexoesImediatas = 0;
-            this.pareamento = null;          // pareou: o codigo cumpriu o papel
-            this.pareamentoRegistradoEm = null;
+            this.immediateReconnects = 0;
+            this.loginCycles = 0;
+            this.pairing = null;
+            this.pairingRegisteredOn = null;
             this.setState('CONNECTED', null, null);
+            // A known-good copy for the day creds.json is lost: restarting then resumes instead of asking for a QR.
+            void this.backupCreds?.().catch((err) => this.logger.warn({ err }, 'could not back up the credentials'));
             return;
         }
-
         if (update.connection === 'close') {
-            this.handleClose(update.lastDisconnect?.error);
+            this.onClose(update.lastDisconnect?.error);
         }
     }
 
-    private handleClose(error: Error | undefined): void {
-        const boom = error as Boom | undefined;
-        const statusCode = boom?.output?.statusCode;
-        const cause: DisconnectCause =
-            (statusCode !== undefined ? DISCONNECT_CAUSE_BY_STATUS_CODE[statusCode] : undefined) ?? 'UNKNOWN';
+    private onClose(error: Error | undefined): void {
+        const statusCode = (error as Boom | undefined)?.output?.statusCode;
+        const cause: DisconnectCause = (statusCode !== undefined ? CAUSE_BY_STATUS[statusCode] : undefined) ?? 'UNKNOWN';
         const detail = error?.message ?? null;
-
-        // Desassina e fecha o socket morto. Antes so o campo era zerado: o
-        // objeto continuava com todos os listeners ligados e, se o WebSocket
-        // ainda estivesse meio vivo, seus eventos seguiam sendo processados
-        // junto com os do socket seguinte.
-        this.descartarSocket();
+        const wasLoggingIn = this.state === 'QR_PENDING' || this.state === 'PAIRING_CODE_PENDING';
+        this.dropSocket();
+        this.currentQr = null;
 
         if (this.closedByUser) {
-            // Deliberate local closure: report USER_LOGOUT/target-state deterministically
-            // rather than trusting the (possibly absent, since a locally-initiated close may
-            // carry no real disconnect-reason error at all) status-code-derived cause above -
-            // see the closedByUser field comment for why this must agree with disconnect()/logout().
-            const targetState: ConnectionStateName = this.closedByUser === 'logout' ? 'LOGGED_OUT' : 'DISCONNECTED';
-            this.setState(targetState, 'USER_LOGOUT', detail ?? `${this.closedByUser}() chamado explicitamente`);
+            const target = this.closedByUser === 'logout' ? 'LOGGED_OUT' : 'DISCONNECTED';
+            this.setState(target, 'USER_LOGOUT', detail ?? `${this.closedByUser}() requested`);
             return;
         }
 
         if (cause === 'USER_LOGOUT' || cause === 'AUTH_FAILURE') {
-            if (statusCode !== undefined && CREDENTIALS_INVALIDATED_STATUS_CODES.has(statusCode)) {
-                this.discardInvalidatedSession(statusCode);
+            if (statusCode !== undefined && CREDENTIALS_REVOKED.has(statusCode)) {
+                this.logger.warn({ statusCode }, 'credentials revoked by WhatsApp; wiping them so the next connect pairs again');
+                this.sessionWipe = wipeCredentials(this.options.sessionDirectory, this.logger).catch((err) => {
+                    this.logger.error({ err }, 'failed to wipe the revoked session');
+                });
             }
+            this.pairing = null;
             this.setState(cause === 'USER_LOGOUT' ? 'LOGGED_OUT' : 'FAILED', cause, detail);
-            this.logger.warn({ cause, detail }, 'connection closed without automatic reconnect');
             return;
         }
 
-        // Outro cliente assumiu a conta. A credencial continua boa, entao nao
-        // se apaga nada — mas voltar correndo comecaria uma guerra de
-        // reconexao com quem assumiu. Espera longa e fixa: se o outro lado era
-        // um bridge orfao, ele morre por ociosidade nesse meio tempo e a conta
-        // volta sozinha; se era um cliente de verdade, cinco minutos entre
-        // tentativas nao produz o vaivem que chama atencao na conta.
         if (cause === 'CONNECTION_REPLACED') {
-            this.logger.warn(
-                { detail, proximaTentativaMs: RECONEXAO_APOS_SUBSTITUICAO_MS },
-                'outro cliente assumiu esta conta (connectionReplaced) - credenciais preservadas, nova tentativa daqui a pouco'
-            );
+            this.logger.warn({ retryInMs: REPLACED_RETRY_MS }, 'another client took this account; credentials kept, retrying later');
             this.setState('RECONNECTING', cause, detail);
-            this.scheduleReconnect(false, RECONEXAO_APOS_SUBSTITUICAO_MS);
+            this.scheduleReconnect(false, REPLACED_RETRY_MS);
             return;
         }
 
-        // Com pareamento em curso, a queda e ESPERADA: o Baileys derruba o
-        // socket quando as refs de QR acabam (~2 min). Nao e falha, entao nao
-        // pode alimentar o backoff exponencial — cada segundo aqui e um
-        // segundo em que o codigo que o operador esta digitando nao existe do
-        // lado do WhatsApp.
-        if (this.pareamento) {
+        // The QR refs (or the pairing window) ran out: one login cycle is over.
+        if (wasLoggingIn && statusCode === DisconnectReason.timedOut) {
+            this.loginCycles++;
+            this.pairingRegisteredOn = null;
+            if (this.loginCycles >= this.options.maxLoginCycles) {
+                this.pairing = null;
+                this.setState('DISCONNECTED', 'LOGIN_TIMEOUT',
+                    `no QR code scan or pairing code typed after ${this.loginCycles} cycles; call connect() again`);
+                return;
+            }
             this.reconnectAttempts = 0;
-            this.pareamentoRegistradoEm = null;
+            this.setState('RECONNECTING', cause, detail);
+            this.scheduleReconnect(true);
+            return;
         }
 
         this.setState('RECONNECTING', cause, detail);
         this.scheduleReconnect(cause === 'WHATSAPP_RESTART');
     }
 
-    /**
-     * Drops credentials WhatsApp has just rejected, so the next connect()
-     * starts a fresh pairing and emits a QR code instead of replaying the same
-     * rejection forever.
-     *
-     * Fire-and-forget by necessity (the caller reacts to a synchronous event),
-     * but the promise is kept in `sessionCleanup` so openSocket() waits for it.
-     * A failure here is logged rather than thrown: the connection is already
-     * down, and the state change still has to reach the operator.
-     */
-    private discardInvalidatedSession(statusCode: number): void {
-        this.logger.warn({ statusCode }, 'credenciais invalidadas pelo WhatsApp; limpando sessao para permitir novo pareamento');
-        this.sessionCleanup = limparCredenciais(this.options.sessionDirectory, this.logger).catch((err) => {
-            this.logger.error({ err }, 'falha ao limpar a sessao invalidada; o proximo connect pode continuar sendo recusado');
-        });
-    }
+    private scheduleReconnect(immediate: boolean, fixedDelayMs?: number): void {
+        this.cancelReconnect();
+        if (this.closedByUser) return;
 
-    private scheduleReconnect(immediate: boolean, delayFixoMs?: number): void {
-        this.cancelarReconexao();
-
-        // Saida deliberada (disconnect/logout) nao reconecta. Sem esta
-        // conferencia, um close que chegasse depois do desligamento explicito
-        // religava a conta sozinha.
-        if (this.closedByUser) {
-            return;
-        }
-
-        // O caminho imediato (515) tem teto: sem ele, um 515 que se repetisse
-        // virava um laco de handshakes sem espera nenhuma, porque
-        // reconnectAttempts era incrementado mas nunca consultado aqui.
-        const podeSerImediato = immediate && this.reconexoesImediatas < MAX_RECONEXOES_IMEDIATAS;
-        if (immediate && !podeSerImediato) {
-            this.logger.warn(
-                { seguidas: this.reconexoesImediatas },
-                'WhatsApp pediu reinicio imediato vezes demais seguidas - passando a esperar entre as tentativas'
-            );
-        }
-        this.reconexoesImediatas = podeSerImediato ? this.reconexoesImediatas + 1 : 0;
+        const allowImmediate = immediate && this.immediateReconnects < MAX_IMMEDIATE_RECONNECTS;
+        this.immediateReconnects = allowImmediate ? this.immediateReconnects + 1 : 0;
 
         let delay: number;
-        if (podeSerImediato) {
+        if (allowImmediate) {
             delay = 0;
-        } else if (delayFixoMs !== undefined) {
-            delay = delayFixoMs + Math.floor(Math.random() * 1_000);
+        } else if (fixedDelayMs !== undefined) {
+            delay = fixedDelayMs + jitter(1_000);
+        } else if (this.reconnectAttempts >= FAILURES_BEFORE_COOLDOWN) {
+            delay = COOLDOWN_MS + jitter(5_000);
         } else {
-            delay =
-                Math.min(
-                    this.options.maxReconnectDelayMs,
-                    this.options.minReconnectDelayMs * Math.pow(2, this.reconnectAttempts)
-                ) + Math.floor(Math.random() * 250);
+            delay = Math.min(this.options.maxReconnectDelayMs, this.options.minReconnectDelayMs * 2 ** this.reconnectAttempts)
+                + jitter(500);
         }
-
-        this.reconnectAttempts += 1;
-        this.logger.info({ delay, attempt: this.reconnectAttempts }, 'scheduling reconnect');
+        this.reconnectAttempts++;
+        this.logger.info({ delay, attempt: this.reconnectAttempts }, 'reconnect scheduled');
 
         this.reconnectTimer = setTimeout(() => {
             this.reconnectTimer = null;
-            if (this.closedByUser) {
-                return;
-            }
+            if (this.closedByUser) return;
             this.openSocket().catch((err) => {
                 this.logger.error({ err }, 'reconnect attempt failed');
                 this.setState('RECONNECTING', 'CONNECTION_LOST', (err as Error).message);
@@ -903,692 +637,727 @@ export class BaileysAdapter {
     private setState(state: ConnectionStateName, cause: DisconnectCause | null, detail: string | null): void {
         const previous = this.state;
         this.state = state;
-        if (previous !== state) {
+        if (previous !== state || cause === 'LOGIN_TIMEOUT') {
             this.callbacks.onConnectionStateChanged(state, cause, detail);
         }
     }
 
+    // ------------------------------------------------------------ pairing
+
     /**
-     * Codigo de pareamento por numero de telefone (a alternativa ao QR).
-     *
-     * Duas coisas tem de ser verdade antes de pedir o codigo, e nenhuma delas
-     * era garantida:
-     *
-     * 1. **O socket precisa estar pronto para mandar stanza.**
-     *    `makeWASocket()` volta antes do handshake terminar, e o Baileys
-     *    responde `Connection Closed` a qualquer envio nesse intervalo. Por
-     *    isso esperamos `prontoParaParear` — ver o campo para o sinal usado.
-     * 2. **A sessao nao pode ja estar pareada.** Com `creds.registered`, o
-     *    WhatsApp nao emite QR nem aceita pareamento, e a espera acima
-     *    estouraria no timeout sem explicar nada.
+     * Pairing code (the alternative to the QR code). The socket has to finish
+     * its handshake before the request, and a session that is already paired
+     * cannot pair again. The code survives socket swaps: Baileys renews the
+     * socket every couple of minutes, and the same code is re-registered on
+     * each new one so what the operator is typing stays valid.
      */
-    async requestPairingCode(phoneNumber: string): Promise<string> {
-        const numero = phoneNumber.replace(/\D/g, '');
-        if (numero.length < 10 || numero.length > 15) {
-            throw new BridgeCommandError(
-                ErrorCode.INVALID_PAYLOAD,
-                `numero invalido: "${phoneNumber}". Use so digitos, com DDI (ex.: 5562999998888).`
-            );
+    async requestPairingCode(phoneNumber: string, customCode?: string): Promise<string> {
+        const phone = phoneNumber.replace(/\D/g, '');
+        if (phone.length < 10 || phone.length > 15) {
+            throw new BridgeCommandError(ErrorCode.INVALID_PAYLOAD, 'phone number must have 10 to 15 digits, country code included');
+        }
+        if (customCode !== undefined && !/^[A-Z0-9]{8}$/.test(customCode)) {
+            throw new BridgeCommandError(ErrorCode.INVALID_PAYLOAD, 'custom pairing code must be 8 characters, A-Z and 0-9');
         }
         if (!this.socket) {
-            throw new BridgeCommandError(ErrorCode.NOT_CONNECTED, 'Instancia nao esta conectando; chame connect antes');
+            await this.connect();
         }
-        if (this.socket.authState.creds.registered) {
-            throw new BridgeCommandError(
-                ErrorCode.INVALID_PAYLOAD,
-                'esta sessao ja esta pareada; desconecte-a antes de parear outro numero'
-            );
+        const socket = this.socket;
+        if (!socket) {
+            throw new BridgeCommandError(ErrorCode.NOT_CONNECTED, 'connection is not open');
         }
-
+        if (socket.authState.creds.registered) {
+            throw new BridgeCommandError(ErrorCode.INVALID_PAYLOAD, 'this session is already paired; log out before pairing another number');
+        }
         this.setState('PAIRING_CODE_PENDING', null, null);
-        await this.esperarSocketPronto();
-
-        const code = await this.socket.requestPairingCode(numero);
-        this.pareamento = { numero, codigo: code };
-        this.pareamentoRegistradoEm = this.socket;
-        this.logger.info({ numero: mascarar(numero) }, 'codigo de pareamento gerado');
+        await this.awaitReadyForPairing();
+        const current = this.socket;
+        if (!current) {
+            throw new BridgeCommandError(ErrorCode.NOT_CONNECTED, 'connection closed while waiting for the handshake');
+        }
+        const code = await current.requestPairingCode(phone, customCode);
+        this.pairing = { phone, code };
+        this.pairingRegisteredOn = current;
+        this.logger.info({ phone: mask(phone) }, 'pairing code issued');
         this.callbacks.onPairingCode(code);
         return code;
     }
 
-    /**
-     * Reapresenta ao servidor o MESMO codigo, no socket atual.
-     *
-     * Chamado quando o socket novo fica pronto com um pareamento ainda em
-     * curso. Sem isto, o codigo na tela do painel deixa de existir do lado do
-     * WhatsApp assim que a conexao anterior cai — e digitar no celular so
-     * responde "codigo invalido".
-     *
-     * Falha aqui e logada, nao propagada: nao ha ninguem esperando por esta
-     * chamada (ela nasce de um evento), e a proxima reconexao tenta de novo.
-     */
-    private reregistrarPareamento(): void {
-        const p = this.pareamento;
+    private reregisterPairing(): void {
+        const pairing = this.pairing;
         const socket = this.socket;
-        if (!p || !socket || this.pareamentoRegistradoEm === socket) {
-            return;
-        }
-        this.pareamentoRegistradoEm = socket;
+        if (!pairing || !socket || this.pairingRegisteredOn === socket) return;
+        this.pairingRegisteredOn = socket;
         this.setState('PAIRING_CODE_PENDING', null, null);
         socket
-            .requestPairingCode(p.numero, p.codigo)
-            .then(() => this.logger.info({ numero: mascarar(p.numero) }, 'codigo de pareamento revalidado apos reconexao'))
+            .requestPairingCode(pairing.phone, pairing.code)
+            .then(() => this.logger.info({ phone: mask(pairing.phone) }, 'pairing code re-registered on the new socket'))
             .catch((err) => {
-                this.pareamentoRegistradoEm = null;
-                this.logger.warn({ err }, 'nao consegui revalidar o codigo de pareamento; tentando na proxima reconexao');
+                this.pairingRegisteredOn = null;
+                this.logger.warn({ err }, 'could not re-register the pairing code; retrying on the next socket');
             });
     }
 
-    /** Espera o handshake terminar, com teto para nao travar a rota do painel. */
-    private async esperarSocketPronto(): Promise<void> {
-        if (!this.prontoParaParear) {
-            return;
-        }
-        let temporizador: NodeJS.Timeout | undefined;
-        const estouro = new Promise<never>((_, reject) => {
-            temporizador = setTimeout(
-                () => reject(new BridgeCommandError(
-                    ErrorCode.NOT_CONNECTED,
-                    'o WhatsApp nao respondeu a tempo; verifique a internet e tente de novo'
-                )),
-                PAIRING_READY_TIMEOUT_MS
-            );
-        });
-        try {
-            await Promise.race([this.prontoParaParear, estouro]);
-        } finally {
-            if (temporizador) clearTimeout(temporizador);
-        }
+    private async awaitReadyForPairing(): Promise<void> {
+        if (!this.readyForPairing) return;
+        await withTimeout(this.readyForPairing, PAIRING_READY_TIMEOUT_MS, 'WhatsApp did not answer the handshake in time');
     }
 
-    async disconnect(): Promise<void> {
-        this.closedByUser = 'disconnect';
-        this.pareamento = null;
-        this.pareamentoRegistradoEm = null;
-        this.cancelarReconexao();
-        // Invalida a geracao: uma abertura que esteja esperando disco ou rede
-        // neste instante descobre, ao voltar, que ja nao e ela quem manda e
-        // desiste em vez de subir um socket para uma instancia desligada.
-        this.geracao++;
-        this.descartarSocket();
-        // Also set explicitly (not just left to handleClose()'s reaction to Baileys' own
-        // 'connection.update' close event): if there was no active socket, that event never fires.
-        this.setState('DISCONNECTED', 'USER_LOGOUT', 'disconnect() chamado explicitamente');
-    }
-
-    async logout(): Promise<void> {
-        this.closedByUser = 'logout';
-        this.pareamento = null;
-        this.pareamentoRegistradoEm = null;
-        this.cancelarReconexao();
-        try {
-            await this.socket?.logout();
-        } catch (err) {
-            this.logger.warn({ err }, 'logout() no baileys falhou, prosseguindo com limpeza local');
-        }
-        // Mesma razao do disconnect(): nenhuma abertura em voo pode ressuscitar
-        // uma sessao cujas credenciais estao sendo apagadas logo abaixo.
-        this.geracao++;
-        this.descartarSocket();
-        // Apaga as credenciais, nao a pasta: o `.lock` da SessionLock mora nela
-        // e ainda e nosso. Removida a pasta inteira, a trava sumia junto e outro
-        // processo podia assumir a conta no meio do encerramento desta.
-        await limparCredenciais(this.options.sessionDirectory, this.logger);
-        // Also set explicitly, same reasoning as disconnect() above.
-        this.setState('LOGGED_OUT', 'USER_LOGOUT', 'logout() chamado explicitamente');
-    }
-
-    /**
-     * Libera o que vive fora do socket: o temporizador de manutencao do cache
-     * de mensagens e os contadores de ruido de protocolo desta instancia.
-     *
-     * De proposito NAO faz parte de `disconnect()` nem de `logout()`: dos dois
-     * a instancia pode voltar a operar (reconectar sem QR novo), e enquanto
-     * isso o `messageCache` ainda precisa de alguem varrendo o que expirou.
-     * `destroy()` e para quando a instancia deixa de existir de verdade - o
-     * `destroy`/`shutdown` do InstanceManager.
-     *
-     * Idempotente: chamar duas vezes nao faz mal.
-     */
-    destroy(): void {
-        if (this.manutencaoTimer) {
-            clearInterval(this.manutencaoTimer);
-            this.manutencaoTimer = null;
-        }
-        limparRuido(this.options.instanceId);
-    }
-
-    /**
-     * Extrai do stanza os pares LID/telefone que o Baileys expoe em
-     * `senderPn`/`participantPn`.
-     */
-    private learnLids(msg: WAMessage): void {
-        const key = msg.key as {
-            remoteJid?: string | null;
-            participant?: string | null;
-            senderLid?: string;
-            senderPn?: string;
-            participantLid?: string;
-            participantPn?: string;
-        };
-        this.lids.remember(key.senderLid ?? key.remoteJid, key.senderPn);
-        this.lids.remember(key.participantLid ?? key.participant, key.participantPn);
-    }
+    // ------------------------------------------------------------ sending
 
     private requireSocket(): WASocket {
         if (!this.socket || this.state !== 'CONNECTED') {
-            throw new BridgeCommandError(ErrorCode.NOT_CONNECTED, `Instancia ${this.options.instanceId} nao esta conectada`);
+            throw new BridgeCommandError(ErrorCode.NOT_CONNECTED, `instance ${this.options.instanceId} is not connected`);
         }
         return this.socket;
     }
 
-    private resolveQuoted(chatId: string, quotedMessageId: string | undefined): WAMessage | undefined {
+    /** A message seen in this chat, looked up under both of its addresses. */
+    private lookup(chatId: string, messageId: string): WAMessage | undefined {
+        return this.recent.message(chatId, messageId) ?? this.recent.message(this.lids.toLid(chatId), messageId);
+    }
+
+    private quoted(chatId: string, quotedMessageId: string | undefined): WAMessage | undefined {
         if (!quotedMessageId) return undefined;
-        const quoted = this.messageCache.get(chatId, quotedMessageId);
+        const quoted = this.lookup(chatId, quotedMessageId);
         if (!quoted) {
-            throw new BridgeCommandError(
-                ErrorCode.MEDIA_NOT_FOUND,
-                `Mensagem ${quotedMessageId} nao esta mais em cache para ser citada (janela de retencao expirada)`
-            );
+            throw new BridgeCommandError(ErrorCode.MEDIA_NOT_FOUND, `message ${quotedMessageId} is no longer available to quote`);
         }
         return quoted;
     }
 
-    private async send(to: string, content: AnyMessageContent, quotedMessageId?: string): Promise<string> {
+    async send(to: string, content: AnyMessageContent, quotedMessageId?: string): Promise<string> {
         const socket = this.requireSocket();
-        const quoted = this.resolveQuoted(to, quotedMessageId);
-        let timer: NodeJS.Timeout | undefined;
+        const jid = toJid(to);
+        const quoted = this.quoted(jid, quotedMessageId);
         try {
-            const timeoutPromise = new Promise<never>((_, reject) => {
-                timer = setTimeout(() => {
-                    reject(new BridgeCommandError(ErrorCode.TIMEOUT, 'Tempo limite esgotado ao enviar mensagem pelo Baileys (100s)'));
-                }, 100_000);
-                timer.unref?.();
-            });
-            const result = await Promise.race([
-                socket.sendMessage(to, content, { quoted }),
-                timeoutPromise
-            ]);
+            const result = await withTimeout(socket.sendMessage(jid, content, { quoted }), SEND_TIMEOUT_MS, 'send timed out');
             if (!result?.key.id) {
-                throw new BridgeCommandError(ErrorCode.SEND_FAILED, 'Baileys nao retornou um id de mensagem');
+                throw new BridgeCommandError(ErrorCode.SEND_FAILED, 'WhatsApp returned no message id');
             }
-            // O reenvio (retry receipt) e pedido para o que NOS mandamos, entao
-            // e esta copia que o `getMessage` vai procurar. Sem guardar aqui, o
-            // cache so teria mensagem recebida e o pedido de reenvio cairia no
-            // vazio — que e o caso que a funcao existe para atender.
-            this.messageCache.put(result);
+            void this.sent.put(result);
+            this.recent.touch(result);
             return result.key.id;
         } catch (err) {
-            if (err instanceof BridgeCommandError) throw err;
-            throw new BridgeCommandError(ErrorCode.SEND_FAILED, (err as Error).message);
-        } finally {
-            if (timer) clearTimeout(timer);
+            throw asCommandError(err, ErrorCode.SEND_FAILED);
         }
     }
 
-    sendText(to: string, payload: Content.SendTextPayload, quotedMessageId?: string): Promise<string> {
-        return this.send(to, Content.buildTextContent(payload), quotedMessageId);
-    }
-
-    sendImage(to: string, payload: Content.SendImagePayload, quotedMessageId?: string): Promise<string> {
-        return this.send(to, Content.buildImageContent(payload), quotedMessageId);
-    }
-
-    sendVideo(to: string, payload: Content.SendVideoPayload, quotedMessageId?: string): Promise<string> {
-        return this.send(to, Content.buildVideoContent(payload), quotedMessageId);
-    }
-
-    sendAudio(to: string, payload: Content.SendAudioPayload, quotedMessageId?: string): Promise<string> {
-        return this.send(to, Content.buildAudioContent(payload), quotedMessageId);
-    }
-
-    sendDocument(to: string, payload: Content.SendDocumentPayload, quotedMessageId?: string): Promise<string> {
-        return this.send(to, Content.buildDocumentContent(payload), quotedMessageId);
-    }
-
-    sendSticker(to: string, payload: Content.SendStickerPayload, quotedMessageId?: string): Promise<string> {
-        return this.send(to, Content.buildStickerContent(payload), quotedMessageId);
-    }
-
-    sendLocation(to: string, payload: Content.SendLocationPayload, quotedMessageId?: string): Promise<string> {
-        return this.send(to, Content.buildLocationContent(payload), quotedMessageId);
-    }
-
-    sendContact(to: string, payload: Content.SendContactPayload, quotedMessageId?: string): Promise<string> {
-        return this.send(to, Content.buildContactContent(payload), quotedMessageId);
-    }
-
-    /**
-     * Publishes our own presence in a chat ('composing' shows the recipient
-     * the "typing..." indicator, 'recording' the voice-note one, 'paused'
-     * clears it, 'available'/'unavailable' set online/offline).
-     *
-     * WhatsApp only routes a chat presence to clients that have subscribed to
-     * it, so `presenceSubscribe` is issued first - without it the indicator is
-     * silently dropped by the server for a chat the recipient is not already
-     * watching.
-     *
-     * Best-effort by design: presence is decoration around a send, never the
-     * point of it, so a failure here is reported but must not be able to abort
-     * the message that follows.
-     */
-    /**
-     * Publishes a presence ("composing", "paused", ...) into a conversation.
-     *
-     * The `available` step is not optional. Instances usually connect with
-     * `markOnlineOnConnect: false` so the number does not sit online all day,
-     * but WhatsApp will not relay a typing indicator from a client that has
-     * declared itself unavailable — the update is accepted and silently
-     * dropped. Announcing availability first is what makes "digitando..."
-     * actually appear on the recipient's screen; the caller can return to
-     * `unavailable` afterwards.
-     */
-    /**
-     * Publishes our own presence ("typing...", "online", "offline").
-     *
-     * Three things have to line up or the indicator silently never shows, with
-     * no error anywhere:
-     *
-     * 1. **The socket has to be online first.** With `markOnlineOnConnect:
-     *    false` — which is what we want, so the number is not online around
-     *    the clock — WhatsApp drops `composing` from an offline socket.
-     *
-     * 2. **The address has to match how the chat is identified.** A regular
-     *    message is resolved server-side whichever address you use, but a
-     *    `chatstate` is delivered verbatim: once a conversation has migrated
-     *    to LID, `composing` sent to `<phone>@s.whatsapp.net` never reaches
-     *    the open chat. So we address the LID whenever we know it.
-     *
-     * 3. **The account needs a profile name.** Baileys refuses to send
-     *    `available`/`unavailable` when `creds.me.name` is empty (it logs
-     *    "no name present, ignoring presence update request" and returns), and
-     *    without `available` the socket stays offline and item 1 bites. There
-     *    is nothing we can do about it from here except say so clearly.
-     */
-    async sendPresence(chatId: string, presence: WAPresence): Promise<void> {
+    async sendButtons(to: string, payload: Content.SendButtonsPayload, quotedMessageId?: string): Promise<string> {
         const socket = this.requireSocket();
-        const alvo = presence === 'available' || presence === 'unavailable'
-            ? chatId
-            : this.lids.toLid(chatId);
+        const jid = toJid(to);
+        const quoted = this.quoted(jid, quotedMessageId);
+        const userJid = socket.user?.id;
+        if (!userJid) {
+            throw new BridgeCommandError(ErrorCode.NOT_CONNECTED, 'account identity not known yet');
+        }
         try {
-            if (presence === 'composing' || presence === 'recording') {
-                if (!socket.user?.name) {
-                    this.logger.warn(
-                        { chatId },
-                        'a conta conectada nao tem nome de perfil: o Baileys ignora "available" e o '
-                        + '"digitando..." nao aparece. Defina um nome no perfil do WhatsApp.'
-                    );
-                }
-                await socket.sendPresenceUpdate('available');
-                await socket.presenceSubscribe(alvo);
+            const message = generateWAMessageFromContent(jid, Content.buttonsContent(payload), { userJid, quoted });
+            const id = message.key.id;
+            if (!id || !message.message) {
+                throw new BridgeCommandError(ErrorCode.SEND_FAILED, 'could not build the buttons message');
             }
-            await socket.sendPresenceUpdate(presence, alvo);
-            this.logger.debug(
-                { presence, alvo, traduzido: alvo !== chatId },
-                'presenca publicada'
+            await withTimeout(
+                socket.relayMessage(jid, message.message, { messageId: id, additionalNodes: [Content.BUTTONS_NODE] }),
+                SEND_TIMEOUT_MS,
+                'send timed out'
             );
+            void this.sent.put(message);
+            return id;
         } catch (err) {
-            throw new BridgeCommandError(ErrorCode.SEND_FAILED, (err as Error).message);
+            throw asCommandError(err, ErrorCode.SEND_FAILED);
         }
     }
 
-    /**
-     * Marca uma mensagem (ou a ultima recebida da conversa) como lida — o
-     * "azulzinho" no celular de quem escreveu.
-     *
-     * <p>Ate esta versao a SDK nunca chamava `readMessages`: a conta recebia
-     * milhares de mensagens sem marcar nenhuma, que nao e como um cliente de
-     * verdade se comporta.
-     *
-     * <p>`readMessages` exige a <b>chave completa</b> (`remoteJid`, `id`,
-     * `participant`, `fromMe`), nao so o id — e por isso que a mensagem precisa
-     * estar no {@link MessageCache}. Inventar uma chave a partir do id seria
-     * pior que falhar: o WhatsApp aceitaria o stanza e o azul nunca apareceria,
-     * sem erro nenhum para investigar.
-     *
-     * @param chatId conversa
-     * @param messageId mensagem especifica, ou `undefined` para a ultima recebida
-     */
-    async markRead(chatId: string, messageId?: string): Promise<void> {
+    async editMessage(target: Content.MessageTargetPayload, text: string): Promise<string> {
         const socket = this.requireSocket();
-        const id = messageId ?? this.messageCache.lastIncomingId(chatId);
-        if (!id) {
-            throw new BridgeCommandError(
-                ErrorCode.MEDIA_NOT_FOUND,
-                `Nenhuma mensagem recebida conhecida em ${chatId} para marcar como lida`
-            );
-        }
-        const mensagem = this.messageCache.get(chatId, id);
-        if (!mensagem) {
-            throw new BridgeCommandError(
-                ErrorCode.MEDIA_NOT_FOUND,
-                `Mensagem ${id} nao esta mais em cache; nao ha como montar a chave de leitura`
-            );
-        }
         try {
-            await socket.readMessages([mensagem.key]);
-            this.logger.debug({ chatId, messageId: id }, 'mensagem marcada como lida');
+            const result = await socket.sendMessage(toJid(target.chatId), Content.editContent(target, text));
+            if (result) void this.sent.put(result);
+            return result?.key.id ?? target.messageId;
         } catch (err) {
-            throw new BridgeCommandError(ErrorCode.SEND_FAILED, (err as Error).message);
+            throw asCommandError(err, ErrorCode.SEND_FAILED);
+        }
+    }
+
+    async deleteMessage(target: Content.MessageTargetPayload): Promise<void> {
+        const socket = this.requireSocket();
+        try {
+            await socket.sendMessage(toJid(target.chatId), Content.deleteContent(target));
+        } catch (err) {
+            throw asCommandError(err, ErrorCode.SEND_FAILED);
+        }
+    }
+
+    async sendReaction(target: Content.MessageTargetPayload, emoji: string): Promise<void> {
+        const socket = this.requireSocket();
+        try {
+            await socket.sendMessage(toJid(target.chatId), Content.reactionContent(target, emoji));
+        } catch (err) {
+            throw asCommandError(err, ErrorCode.SEND_FAILED);
         }
     }
 
     /**
-     * Assina a presenca de uma conversa, para o `presence.update` passar a
-     * entregar o "digitando..." e o online <b>do contato</b>.
-     *
-     * <p>Sem esta assinatura o WhatsApp nao envia presenca daquela conversa. Ate
-     * agora ela so acontecia como efeito colateral de publicar `composing`, o
-     * que tornava impossivel observar um contato sem antes escrever para ele.
-     *
-     * <p>Vai para o LID quando ele e conhecido, pelo mesmo motivo do
-     * {@link #sendPresence}: stanza de presenca nao e resolvido pelo servidor,
-     * chega literal no endereco que a gente mandar.
+     * Publishes our presence. "Typing" from a socket declared unavailable is
+     * dropped by WhatsApp without an error, so `available` goes first when the
+     * account is not already online; and chat states go to the LID when the
+     * chat moved to one, since they are delivered verbatim.
      */
+    async sendPresence(chatId: string | undefined, presence: WAPresence): Promise<void> {
+        const socket = this.requireSocket();
+        try {
+            if (presence === 'available' || presence === 'unavailable') {
+                await socket.sendPresenceUpdate(presence);
+                this.available = presence === 'available';
+                return;
+            }
+            if (!chatId) {
+                throw new BridgeCommandError(ErrorCode.INVALID_PAYLOAD, `chatId is required for presence '${presence}'`);
+            }
+            const target = this.lids.toLid(toJid(chatId));
+            if (!this.available) {
+                await socket.sendPresenceUpdate('available');
+                this.available = true;
+            }
+            if (!this.subscribedPresence.has(target)) {
+                await socket.presenceSubscribe(target);
+                this.subscribedPresence.set(target, true);
+            }
+            await socket.sendPresenceUpdate(presence, target);
+        } catch (err) {
+            throw asCommandError(err, ErrorCode.SEND_FAILED);
+        }
+    }
+
     async subscribePresence(chatId: string): Promise<void> {
         const socket = this.requireSocket();
-        const alvo = this.lids.toLid(chatId);
+        const target = this.lids.toLid(toJid(chatId));
+        if (this.subscribedPresence.has(target)) return;
         try {
-            await socket.presenceSubscribe(alvo);
-            this.logger.debug({ chatId, alvo, traduzido: alvo !== chatId }, 'presenca da conversa assinada');
+            await socket.presenceSubscribe(target);
+            this.subscribedPresence.set(target, true);
         } catch (err) {
-            throw new BridgeCommandError(ErrorCode.SEND_FAILED, (err as Error).message);
-        }
-    }
-
-    async sendReaction(payload: Content.SendReactionPayload): Promise<void> {
-        const socket = this.requireSocket();
-        try {
-            await socket.sendMessage(payload.chatId, Content.buildReactionContent(payload));
-        } catch (err) {
-            throw new BridgeCommandError(ErrorCode.SEND_FAILED, (err as Error).message);
+            throw asCommandError(err, ErrorCode.SEND_FAILED);
         }
     }
 
     /**
-     * Replaces the text of a message we already sent.
-     *
-     * The edit travels as a normal message carrying the original key, so the
-     * result has its own id - which we cache like any other outbound message,
-     * otherwise a retry receipt for it would find nothing.
-     *
-     * WhatsApp closes the edit window a few minutes after delivery and does
-     * not publish the exact limit. Past it the server simply refuses, and that
-     * refusal is what the caller sees: there is no way to ask in advance
-     * whether a given message is still editable.
+     * Read receipt (the blue ticks). A receipt needs the full key; it comes
+     * from the remembered keys, or is rebuilt from what the caller knows.
      */
-    async editMessage(payload: Content.EditMessagePayload): Promise<string> {
+    async markRead(chatId: string, messageId: string | undefined, participant: string | undefined): Promise<void> {
+        const socket = this.requireSocket();
+        const jid = toJid(chatId);
+        const lid = this.lids.toLid(jid);
+        let targets = [...this.recent.takeUnread(jid, messageId), ...(lid !== jid ? this.recent.takeUnread(lid, messageId) : [])];
+        if (targets.length === 0 && messageId) {
+            targets = [{ remoteJid: jid, id: messageId, participant }];
+        }
+        if (targets.length === 0) {
+            return;
+        }
+        try {
+            await socket.readMessages(targets.map((t) => ({ remoteJid: t.remoteJid, id: t.id, participant: t.participant, fromMe: false })));
+        } catch (err) {
+            throw asCommandError(err, ErrorCode.SEND_FAILED);
+        }
+    }
+
+    async rejectCall(callId: string, from: string): Promise<void> {
         const socket = this.requireSocket();
         try {
-            const result = await socket.sendMessage(payload.chatId, Content.buildEditContent(payload));
-            if (result) {
-                this.messageCache.put(result);
-            }
-            return result?.key.id ?? payload.messageId;
+            await socket.rejectCall(callId, from);
         } catch (err) {
-            throw new BridgeCommandError(ErrorCode.SEND_FAILED, (err as Error).message);
+            throw asCommandError(err, ErrorCode.SEND_FAILED);
         }
     }
 
-    /**
-     * Revokes a message for everyone ("apagar para todos").
-     *
-     * Deleting only on our side is deliberately not offered: the panel keeps
-     * its own history, so hiding a message locally is a job for the panel, not
-     * for WhatsApp.
-     */
-    async deleteMessage(payload: Content.MessageTargetPayload): Promise<void> {
+    /** Streams the media straight to a file: a video never sits whole in either heap. */
+    async downloadMedia(chatId: string, messageId: string, targetPath: string): Promise<{ path: string; mimetype: string; size: number }> {
         const socket = this.requireSocket();
+        const message = this.lookup(toJid(chatId), messageId);
+        if (!message) {
+            throw new BridgeCommandError(ErrorCode.MEDIA_NOT_FOUND, `message ${messageId} is no longer available for download`);
+        }
+        const temporary = targetPath + '.part';
         try {
-            await socket.sendMessage(payload.chatId, Content.buildDeleteContent(payload));
+            const stream = await downloadMediaMessage(message, 'stream', {}, {
+                logger: this.baileysLog as never,
+                reuploadRequest: socket.updateMediaMessage
+            });
+            await pipeline(stream, createWriteStream(temporary));
+            await rename(temporary, targetPath);
+            const size = (await stat(targetPath)).size;
+            return { path: targetPath, mimetype: mimetypeOf(message), size };
         } catch (err) {
-            throw new BridgeCommandError(ErrorCode.SEND_FAILED, (err as Error).message);
+            await unlink(temporary).catch(() => undefined);
+            throw asCommandError(err, ErrorCode.MEDIA_NOT_FOUND);
         }
     }
 
-    async downloadMedia(chatId: string, messageId: string): Promise<{ base64: string; mimetype: string }> {
-        this.requireSocket();
-        const cached = this.messageCache.get(chatId, messageId);
-        if (!cached) {
-            throw new BridgeCommandError(
-                ErrorCode.MEDIA_NOT_FOUND,
-                `Mensagem ${messageId} nao esta mais em cache (janela de retencao expirada)`
-            );
-        }
-        try {
-            const buffer = (await downloadMediaMessage(cached, 'buffer', {})) as Buffer;
-            const mimetype = this.extractMimetype(cached);
-            return { base64: buffer.toString('base64'), mimetype };
-        } catch (err) {
-            throw new BridgeCommandError(ErrorCode.MEDIA_NOT_FOUND, (err as Error).message);
-        }
-    }
+    // ------------------------------------------------------------ queries
 
-    private extractMimetype(msg: WAMessage): string {
-        const m = msg.message;
-        return (
-            m?.imageMessage?.mimetype ??
-            m?.videoMessage?.mimetype ??
-            m?.audioMessage?.mimetype ??
-            m?.documentMessage?.mimetype ??
-            m?.stickerMessage?.mimetype ??
-            'application/octet-stream'
-        );
-    }
-
-    /**
-     * Identity of the account this instance is logged in as.
-     *
-     * Baileys exposes it as `socket.user`, whose `id` carries the device
-     * suffix ("5562999...:12@s.whatsapp.net"); the suffix is stripped here so
-     * callers get the same JID shape every other command uses. `name` is the
-     * WhatsApp profile name, which may legitimately be absent.
-     */
     async getMe(): Promise<{ jid: string | null; phoneNumber: string | null; name: string | null }> {
-        const socket = this.requireSocket();
-        const user = socket.user;
-        if (!user?.id) {
-            return { jid: null, phoneNumber: null, name: null };
-        }
-        const digits = (user.id.split(':')[0] ?? '').split('@')[0]?.replace(/[^0-9]/g, '') ?? '';
+        const user = this.requireSocket().user;
+        const digits = (user?.id ?? '').split(':')[0]?.split('@')[0]?.replace(/\D/g, '') ?? '';
         return {
-            jid: digits.length > 0 ? `${digits}@s.whatsapp.net` : null,
-            phoneNumber: digits.length > 0 ? digits : null,
-            name: user.name ?? user.verifiedName ?? null
+            jid: digits ? `${digits}@s.whatsapp.net` : null,
+            phoneNumber: digits || null,
+            name: user?.name ?? user?.verifiedName ?? null
         };
     }
 
-    /**
-     * Se um numero tem conta no WhatsApp — <b>uma</b> consulta, nao tres.
-     *
-     * <p>E a alternativa barata ao {@link #getContact}, que dispara
-     * `onWhatsApp` + `profilePictureUrl` + `fetchStatus` por chamada. Quem so
-     * quer saber se vale a pena enviar (o caso comum antes de um disparo) nao
-     * tem por que ler a foto e o recado pessoal de alguem — e foi exatamente
-     * esse excesso que fez uma conta ser suspensa por coleta.
-     *
-     * <p>Com cache: uma resposta positiva vale 24h, uma negativa 6h. O prazo
-     * menor no negativo e para um numero recem-criado nao ficar marcado como
-     * inexistente o dia todo. O cache tambem e protecao: repetir a mesma
-     * pergunta sobre o mesmo numero e, por si so, um padrao de sondagem.
-     */
-    async checkNumber(numero: string): Promise<{ jid: string; exists: boolean; cached: boolean }> {
-        const agora = Date.now();
-        const emCache = this.numerosVerificados.get(numero);
-        if (emCache && agora < emCache.ateMs) {
-            return { jid: emCache.jid, exists: emCache.exists, cached: true };
-        }
+    /** One query, cached: asking about the same number again is itself a probing pattern. */
+    async checkNumber(number: string): Promise<{ jid: string; exists: boolean; cached: boolean }> {
+        const digits = number.replace(/\D/g, '');
+        const known = this.knownNumbers.get<string>(digits);
+        if (known) return { jid: known, exists: true, cached: true };
+        if (this.unknownNumbers.get<boolean>(digits)) return { jid: `${digits}@s.whatsapp.net`, exists: false, cached: true };
 
         const socket = this.requireSocket();
-        this.leituras.consumir('check_number');
-        const resultados = await socket.onWhatsApp(numero);
-        const primeiro = resultados?.[0];
-        const exists = primeiro?.exists != null && primeiro.exists !== false;
-        // O JID vem do proprio WhatsApp: e ele quem sabe se a conta e a com ou
-        // a sem o nono digito.
-        const jid = primeiro?.jid ?? numero;
-        this.lids.remember((primeiro as { lid?: string } | undefined)?.lid, jid);
-
-        this.guardarNumero(numero, {
-            jid,
-            exists,
-            ateMs: agora + (exists ? CACHE_NUMERO_OK_MS : CACHE_NUMERO_NAO_MS)
-        });
+        this.reads.consume('check_number');
+        const results = await socket.onWhatsApp(digits);
+        const first = results?.[0];
+        const exists = first?.exists != null && first.exists !== false;
+        // WhatsApp knows whether the account is the one with or without the extra ninth digit.
+        const jid = first?.jid ?? `${digits}@s.whatsapp.net`;
+        this.lids.remember((first as { lid?: string } | undefined)?.lid, jid);
+        if (exists) {
+            this.knownNumbers.set(digits, jid);
+        } else {
+            this.unknownNumbers.set(digits, true);
+        }
         return { jid, exists, cached: false };
     }
 
-    /** Guarda a resposta sobre um numero, mantendo o cache limitado. */
-    private guardarNumero(numero: string, entrada: { jid: string; exists: boolean; ateMs: number }): void {
-        if (this.numerosVerificados.size >= MAX_NUMEROS_EM_CACHE) {
-            const agora = Date.now();
-            for (const [chave, valor] of this.numerosVerificados) {
-                if (agora >= valor.ateMs) {
-                    this.numerosVerificados.delete(chave);
-                }
-            }
-            // Ainda cheio depois da faxina (campanha grande em poucas horas):
-            // esvaziar custa consultas repetidas; nao esvaziar custava memoria
-            // que so sobe num processo que fica meses no ar.
-            if (this.numerosVerificados.size >= MAX_NUMEROS_EM_CACHE) {
-                this.numerosVerificados.clear();
-                this.logger.info('cache de numeros verificados esvaziado para nao crescer sem limite');
-            }
-        }
-        this.numerosVerificados.set(numero, entrada);
-    }
-
-    async getContact(jid: string): Promise<{ jid: string; name: string | null; status: string | null; profilePictureUrl: string | null; onWhatsApp: boolean }> {
+    /** Three queries (existence, picture, status text): charged three times. Prefer checkNumber or getProfilePicture. */
+    async getContact(jid: string): Promise<{ jid: string; status: string | null; profilePictureUrl: string | null; onWhatsApp: boolean }> {
         const socket = this.requireSocket();
-        // Tres consultas num unico metodo: cobra as tres do orcamento.
-        this.leituras.consumir('get_contact');
-        this.leituras.consumir('get_contact');
-        this.leituras.consumir('get_contact');
-        const results = await socket.onWhatsApp(jid);
+        this.reads.consume('get_contact', 3);
+        const target = toJid(jid);
+        const results = await socket.onWhatsApp(target);
         const exists = results?.[0]?.exists != null && results[0].exists !== false;
-        const resolvedJid = results?.[0]?.jid ?? jid;
-        // A consulta devolve os dois enderecos do contato: aproveita para
-        // aprender o par antes mesmo de ele mandar a primeira mensagem.
-        this.lids.remember((results?.[0] as { lid?: string } | undefined)?.lid, resolvedJid);
-
-        let profilePictureUrl: string | null = null;
-        try {
-            profilePictureUrl = (await socket.profilePictureUrl(resolvedJid, 'image')) ?? null;
-        } catch {
-            profilePictureUrl = null;
-        }
-
-        let status: string | null = null;
-        try {
-            const statusResult = await socket.fetchStatus(resolvedJid);
-            const first = statusResult?.[0] as unknown as { status?: { status?: string } } | undefined;
-            status = first?.status?.status ?? null;
-        } catch {
-            status = null;
-        }
-
-        return { jid: resolvedJid, name: null, status, profilePictureUrl, onWhatsApp: exists };
+        const resolved = results?.[0]?.jid ?? target;
+        const picture = await socket.profilePictureUrl(resolved, 'image').catch(() => undefined);
+        const statusResult = await socket.fetchStatus(resolved).catch(() => undefined);
+        const status = (statusResult?.[0] as unknown as { status?: { status?: string } } | undefined)?.status?.status ?? null;
+        return { jid: resolved, status, profilePictureUrl: picture ?? null, onWhatsApp: exists };
     }
 
-    /**
-     * Apenas a URL da foto de perfil - uma consulta, e so o dado que a tela usa.
-     *
-     * Existe para o painel parar de chamar `getContact()` quando tudo o que ele
-     * quer e o avatar. Aquele metodo dispara TRES consultas por contato:
-     * `onWhatsApp` (o numero existe?), `profilePictureUrl` (a foto) e
-     * `fetchStatus` (o "recado" pessoal da pessoa). A tela de conversas pede o
-     * avatar de cada contato da barra lateral, entao abrir o painel virava uma
-     * varredura da agenda inteira - sondagem de existencia de numero e leitura
-     * de recado pessoal de gente com quem o operador nem estava falando, dois
-     * dados que o painel nunca exibiu. E leitura em massa de informacao de
-     * terceiro, e e o comportamento que faz uma conta ser suspensa.
-     *
-     * `null` quando o contato nao tem foto ou nao a mostra para nos - o caso
-     * comum, e por isso nao e erro.
-     */
     async getProfilePicture(jid: string): Promise<{ jid: string; profilePictureUrl: string | null }> {
         const socket = this.requireSocket();
-        this.leituras.consumir('get_profile_picture');
-        try {
-            const url = (await socket.profilePictureUrl(jid, 'image')) ?? null;
-            return { jid, profilePictureUrl: url };
-        } catch {
-            return { jid, profilePictureUrl: null };
-        }
+        this.reads.consume('get_profile_picture');
+        const target = toJid(jid);
+        const url = await socket.profilePictureUrl(target, 'image').catch(() => undefined);
+        return { jid: target, profilePictureUrl: url ?? null };
     }
 
-    /**
-     * Metadados de um grupo, com cache curto.
-     *
-     * <p>O cache serve a dois clientes: quem chama isto direto e o proprio
-     * Baileys, que consulta o metadata do grupo <b>a cada envio</b> para saber
-     * para quem cifrar. Sem o cache, mandar tres mensagens seguidas ao mesmo
-     * grupo custava tres consultas — e cada uma traz numero e nome de TODOS os
-     * participantes.
-     */
     async getGroupMetadata(jid: string): Promise<GroupMetadata> {
-        const agora = Date.now();
-        const emCache = this.gruposEmCache.get(jid);
-        if (emCache && agora < emCache.ateMs) {
-            return emCache.metadata;
-        }
-        this.leituras.consumir('get_group_metadata');
-        const metadata = await this.requireSocket().groupMetadata(jid);
-        this.guardarGrupo(jid, metadata);
+        const cached = this.groups.get<GroupMetadata>(jid);
+        if (cached) return cached;
+        const socket = this.requireSocket();
+        this.reads.consume('get_group_metadata');
+        const metadata = await socket.groupMetadata(jid);
+        this.groups.set(jid, metadata);
         return metadata;
     }
 
-    private guardarGrupo(jid: string, metadata: GroupMetadata): void {
-        if (this.gruposEmCache.size >= MAX_GRUPOS_EM_CACHE) {
-            const maisAntigo = this.gruposEmCache.keys().next().value;
-            if (maisAntigo !== undefined) {
-                this.gruposEmCache.delete(maisAntigo);
-            }
-        }
-        this.gruposEmCache.set(jid, { metadata, ateMs: Date.now() + CACHE_GRUPO_MS });
-    }
-
     async listGroups(): Promise<GroupMetadata[]> {
-        // Uma so chamada, mas ela traz TODOS os grupos com TODOS os
-        // participantes: pesa como varias consultas, e e por isso que custa
-        // caro no orcamento.
-        this.leituras.consumir('list_groups');
-        const map = await this.requireSocket().groupFetchAllParticipating();
-        const grupos = Object.values(map);
-        // Ja que vieram, aproveita: sem isto, o primeiro envio para cada um
-        // desses grupos pediria o metadata de novo.
-        for (const g of grupos) {
-            this.guardarGrupo(g.id, g);
+        const socket = this.requireSocket();
+        // One call, but it returns every group with every participant.
+        this.reads.consume('list_groups', 3);
+        const groups = Object.values(await socket.groupFetchAllParticipating());
+        for (const group of groups) {
+            this.groups.set(group.id, group);
         }
-        return grupos;
+        return groups;
     }
 
     createGroup(subject: string, participants: string[]): Promise<GroupMetadata> {
-        return this.requireSocket().groupCreate(subject, participants);
+        return this.requireSocket().groupCreate(subject, participants.map(toJid));
     }
 
-    updateGroupParticipants(
-        groupJid: string,
-        participants: string[],
-        action: 'add' | 'remove' | 'promote' | 'demote'
-    ): Promise<unknown> {
-        return this.requireSocket().groupParticipantsUpdate(groupJid, participants, action);
+    updateGroupParticipants(groupJid: string, participants: string[], action: 'add' | 'remove' | 'promote' | 'demote') {
+        this.groups.del(groupJid);
+        return this.requireSocket().groupParticipantsUpdate(groupJid, participants.map(toJid), action);
     }
 
     updateGroupSubject(groupJid: string, subject: string): Promise<void> {
+        this.groups.del(groupJid);
         return this.requireSocket().groupUpdateSubject(groupJid, subject);
     }
 
     updateGroupDescription(groupJid: string, description: string): Promise<void> {
+        this.groups.del(groupJid);
         return this.requireSocket().groupUpdateDescription(groupJid, description);
     }
 
     leaveGroup(groupJid: string): Promise<void> {
+        this.groups.del(groupJid);
         return this.requireSocket().groupLeave(groupJid);
     }
 
     getGroupInviteCode(groupJid: string): Promise<string | undefined> {
         return this.requireSocket().groupInviteCode(groupJid);
     }
+
+    // ------------------------------------------------------------ contacts, groups, profile, privacy
+
+    /** Several numbers in one query; each uncached number is still charged to the read budget. */
+    async checkNumbers(numbers: string[]): Promise<Array<{ number: string; jid: string; exists: boolean; cached: boolean }>> {
+        const digits = [...new Set(numbers.map((n) => n.replace(/\D/g, '')).filter((n) => n.length > 0))];
+        if (digits.length === 0 || digits.length > 50) {
+            throw new BridgeCommandError(ErrorCode.INVALID_PAYLOAD, 'between 1 and 50 numbers per call');
+        }
+        const answers = new Map<string, { jid: string; exists: boolean; cached: boolean }>();
+        const unknown: string[] = [];
+        for (const number of digits) {
+            const known = this.knownNumbers.get<string>(number);
+            if (known) answers.set(number, { jid: known, exists: true, cached: true });
+            else if (this.unknownNumbers.get<boolean>(number)) answers.set(number, { jid: `${number}@s.whatsapp.net`, exists: false, cached: true });
+            else unknown.push(number);
+        }
+        if (unknown.length > 0) {
+            const socket = this.requireSocket();
+            this.reads.consume('check_numbers', unknown.length);
+            const results = (await socket.onWhatsApp(...unknown)) ?? [];
+            for (const number of unknown) {
+                const found = results.find((r) => (r.jid ?? '').startsWith(number) && r.exists);
+                if (found?.jid) {
+                    this.knownNumbers.set(number, found.jid);
+                    this.lids.remember((found as { lid?: string }).lid, found.jid);
+                    answers.set(number, { jid: found.jid, exists: true, cached: false });
+                } else {
+                    this.unknownNumbers.set(number, true);
+                    answers.set(number, { jid: `${number}@s.whatsapp.net`, exists: false, cached: false });
+                }
+            }
+        }
+        return digits.map((number) => ({ number, ...answers.get(number)! }));
+    }
+
+    /** Whether a group exists and whether this account is in it, from one metadata query. */
+    async groupExists(groupJid: string): Promise<{ groupJid: string; exists: boolean; isMember: boolean; subject: string | null }> {
+        try {
+            const metadata = await this.getGroupMetadata(groupJid);
+            const me = this.ownIds();
+            const isMember = metadata.participants.some((p) => me.has(jidNormalizedUser(p.id)) || (p.lid !== undefined && me.has(jidNormalizedUser(p.lid))));
+            return { groupJid, exists: true, isMember, subject: metadata.subject ?? null };
+        } catch (err) {
+            const status = (err as Boom).output?.statusCode;
+            if (status === 404 || status === 406) return { groupJid, exists: false, isMember: false, subject: null };
+            if (status === 401 || status === 403) return { groupJid, exists: true, isMember: false, subject: null };
+            throw err;
+        }
+    }
+
+    async getInviteInfo(code: string): Promise<GroupMetadata> {
+        const socket = this.requireSocket();
+        this.reads.consume('get_invite_info');
+        return socket.groupGetInviteInfo(inviteCodeOf(code));
+    }
+
+    async joinGroup(code: string): Promise<string | null> {
+        return (await this.requireSocket().groupAcceptInvite(inviteCodeOf(code))) ?? null;
+    }
+
+    async revokeInviteCode(groupJid: string): Promise<string | null> {
+        return (await this.requireSocket().groupRevokeInvite(groupJid)) ?? null;
+    }
+
+    async setGroupSetting(groupJid: string, setting: 'announcement' | 'not_announcement' | 'locked' | 'unlocked'): Promise<void> {
+        this.groups.del(groupJid);
+        await this.requireSocket().groupSettingUpdate(groupJid, setting);
+    }
+
+    /** Disappearing messages: 0 turns them off; WhatsApp accepts 86400, 604800 and 7776000 seconds. */
+    async setDisappearing(chatId: string, seconds: number): Promise<void> {
+        const socket = this.requireSocket();
+        const jid = toJid(chatId);
+        if (jid.endsWith('@g.us')) {
+            await socket.groupToggleEphemeral(jid, seconds);
+        } else {
+            await socket.sendMessage(jid, { disappearingMessagesInChat: seconds > 0 ? seconds : false });
+        }
+    }
+
+    async updateProfilePicture(jid: string | undefined, filePath: string): Promise<void> {
+        const socket = this.requireSocket();
+        await socket.updateProfilePicture(jid ? toJid(jid) : jidNormalizedUser(socket.user!.id), { url: filePath });
+    }
+
+    async removeProfilePicture(jid: string | undefined): Promise<void> {
+        const socket = this.requireSocket();
+        await socket.removeProfilePicture(jid ? toJid(jid) : jidNormalizedUser(socket.user!.id));
+    }
+
+    async updateProfileName(name: string): Promise<void> {
+        await this.requireSocket().updateProfileName(name);
+    }
+
+    async updateProfileStatus(status: string): Promise<void> {
+        await this.requireSocket().updateProfileStatus(status);
+    }
+
+    async setBlocked(jid: string, blocked: boolean): Promise<void> {
+        await this.requireSocket().updateBlockStatus(toJid(jid), blocked ? 'block' : 'unblock');
+    }
+
+    async getBlocklist(): Promise<string[]> {
+        const socket = this.requireSocket();
+        this.reads.consume('get_blocklist');
+        return ((await socket.fetchBlocklist()) ?? []).filter((jid): jid is string => typeof jid === 'string').map((jid) => this.lids.resolve(jid));
+    }
+
+    async getStatus(jid: string): Promise<{ jid: string; status: string | null; setAt: number | null }> {
+        const socket = this.requireSocket();
+        this.reads.consume('get_status');
+        const target = toJid(jid);
+        const result = (await socket.fetchStatus(target))?.[0] as { status?: { status?: string; setAt?: Date } } | undefined;
+        const setAt = result?.status?.setAt;
+        return { jid: target, status: result?.status?.status ?? null, setAt: setAt ? Math.floor(new Date(setAt).getTime() / 1000) : null };
+    }
+
+    async getBusinessProfile(jid: string): Promise<Record<string, unknown> | null> {
+        const socket = this.requireSocket();
+        this.reads.consume('get_business_profile');
+        const profile = await socket.getBusinessProfile(toJid(jid));
+        return (profile as Record<string, unknown> | undefined) ?? null;
+    }
+
+    async getPrivacySettings(): Promise<Record<string, string>> {
+        const socket = this.requireSocket();
+        this.reads.consume('get_privacy_settings');
+        return (await socket.fetchPrivacySettings(true)) as Record<string, string>;
+    }
+
+    async updatePrivacy(setting: PrivacySetting, value: string): Promise<void> {
+        const allowed = PRIVACY_VALUES[setting];
+        if (!allowed || !allowed.has(value)) {
+            throw new BridgeCommandError(ErrorCode.INVALID_PAYLOAD, `invalid value '${value}' for privacy setting '${setting}'`);
+        }
+        const socket = this.requireSocket();
+        const v = value as never;
+        switch (setting) {
+            case 'last_seen':
+                return socket.updateLastSeenPrivacy(v);
+            case 'online':
+                return socket.updateOnlinePrivacy(v);
+            case 'profile_picture':
+                return socket.updateProfilePicturePrivacy(v);
+            case 'status':
+                return socket.updateStatusPrivacy(v);
+            case 'read_receipts':
+                return socket.updateReadReceiptsPrivacy(v);
+            case 'groups_add':
+                return socket.updateGroupsAddPrivacy(v);
+        }
+    }
+
+    /** Archive and unread need the newest message of the chat as their anchor, as the phone does. */
+    async modifyChat(chatId: string, change: ChatChange, muteUntilMs?: number): Promise<void> {
+        const socket = this.requireSocket();
+        const jid = toJid(chatId);
+        const anchor = (): Array<{ key: proto.IMessageKey; messageTimestamp: number }> => {
+            const last = this.recent.lastMessage(jid) ?? this.recent.lastMessage(this.lids.toLid(jid));
+            if (!last) {
+                throw new BridgeCommandError(ErrorCode.MEDIA_NOT_FOUND, `no recent message in ${chatId} to anchor '${change}'`);
+            }
+            return [last];
+        };
+        switch (change) {
+            case 'mute':
+                return socket.chatModify({ mute: muteUntilMs ?? -1 }, jid);
+            case 'unmute':
+                return socket.chatModify({ mute: null }, jid);
+            case 'pin':
+                return socket.chatModify({ pin: true }, jid);
+            case 'unpin':
+                return socket.chatModify({ pin: false }, jid);
+            case 'archive':
+                return socket.chatModify({ archive: true, lastMessages: anchor() }, jid);
+            case 'unarchive':
+                return socket.chatModify({ archive: false, lastMessages: anchor() }, jid);
+            case 'mark_unread':
+                return socket.chatModify({ markRead: false, lastMessages: anchor() }, jid);
+        }
+    }
+
+    async starMessage(target: Content.MessageTargetPayload, star: boolean): Promise<void> {
+        await this.requireSocket().chatModify(
+            { star: { messages: [{ id: target.messageId, fromMe: target.fromMe }], star } },
+            toJid(target.chatId)
+        );
+    }
+
+    /** Forwards a message this bridge still has: one received recently, or one this account sent. */
+    async forwardMessage(chatId: string, messageId: string, to: string): Promise<string> {
+        const jid = toJid(chatId);
+        const message = this.lookup(jid, messageId) ?? (await this.sent.full(jid, messageId)) ?? (await this.sent.full(this.lids.toLid(jid), messageId));
+        if (!message) {
+            throw new BridgeCommandError(ErrorCode.MEDIA_NOT_FOUND, `message ${messageId} is no longer available to forward`);
+        }
+        return this.send(to, { forward: message });
+    }
+
+    async sendPoll(to: string, name: string, options: string[], selectableCount: number): Promise<string> {
+        const values = [...new Set(options.map((o) => o.trim()).filter((o) => o.length > 0))];
+        if (!name.trim() || values.length < 2 || values.length > 12) {
+            throw new BridgeCommandError(ErrorCode.INVALID_PAYLOAD, 'a poll needs a question and 2 to 12 distinct options');
+        }
+        const count = Math.max(0, Math.min(selectableCount, values.length));
+        return this.send(to, { poll: { name, values, selectableCount: count } });
+    }
+
+    /**
+     * Baileys leaves poll votes encrypted (its decryption is disabled upstream). A vote is
+     * decrypted here with the secret of our own poll, read back from the sent-message store, and
+     * reported with the option names instead of their hashes.
+     */
+    private async onPollVote(message: WAMessage): Promise<void> {
+        const update = normalizeMessageContent(message.message)?.pollUpdateMessage;
+        const creationKey = update?.pollCreationMessageKey;
+        if (!update?.vote || !creationKey?.id) return;
+        const chat = creationKey.remoteJid ?? message.key.remoteJid ?? '';
+        const poll = (await this.sent.full(chat, creationKey.id))
+            ?? (await this.sent.full(this.lids.toLid(chat), creationKey.id))
+            ?? (await this.sent.full(this.lids.resolve(chat), creationKey.id));
+        if (!poll) return;
+        const content = normalizeMessageContent(poll.message);
+        const secret = content?.messageContextInfo?.messageSecret ?? poll.message?.messageContextInfo?.messageSecret;
+        const creation = content?.pollCreationMessage ?? content?.pollCreationMessageV2 ?? content?.pollCreationMessageV3;
+        if (!secret || !creation?.options) return;
+
+        const key = message.key as WAMessage['key'] & { participantAlt?: string; remoteJidAlt?: string };
+        const voters = unique([key.participant, key.participantAlt, key.remoteJid, key.remoteJidAlt]);
+        let vote: proto.Message.PollVoteMessage | null = null;
+        for (const creator of this.ownIds()) {
+            for (const voter of voters) {
+                try {
+                    vote = decryptPollVote(update.vote, { pollEncKey: secret, pollCreatorJid: creator, pollMsgId: creationKey.id, voterJid: voter });
+                    break;
+                } catch {
+                    // wrong identity pair: try the next address form
+                }
+            }
+            if (vote) break;
+        }
+        if (!vote) {
+            this.logger.debug({ pollId: creationKey.id }, 'could not decrypt a poll vote');
+            return;
+        }
+        const byHash = new Map(creation.options.map((o) => [createHash('sha256').update(o.optionName ?? '').digest('hex'), o.optionName ?? '']));
+        const selected = (vote.selectedOptions ?? []).map((h) => byHash.get(Buffer.from(h).toString('hex'))).filter((o): o is string => o !== undefined);
+        this.callbacks.onPollVote({
+            chatId: this.lids.resolve(chat),
+            pollMessageId: creationKey.id,
+            voterId: this.lids.resolve(voters[0] ?? ''),
+            selectedOptions: selected,
+            timestamp: timestampOf(message)
+        });
+    }
+
+    /** Every address this account answers to (phone number and LID), normalised. */
+    private ownIds(): Set<string> {
+        const user = this.socket?.user as { id?: string; lid?: string } | undefined;
+        return new Set(unique([user?.id, user?.lid]).map((jid) => jidNormalizedUser(jid)));
+    }
+
+    private learnLids(message: WAMessage): void {
+        // v7 carries the other address form in remoteJidAlt/participantAlt; older stanzas in senderPn/participantPn.
+        const key = message.key as {
+            remoteJid?: string | null;
+            remoteJidAlt?: string;
+            participant?: string | null;
+            participantAlt?: string;
+            senderPn?: string;
+            participantPn?: string;
+        };
+        this.lids.remember(key.remoteJid, key.remoteJidAlt ?? key.senderPn);
+        this.lids.remember(key.participant, key.participantAlt ?? key.participantPn);
+    }
 }
 
-export type { AbstractMessage, BaileysContact };
+function unique(values: Array<string | null | undefined>): string[] {
+    return [...new Set(values.filter((v): v is string => typeof v === 'string' && v.length > 0))];
+}
+
+/** Accepts the bare code or the whole chat.whatsapp.com link. */
+function inviteCodeOf(value: string): string {
+    const code = value.trim().replace(/^https?:\/\/chat\.whatsapp\.com\//i, '').split(/[/?#]/)[0] ?? '';
+    if (!/^[A-Za-z0-9]{10,40}$/.test(code)) {
+        throw new BridgeCommandError(ErrorCode.INVALID_PAYLOAD, 'not a group invite code or link');
+    }
+    return code;
+}
+
+const STATUS_NAMES: Record<number, string> = {
+    0: 'ERROR',
+    1: 'PENDING',
+    2: 'SERVER_ACK',
+    3: 'DELIVERED',
+    4: 'READ',
+    5: 'PLAYED'
+};
+
+/** Status updates, channels and broadcast lists: content the application never uses. */
+function isIgnoredAddress(jid: string | undefined | null): boolean {
+    if (!jid) return false;
+    const server = jid.slice(jid.indexOf('@') + 1);
+    return server === 'broadcast' || server === 'newsletter';
+}
+
+/** Accepts a bare phone number as well as a JID. */
+export function toJid(value: string): string {
+    if (value.includes('@')) return value;
+    const digits = value.replace(/\D/g, '');
+    if (digits.length === 0) {
+        throw new BridgeCommandError(ErrorCode.INVALID_PAYLOAD, `not a phone number or JID: ${value}`);
+    }
+    return `${digits}@s.whatsapp.net`;
+}
+
+function timestampOf(message: WAMessage): number {
+    const raw = message.messageTimestamp;
+    if (typeof raw === 'number') return raw;
+    return raw ? Number(raw.toString()) : Math.floor(Date.now() / 1000);
+}
+
+function mimetypeOf(message: WAMessage): string {
+    const content = message.message;
+    return (
+        content?.imageMessage?.mimetype ??
+        content?.videoMessage?.mimetype ??
+        content?.audioMessage?.mimetype ??
+        content?.documentMessage?.mimetype ??
+        content?.stickerMessage?.mimetype ??
+        'application/octet-stream'
+    );
+}
+
+function jitter(maxMs: number): number {
+    return Math.floor(Math.random() * maxMs);
+}
+
+/** Masks a phone number down to its last four digits: logs end up in aggregators. */
+function mask(phone: string): string {
+    return phone.length <= 4 ? '*'.repeat(phone.length) : '*'.repeat(phone.length - 4) + phone.slice(-4);
+}
+
+function asCommandError(err: unknown, code: (typeof ErrorCode)[keyof typeof ErrorCode]): BridgeCommandError {
+    return err instanceof BridgeCommandError ? err : new BridgeCommandError(code, (err as Error)?.message ?? String(err));
+}
+
+export async function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
+    const expiry = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new BridgeCommandError(ErrorCode.TIMEOUT, message)), ms);
+        timer.unref?.();
+    });
+    try {
+        return await Promise.race([promise, expiry]);
+    } finally {
+        if (timer) clearTimeout(timer);
+    }
+}

@@ -1,0 +1,8 @@
+# JitPack build of com.github.LuanVictorGit.AngatuWhatsappSDK:angatu-whatsapp:<commit>.
+# The SDK targets Java 25, which JitPack does not offer by name, so SDKMAN installs it.
+# The bridge bundle is committed in sdk/src/main/resources/bridge, so no Node.js is needed here.
+before_install:
+  - sdk install java 25.0.1-tem
+  - sdk use java 25.0.1-tem
+install:
+  - mvn -B -q install -DskipTests -Dskip.bridge.build

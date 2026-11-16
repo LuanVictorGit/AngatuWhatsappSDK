@@ -1,11 +1,11 @@
 {
   "name": "@angatusistemas/whatsapp-bridge",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
-  "description": "Bridge Node.js que expoe o Baileys para o Angatu WhatsApp SDK (Java) via WebSocket local. Nao e publicado no npm; e compilado e embutido como recurso dentro do JAR do SDK.",
+  "description": "Node.js bridge that exposes Baileys to the Angatu WhatsApp SDK (Java) over a local WebSocket. Not published to npm: bundled and shipped inside the SDK jar.",
   "type": "module",
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.0.0"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
@@ -13,7 +13,7 @@
     "dev": "node --import tsx src/index.ts"
   },
   "dependencies": {
-    "baileys": "6.7.24",
+    "baileys": "7.0.0-rc14",
     "pino": "9.6.0",
     "ws": "8.18.0"
   },
@@ -23,8 +23,5 @@
     "esbuild": "0.24.2",
     "tsx": "4.19.2",
     "typescript": "5.7.2"
-  },
-  "overrides": {
-    "libsignal": "npm:libsignal@6.0.0"
   }
 }

@@ -1,10 +1,6 @@
 import type { ErrorPayload } from './messages.js';
 
-/**
- * Stable, machine-readable error codes. These are mirrored one-to-one by
- * com.angatusistemas.whatsapp.exception on the Java side - keep both lists
- * in sync when adding a new code.
- */
+/** Machine-readable error codes, mirrored one to one by BridgeErrorCode on the Java side. */
 export const ErrorCode = {
     INVALID_TOKEN: 'INVALID_TOKEN',
     PROTOCOL_VERSION_MISMATCH: 'PROTOCOL_VERSION_MISMATCH',
@@ -17,6 +13,7 @@ export const ErrorCode = {
     AUTH_FAILED: 'AUTH_FAILED',
     SEND_FAILED: 'SEND_FAILED',
     TIMEOUT: 'TIMEOUT',
+    RATE_LIMITED: 'RATE_LIMITED',
     UNSUPPORTED_FEATURE: 'UNSUPPORTED_FEATURE',
     MEDIA_NOT_FOUND: 'MEDIA_NOT_FOUND',
     INVALID_PAYLOAD: 'INVALID_PAYLOAD',
@@ -35,15 +32,11 @@ export class BridgeCommandError extends Error {
         this.code = code;
         this.details = details;
     }
-
-    toPayload(): ErrorPayload {
-        return { code: this.code, message: this.message, details: this.details };
-    }
 }
 
 export function toErrorPayload(err: unknown): ErrorPayload {
     if (err instanceof BridgeCommandError) {
-        return err.toPayload();
+        return { code: err.code, message: err.message, details: err.details };
     }
     if (err instanceof Error) {
         return { code: ErrorCode.INTERNAL_ERROR, message: err.message };

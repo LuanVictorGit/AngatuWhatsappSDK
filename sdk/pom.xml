@@ -7,7 +7,7 @@
     <parent>
         <groupId>com.angatusistemas</groupId>
         <artifactId>angatu-whatsapp-parent</artifactId>
-        <version>1.0.0-SNAPSHOT</version>
+        <version>2.0.0-SNAPSHOT</version>
         <relativePath>../pom.xml</relativePath>
     </parent>
 
@@ -16,41 +16,47 @@
 
     <name>Angatu WhatsApp SDK</name>
     <description>
-        API Java para integracao com WhatsApp via Baileys. Esconde por completo o Node.js/Baileys
-        do consumidor: gerencia o runtime Node, o processo Bridge e a comunicacao WebSocket local.
+        API Java para WhatsApp. Gerencia o runtime Node.js, o processo bridge com o Baileys e a
+        comunicacao WebSocket local; a fila de interacoes fica em SQLite pela AngatuLibraries.
     </description>
 
     <properties>
         <bridge.dir>${project.basedir}/../bridge</bridge.dir>
-        <!-- Set -Dskip.bridge.build=true to reuse whatever is already in
-             src/main/resources/bridge/ (e.g. CI stage that built it once). -->
-        <skip.bridge.build>false</skip.bridge.build>
     </properties>
 
     <dependencies>
+        <!-- Persistence (Saveable), JSON (GsonAPI) and logging (Console). -->
         <dependency>
-            <groupId>org.slf4j</groupId>
-            <artifactId>slf4j-api</artifactId>
+            <groupId>com.github.LuanVictorGit</groupId>
+            <artifactId>AngatuLibraries</artifactId>
+        </dependency>
+        <!-- The persistence row of AngatuLibraries: its dependencies are optional, so they are declared here. -->
+        <dependency>
+            <groupId>org.xerial</groupId>
+            <artifactId>sqlite-jdbc</artifactId>
         </dependency>
         <dependency>
-            <groupId>com.fasterxml.jackson.core</groupId>
-            <artifactId>jackson-databind</artifactId>
+            <groupId>com.zaxxer</groupId>
+            <artifactId>HikariCP</artifactId>
         </dependency>
+        <dependency>
+            <groupId>com.google.code.gson</groupId>
+            <artifactId>gson</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <!-- QR code PNG rendering, no external service. -->
         <dependency>
             <groupId>com.google.zxing</groupId>
             <artifactId>core</artifactId>
         </dependency>
         <!--
-            Java-WebSocket (classic blocking-socket client, no NIO Selector) rather
-            than the JDK-builtin java.net.http.WebSocket: constructing the built-in
-            client requires opening a java.nio.channels.Selector, whose internal
-            wakeup mechanism opens a loopback Unix-domain-socket pipe - which fails
-            with "Unable to establish loopback connection" in some restricted/
-            sandboxed Windows environments (reproduced during development on this
-            project, even after forcing the legacy WindowsSelectorProvider). Since
-            this client carries every byte of Java<->Bridge traffic, that risk is not
-            worth taking for a dependency that was already pinned in this project
-            anyway (previously test-scope only, for the mock bridge server).
+            Blocking-socket WebSocket client. The JDK's java.net.http.WebSocket opens an NIO Selector,
+            whose loopback wake-up pipe fails in some restricted Windows environments; this client
+            carries every byte between Java and the bridge, so that risk is not taken.
         -->
         <dependency>
             <groupId>org.java-websocket</groupId>
@@ -62,21 +68,6 @@
             <artifactId>junit-jupiter</artifactId>
             <scope>test</scope>
         </dependency>
-        <dependency>
-            <groupId>org.mockito</groupId>
-            <artifactId>mockito-core</artifactId>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>org.mockito</groupId>
-            <artifactId>mockito-junit-jupiter</artifactId>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>ch.qos.logback</groupId>
-            <artifactId>logback-classic</artifactId>
-            <scope>test</scope>
-        </dependency>
     </dependencies>
 
     <build>
@@ -85,22 +76,10 @@
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
                 <configuration>
-                    <excludes>
-                        <exclude>**/*IT.java</exclude>
-                    </excludes>
+                    <systemPropertyVariables>
+                        <angatu.db>${project.build.directory}/test-database.db</angatu.db>
+                    </systemPropertyVariables>
                 </configuration>
-            </plugin>
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-failsafe-plugin</artifactId>
-                <executions>
-                    <execution>
-                        <goals>
-                            <goal>integration-test</goal>
-                            <goal>verify</goal>
-                        </goals>
-                    </execution>
-                </executions>
             </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
@@ -111,6 +90,7 @@
                             <Implementation-Title>${project.name}</Implementation-Title>
                             <Implementation-Version>${project.version}</Implementation-Version>
                             <Automatic-Module-Name>com.angatusistemas.whatsapp</Automatic-Module-Name>
+                            <Enable-Native-Access>ALL-UNNAMED</Enable-Native-Access>
                         </manifestEntries>
                     </archive>
                 </configuration>
@@ -120,16 +100,10 @@
 
     <profiles>
         <!--
-            Builds the Node.js bridge (npm install + esbuild bundle) as part of
-            the normal Maven lifecycle, so "mvn clean install" from a fresh
-            clone produces a fully self-contained sdk jar with no manual npm
-            step. This requires Node.js/npm on the BUILD machine only - the
-            resulting jar does not require them at runtime for consumers (see
-            NodeRuntimeLocator/NodeRuntimeDownloader).
-
-            Split into two OS-specific profiles because Windows resolves the
-            "npm" command as npm.cmd, which the JVM's process launcher (unlike
-            a real shell) does not resolve on its own.
+            Rebuilds the Node bridge (npm install + esbuild) into src/main/resources/bridge/ whenever npm
+            is on the build machine. The bundle is also committed, so a build without Node (JitPack,
+            -Dskip.bridge.build) packages the committed one. Consumers never need Node at build time.
+            Two profiles because Windows resolves npm as npm.cmd, which a JVM process launch does not.
         -->
         <profile>
             <id>build-bridge-windows</id>
@@ -137,6 +111,9 @@
                 <os><family>windows</family></os>
                 <property><name>!skip.bridge.build</name></property>
             </activation>
+            <properties>
+                <npm.executable>npm.cmd</npm.executable>
+            </properties>
             <build>
                 <plugins>
                     <plugin>
@@ -148,9 +125,14 @@
                                 <phase>generate-resources</phase>
                                 <goals><goal>exec</goal></goals>
                                 <configuration>
-                                    <executable>npm.cmd</executable>
+                                    <executable>${npm.executable}</executable>
                                     <workingDirectory>${bridge.dir}</workingDirectory>
-                                    <arguments><argument>install</argument></arguments>
+                                    <arguments>
+                                        <argument>install</argument>
+                                        <argument>--no-audit</argument>
+                                        <argument>--no-fund</argument>
+                                        <argument>--prefer-offline</argument>
+                                    </arguments>
                                 </configuration>
                             </execution>
                             <execution>
@@ -158,7 +140,7 @@
                                 <phase>generate-resources</phase>
                                 <goals><goal>exec</goal></goals>
                                 <configuration>
-                                    <executable>npm.cmd</executable>
+                                    <executable>${npm.executable}</executable>
                                     <workingDirectory>${bridge.dir}</workingDirectory>
                                     <arguments>
                                         <argument>run</argument>
@@ -171,13 +153,15 @@
                 </plugins>
             </build>
         </profile>
-
         <profile>
             <id>build-bridge-unix</id>
             <activation>
                 <os><family>unix</family></os>
                 <property><name>!skip.bridge.build</name></property>
             </activation>
+            <properties>
+                <npm.executable>npm</npm.executable>
+            </properties>
             <build>
                 <plugins>
                     <plugin>
@@ -189,9 +173,14 @@
                                 <phase>generate-resources</phase>
                                 <goals><goal>exec</goal></goals>
                                 <configuration>
-                                    <executable>npm</executable>
+                                    <executable>${npm.executable}</executable>
                                     <workingDirectory>${bridge.dir}</workingDirectory>
-                                    <arguments><argument>install</argument></arguments>
+                                    <arguments>
+                                        <argument>install</argument>
+                                        <argument>--no-audit</argument>
+                                        <argument>--no-fund</argument>
+                                        <argument>--prefer-offline</argument>
+                                    </arguments>
                                 </configuration>
                             </execution>
                             <execution>
@@ -199,7 +188,7 @@
                                 <phase>generate-resources</phase>
                                 <goals><goal>exec</goal></goals>
                                 <configuration>
-                                    <executable>npm</executable>
+                                    <executable>${npm.executable}</executable>
                                     <workingDirectory>${bridge.dir}</workingDirectory>
                                     <arguments>
                                         <argument>run</argument>

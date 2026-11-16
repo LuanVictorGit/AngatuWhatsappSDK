@@ -7,7 +7,7 @@
     <parent>
         <groupId>com.angatusistemas</groupId>
         <artifactId>angatu-whatsapp-parent</artifactId>
-        <version>1.0.0-SNAPSHOT</version>
+        <version>2.0.0-SNAPSHOT</version>
     </parent>
 
     <artifactId>angatu-whatsapp-cli</artifactId>
@@ -25,11 +25,11 @@
             <groupId>com.angatusistemas</groupId>
             <artifactId>angatu-whatsapp</artifactId>
         </dependency>
-        <!-- Binds SLF4J so the SDK's own internal logs (bridge lifecycle, reconnection,
-             heartbeat) are actually visible when running the CLI as a standalone jar. -->
+        <!-- Silences the binding warning of the WebSocket client's logging facade in a standalone jar. -->
         <dependency>
-            <groupId>ch.qos.logback</groupId>
-            <artifactId>logback-classic</artifactId>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-nop</artifactId>
+            <version>2.0.13</version>
             <scope>runtime</scope>
         </dependency>
         <dependency>
@@ -41,13 +41,6 @@
 
     <build>
         <plugins>
-            <!--
-                Produces a single executable angatu-whatsapp-cli.jar with every
-                dependency (SDK, Jackson, Java-WebSocket, zxing, logback, ...) bundled
-                in, plus the embedded Node bridge resources the sdk module already
-                carries - so "java -jar angatu-whatsapp-cli.jar" works with no other
-                classpath setup.
-            -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
