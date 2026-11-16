@@ -1,185 +1,60 @@
+---
+tags:
+  - biblioteca
+  - whatsapp
+  - java
+status: ativo
+versao: 2.0.0-SNAPSHOT
+---
+
 # Angatu WhatsApp SDK
 
-SDK Java para integração com WhatsApp, construído sobre o [Baileys](https://github.com/WhiskeySockets/Baileys)
-(`baileys@6.7.24`). Permite que uma aplicação Java conecte números de WhatsApp, envie e receba
-mensagens, mídia, reações, eventos de grupo e presença — **sem que o desenvolvedor Java precise
-escrever, ler ou entender uma linha de Node.js/TypeScript**.
+Biblioteca Java para automatizar WhatsApp com comportamento de gente: uma fila que espaça cada
+interação, "digitando..." antes de responder, visto azul na hora certa, conta sempre online e
+recusa de chamadas — com pouca memória e reconexão que não desiste.
 
-> **Aviso importante.** O Baileys é uma biblioteca **não oficial**, construída por engenharia reversa
-> do protocolo do WhatsApp Web — não é a [WhatsApp Business Platform (Cloud API)](https://developers.facebook.com/docs/whatsapp)
-> oficial da Meta. Usar este SDK (assim como usar o Baileys diretamente) para automação viola os
-> Termos de Serviço do WhatsApp e pode resultar no banimento do número conectado, especialmente em
-> uso de alto volume ou com padrões de envio automatizados. Use por sua conta e risco, prefira
-> números de teste/descartáveis durante o desenvolvimento, e avalie a API oficial da Meta para
-> aplicações comerciais críticas.
+Por baixo roda o [Baileys](https://github.com/WhiskeySockets/Baileys) num processo Node.js que a
+própria biblioteca baixa, inicia e encerra. Quem usa a SDK escreve só Java.
 
-## Sumário
+> [!WARNING]
+> O Baileys é um cliente **não oficial** do WhatsApp Web. Automatizar um número por ele viola os
+> termos do WhatsApp e o número pode ser banido — principalmente com volume alto, mensagens que
+> ninguém pediu ou padrão de máquina. A SDK reduz o padrão de máquina; ela não torna aceitável
+> mandar o mesmo texto para milhares de desconhecidos. Use um número descartável enquanto
+> desenvolve. Para uso comercial crítico, existe a API oficial (WhatsApp Cloud API) da Meta.
 
-- [Visão geral](#visão-geral)
-- [Arquitetura](#arquitetura)
-- [Estrutura de arquivos](#estrutura-de-arquivos)
-- [Requisitos](#requisitos)
-- [Instalação](#instalação)
-- [Início rápido](#início-rápido)
-- [Conectando e QR Code](#conectando-e-qr-code)
-- [Enviando mensagens](#enviando-mensagens)
-- [Recebendo eventos](#recebendo-eventos)
-- [Mídia, contatos e grupos](#mídia-contatos-e-grupos)
-- [Múltiplas instâncias](#múltiplas-instâncias)
-- [Persistência de sessão e reconexão](#persistência-de-sessão-e-reconexão)
-- [Tratamento de erros](#tratamento-de-erros)
-- [Configuração](#configuração)
-- [Segurança](#segurança)
-- [Encerrando o cliente](#encerrando-o-cliente)
-- [CLI opcional](#cli-opcional)
-- [Exemplos](#exemplos)
-- [Referência completa de exemplos (EXAMPLES.md)](EXAMPLES.md)
-- [Desenvolvimento](#desenvolvimento)
-- [Como testar](#como-testar)
-- [Como publicar](#como-publicar)
-- [Decisões de arquitetura](#decisões-de-arquitetura)
-- [Limitações conhecidas](#limitações-conhecidas)
-- [Próximas melhorias recomendadas](#próximas-melhorias-recomendadas)
-- [Licença](#licença)
+## O que ela faz
 
-## Visão geral
-
-- **API Java limpa e orientada a objetos** — nenhum tipo do Baileys/Node vaza para a aplicação.
-- **Sem instalação manual de Node.js**: o SDK detecta um Node.js compatível já instalado ou baixa
-  um automaticamente (verificado por SHA-256) na primeira execução.
-- **Processo Bridge Node.js isolado**: cada `WhatsAppClient` sobe seu próprio processo Node local,
-  fala com ele por WebSocket (`127.0.0.1`, autenticado por token), e o encerra ao fechar o cliente.
-- **Multi-instância**: várias contas de WhatsApp na mesma aplicação, cada uma com seu próprio
-  `instanceId` e diretório de sessão, com prevenção de conflito em tempo de execução.
-- **Uma conta, um socket — garantido em disco**: uma trava (`.lock`) no diretório de sessão impede
-  que dois processos abram a mesma conta, mesmo depois de um `kill -9` que deixe um bridge órfão.
-  Dois sockets na mesma conta fazem o WhatsApp derrubar um com `connectionReplaced`, o que dispara
-  reconexão, que abre outro socket — o vaivém que denuncia automação.
-- **Sessão persistente**: a autenticação (estado do Baileys) é salva em disco por instância, com
-  gravação atômica (`.tmp` + `fsync` + `rename`), e sobrevive a reinícios — sem novo QR Code a cada
-  deploy, e sem o "pediu QR do nada" que uma queda no meio da escrita causava.
-- **Ritmo humano embutido** (`PacingOptions`): fila sequencial por instância — nada sai em paralelo
-  —, intervalo aleatório de 4 a 12 segundos entre envios e teto de 10 por minuto.
-- **Sinais de presença configuráveis** (`HumanizationOptions`): "digitando...", "gravando áudio...",
-  online/offline em volta do envio e o "azulzinho" de leitura, cada um ligando e desligando sozinho.
-- **Eventos independentes**: listeners separados por tipo (mensagem, atualização, exclusão,
-  reação, estado de conexão, QR Code, grupo, presença, erro) em vez de um único callback genérico.
-- **Exceções tipadas** com contexto de diagnóstico (`instanceId`, código de erro do bridge, causa).
-- **Reconexão automática** com backoff exponencial, distinguindo logout do usuário, perda de
-  conexão, reinício solicitado pelo WhatsApp, substituição por outro cliente, falha de autenticação
-  e queda do processo bridge — e que **nunca desiste de vez**: esgotado o backoff, as tentativas
-  continuam espaçadas (`reconnectCooldown`, padrão 5 min) em vez de o cliente ficar em `FAILED`
-  para sempre.
-- **CLI opcional** (`angatu-whatsapp-cli`) para parear um número ou enviar uma mensagem avulsa sem
-  escrever código Java.
-
-## Arquitetura
-
-```
-┌─────────────────────┐        WebSocket local         ┌──────────────────────┐        ┌──────────┐
-│   Aplicação Java     │        (127.0.0.1, token)      │  Bridge Node.js       │        │          │
-│                      │  ───────────────────────────▶  │  (processo próprio,   │        │ WhatsApp │
-│  WhatsAppClient      │  ◀───────────────────────────  │  spawnado pelo SDK)   │  ────▶ │          │
-│  (sdk/)              │   protocolo JSON com IDs        │  Baileys 6.7.24       │        │          │
-└─────────────────────┘   únicos, versionado            └──────────────────────┘        └──────────┘
-```
-
-O SDK **nunca** porta o Baileys para Java. A regra é rígida: Java fala com um processo Node.js
-local via WebSocket, e apenas esse processo (o "bridge", em `bridge/`) importa e usa o Baileys.
-Isso significa que:
-
-- Atualizar o Baileys é uma mudança isolada em `bridge/`, sem tocar no código Java.
-- Nenhuma regra de negócio da aplicação vive dentro do bridge — ele só traduz eventos/comandos.
-- O bridge é pequeno, testável isoladamente (`bridge/src`, `npm run typecheck`) e compilado com
-  esbuild num único arquivo (`bridge.mjs`, ~6.5 MB) embutido como recurso dentro do jar do SDK.
-
-### Um processo bridge por cliente
-
-Cada `WhatsAppClient` sobe seu **próprio** processo Node — não há um processo bridge compartilhado
-entre todos os clientes da JVM (embora o bridge internamente suporte múltiplas instâncias por
-processo). Essa escolha prioriza isolamento de falhas: se o socket do Baileys de um número trava
-ou o processo bridge morre, apenas aquele `WhatsAppClient` é afetado, nunca os outros. O custo é um
-processo Node extra por número conectado — para a maioria dos casos de uso (dezenas de números,
-não milhares) isso é uma troca razoável. Veja [Próximas melhorias](#próximas-melhorias-recomendadas)
-para um possível modo opcional de processo compartilhado.
-
-### Protocolo Java ↔ Bridge
-
-JSON sobre WebSocket, com um envelope por mensagem (`type`, `id`, e campos específicos do tipo):
-`handshake` / `handshake_ack`, `heartbeat` / `heartbeat_ack`, `request` / `response`, `event`,
-`error`. Cada requisição carrega um ID único gerado pelo Java e correlacionado com sua resposta;
-o handshake inclui a versão do protocolo (`ProtocolVersion.CURRENT`) e é rejeitado se o major
-version não bater com o do bridge. Um heartbeat de aplicação (não o keepalive nativo do
-WebSocket) detecta conexões mortas que o TCP ainda não percebeu.
-
-## Estrutura de arquivos
-
-```
-AngatuWhatsAppSDK/
-├── pom.xml                            # POM agregador (multi-módulo Maven)
-├── LICENSE                            # Apache License 2.0
-├── sdk/                                # com.angatusistemas:angatu-whatsapp — o artefato publicado
-│   ├── src/main/java/com/angatusistemas/whatsapp/
-│   │   ├── WhatsAppClient.java         # Fachada pública principal
-│   │   ├── ConnectionState.java        # Enum de estado de conexão
-│   │   ├── DisconnectCause.java        # Enum de causa de desconexão
-│   │   ├── model/                      # Message, Contact, Group, MediaContent, ...
-│   │   ├── listener/                   # 9 interfaces funcionais de evento
-│   │   ├── request/                    # Builders para envio de mídia/localização/contato/reação
-│   │   ├── exception/                  # Hierarquia de exceções tipadas
-│   │   ├── protocol/                   # Envelope, codec JSON, versionamento
-│   │   ├── transport/                  # BridgeConnection (cliente WebSocket)
-│   │   ├── runtime/                    # Localização/download do Node, processo do bridge
-│   │   └── internal/                   # InstanceRegistry, QrCodeRenderer (uso interno do SDK)
-│   ├── src/main/resources/bridge/      # bridge.mjs compilado é copiado para cá no build
-│   └── src/test/java/...               # Testes unitários e de integração (mock bridge)
-├── bridge/                             # Bridge Node.js/TypeScript — nunca publicado, só embutido
-│   ├── src/
-│   │   ├── adapter/                    # BaileysAdapter, MessageMapper, InstanceManager
-│   │   ├── protocol/                   # Envelope/erros espelhando o lado Java
-│   │   └── server/                     # Servidor WebSocket local, autenticação por token
-│   ├── build.mjs                       # Bundle esbuild → dist/bridge.mjs
-│   └── package.json
-├── cli/                                # com.angatusistemas:angatu-whatsapp-cli — opcional
-│   └── src/main/java/com/angatusistemas/whatsapp/cli/
-├── examples/
-│   ├── simple-bot/                     # Uma instância, QR em PNG, eco de mensagens recebidas
-│   └── multi-instance/                 # Várias instâncias isoladas na mesma aplicação
-```
+- **Fila de interações em disco.** Tudo que vai ao WhatsApp — mensagem, presença, visto, consulta,
+  ação em grupo — passa por uma fila por número, uma coisa de cada vez, com no mínimo 500 ms entre
+  elas. A fila mora em SQLite, então mil mensagens agendadas ocupam disco, não memória, e
+  sobrevivem a uma queda do processo.
+- **Ritmo humano.** Antes de cada mensagem: marca a conversa como lida, mostra "digitando..." por
+  um tempo proporcional ao texto, envia e espera um intervalo aleatório (4 a 12 s por padrão) antes
+  da próxima. Áudio de voz mostra "gravando áudio...".
+- **Só mensagens novas.** Nada de histórico: a biblioteca entrega apenas o que chega depois que o
+  cliente sobe, e nunca pede conversas antigas ao celular.
+- **Conexão estável.** QR Code ou código de pareamento, credencial gravada de forma durável com
+  backup automático, reconexão com espera crescente, retomada sem QR depois de reiniciar a
+  aplicação e limpeza de processo órfão de uma execução anterior.
+- **Pouca memória.** Um único processo Node atende todos os números da aplicação; caches do
+  protocolo limitados e sem timer; mídia baixada direto para arquivo.
+- **API completa.** Texto, imagem, vídeo, áudio, documento, figurinha, localização, contato,
+  botões (com evento de qual foi apertado), enquetes (com voto decifrado), reações, edição, apagar
+  para todos, encaminhar; grupos, convites, perfil, privacidade, bloqueio; verificar se um número
+  ou um grupo existe.
 
 ## Requisitos
 
-- **Java 17+** para consumir o SDK.
-- **Uma das opções a seguir** para o runtime Node.js usado pelo bridge:
-  - Node.js **20+** já instalado no sistema (detectado automaticamente), **ou**
-  - Nenhum — o SDK baixa um Node.js gerenciado (verificado por SHA-256 contra o `SHASUMS256.txt`
-    oficial do nodejs.org) na primeira execução e o mantém em cache local.
-- **Node.js + npm no ambiente de build** (não no runtime dos consumidores) apenas se você for
-  **compilar o SDK a partir do código-fonte** — o bridge é compilado durante `mvn install` via um
-  profile Maven que roda `npm install && npm run build`. Consumidores que só adicionam a
-  dependência Maven não precisam de Node.js instalado para *compilar* sua aplicação — apenas em
-  runtime, para o bridge já embutido rodar (via Node do sistema ou baixado automaticamente).
-- Windows, Linux ou macOS (x64/arm64).
-- Acesso à internet na primeira conexão de cada número (para o handshake com os servidores do
-  WhatsApp) e, se nenhum Node.js compatível for encontrado localmente, para baixá-lo de
-  `nodejs.org` uma única vez.
+- **Java 25** (a biblioteca é compilada para o Java 25).
+- **Node.js 22 ou mais novo** em tempo de execução. Não precisa instalar: se a máquina não tiver,
+  a SDK baixa o Node oficial de nodejs.org, confere o SHA-256 e guarda em cache.
+- Nada de Node na hora de compilar o seu projeto: a ponte já vem dentro do jar.
 
 ## Instalação
 
-O artefato ainda não foi publicado no Maven Central (versão atual: `1.0.0-SNAPSHOT`). Duas formas
-de consumir o SDK:
-
-### Opção 1 — Maven Central (após uma release)
-
-```xml
-<dependency>
-    <groupId>com.angatusistemas</groupId>
-    <artifactId>angatu-whatsapp</artifactId>
-    <version>1.0.0</version>
-</dependency>
-```
-
-### Opção 2 — JitPack (direto do GitHub, sem precisar de uma release no Central)
+As versões saem pelo JitPack, pelo hash do commit (o repositório não publica tags). Pegue o hash
+mais recente da branch `main` e use como versão:
 
 ```xml
 <repositories>
@@ -190,840 +65,251 @@ de consumir o SDK:
 </repositories>
 
 <dependency>
-    <groupId>com.github.LuanVictorGit</groupId>
+    <groupId>com.github.LuanVictorGit.AngatuWhatsappSDK</groupId>
     <artifactId>angatu-whatsapp</artifactId>
-    <version><!-- tag, branch ou commit hash do GitHub --></version>
+    <version>HASH_DO_COMMIT</version>
 </dependency>
 ```
 
-O JitPack builda o módulo `sdk` (com o bridge embutido) diretamente a partir do repositório
-público no GitHub — funciona a partir de qualquer tag, branch ou commit, sem exigir conta no
-Sonatype/Central Portal.
-
-### Opção 3 — instalar localmente a partir do código-fonte
-
-```bash
-git clone https://github.com/LuanVictorGit/AngatuWhatsappSDK.git
-cd angatu-whatsapp
-mvn clean install
+```groovy
+repositories { maven { url 'https://jitpack.io' } }
+dependencies { implementation 'com.github.LuanVictorGit.AngatuWhatsappSDK:angatu-whatsapp:HASH_DO_COMMIT' }
 ```
 
-Isso publica `com.angatusistemas:angatu-whatsapp:1.0.0-SNAPSHOT` no seu repositório Maven local
-(`~/.m2`), pronto para ser usado como dependência em outro projeto na mesma máquina.
+A SDK traz junto a [AngatuLibraries](https://github.com/LuanVictorGit/AngatuLibraries) (SQLite da
+fila, JSON e console), o driver SQLite, HikariCP, Gson, Java-WebSocket e ZXing.
 
-## Início rápido
-
-```java
-import com.angatusistemas.whatsapp.WhatsAppClient;
-
-import java.util.concurrent.CountDownLatch;
-
-public class QuickStart {
-    public static void main(String[] args) throws Exception {
-        WhatsAppClient client = WhatsAppClient.builder()
-                .instanceId("meu-bot")
-                .sessionDirectory("./whatsapp-session")
-                .build();
-
-        client.addQrCodeListener(qr ->
-                System.out.println("Escaneie no WhatsApp: " + qr));
-
-        client.addConnectionStateListener((state, cause, detail) ->
-                System.out.println("Estado: " + state));
-
-        client.addMessageListener(message -> {
-            if (!message.isFromMe()) {
-                client.sendText(message.chatId(), "Recebi: " + message.text());
-            }
-        });
-
-        Runtime.getRuntime().addShutdownHook(new Thread(client::close));
-
-        client.connect().join(); // confirma que o bridge aceitou iniciar a conexão
-
-        new CountDownLatch(1).await(); // mantém a JVM viva - veja "Encerrando o cliente"
-    }
-}
-```
-
-`client.connect()` retorna assim que o bridge confirma que iniciou a tentativa de conexão — **não**
-espera o WhatsApp autenticar. O progresso real (`QR_PENDING`, `CONNECTED`, etc.) chega pelos
-listeners, de forma assíncrona. Veja [`examples/simple-bot`](examples/simple-bot) para uma versão
-completa e executável deste exemplo.
-
-## Conectando e QR Code
+## Primeiros passos
 
 ```java
 WhatsAppClient client = WhatsAppClient.builder()
-        .instanceId("vendas")
-        .sessionDirectory("./sessions/vendas")
-        .displayName("Vendas - Angatu")   // nome exibido em "Aparelhos conectados"
+        .instanceId("atendimento")
+        .sessionDirectory(Path.of("/data/whatsapp/atendimento"))
         .build();
 
-client.addQrCodeListener(qr -> {
-    // qr é o conteúdo bruto do QR Code (string). Duas formas de exibi-lo:
-    byte[] png = client.getQrCodePng();       // PNG 300x300 pronto para salvar/servir
-    byte[] pngGrande = client.getQrCodePng(500);
-});
-
-client.connect();
-```
-
-- `getCurrentQrCode()` devolve o conteúdo bruto atual (ou `null` se não há QR pendente).
-- `getQrCodePng()` / `getQrCodePng(int tamanho)` renderizam o QR atual como PNG localmente (via
-  ZXing) — nenhuma chamada a serviço externo de terceiros.
-- O QR Code é rotativo: o WhatsApp o expira e o bridge emite um novo periodicamente enquanto o
-  estado permanece `QR_PENDING`. O listener é chamado a cada novo QR.
-
-### Pareamento por código (alternativa ao QR Code)
-
-```java
-client.connect().join();
-String codigo = client.requestPairingCode("5511999999999").get(30, TimeUnit.SECONDS);
-System.out.println("Digite este código no WhatsApp: " + codigo);
-```
-
-> O fluxo de QR Code foi verificado de ponta a ponta neste projeto (conexão real, autenticação e
-> recebimento de eventos). O fluxo de código de pareamento foi validado apenas até a obtenção do
-> código pelo bridge/Baileys — teste-o no seu ambiente antes de depender dele em produção.
-
-## Enviando mensagens
-
-Todos os métodos de envio retornam `CompletableFuture<String>` com o `messageId` gerado (ou
-`CompletableFuture<Void>` para `sendReaction`), e nunca bloqueiam a thread chamadora.
-
-```java
-// Texto simples
-client.sendText("5511999999999@s.whatsapp.net", "Olá!");
-
-// Texto respondendo a outra mensagem
-client.sendText(chatId, "Respondendo...", quotedMessageId);
-
-// Imagem
-client.sendImage(SendImageRequest.builder()
-        .to(chatId)
-        .filePath("/caminho/para/imagem.jpg")
-        .caption("Legenda opcional")
-        .build());
-
-// Vídeo (ou GIF via gifPlayback)
-client.sendVideo(SendVideoRequest.builder()
-        .to(chatId).filePath("/caminho/video.mp4").gifPlayback(false).build());
-
-// Áudio (ptt=true para nota de voz)
-client.sendAudio(SendAudioRequest.builder()
-        .to(chatId).filePath("/caminho/audio.ogg").ptt(true).build());
-
-// Documento
-client.sendDocument(SendDocumentRequest.builder()
-        .to(chatId).filePath("/caminho/arquivo.pdf")
-        .fileName("relatorio.pdf").mimetype("application/pdf").build());
-
-// Sticker
-client.sendSticker(SendStickerRequest.builder().to(chatId).filePath("/caminho/figurinha.webp").build());
-
-// Localização
-client.sendLocation(SendLocationRequest.builder(-23.5505, -46.6333)
-        .to(chatId).name("Sede Angatu").address("São Paulo, SP").build());
-
-// Cartão de contato
-client.sendContact(SendContactRequest.builder()
-        .to(chatId).displayName("Suporte").phoneNumber("5511988888888").build());
-
-// Reação (emoji=null remove a reação existente)
-client.sendReaction(SendReactionRequest.builder()
-        .chatId(chatId).messageId(messageId).emoji("👍").fromMe(false).build());
-```
-
-`filePath` é lido pelo processo bridge local (mesma máquina onde a aplicação Java roda), não pela
-aplicação Java diretamente — use caminhos absolutos ou relativos ao diretório de trabalho do
-processo Java, que é o mesmo processo que inicia o bridge.
-
-Todos os builders (exceto `SendLocationRequest`, cujas coordenadas são obrigatórias no próprio
-`builder(lat, lon)`) seguem o mesmo padrão: `to`/`chatId` obrigatório, demais campos opcionais.
-
-## Recebendo eventos
-
-Nove interfaces funcionais, registradas independentemente — assine só o que precisar:
-
-| Listener | Método | Quando dispara |
-|---|---|---|
-| `MessageListener` | `onMessageReceived(Message message)` | Nova mensagem (própria ou de terceiros) |
-| `MessageUpdatedListener` | `onMessageUpdated(String chatId, String messageId, JsonNode updates)` | Edição/atualização de mensagem existente |
-| `MessageDeletedListener` | `onMessageDeleted(String chatId, String messageId)` | Mensagem apagada |
-
-Do lado ativo, `editMessage` e `deleteMessage` fazem o mesmo pela sua conta.
-Os dois só valem dentro da janela que o WhatsApp concede depois da entrega
-(cerca de 15 minutos, decididos pelo servidor e sem limite publicado): não há
-como consultar o prazo, então a recusa do servidor é a resposta.
-| `ReactionListener` | `onReactionReceived(String chatId, String messageId, String senderId, String emoji, boolean removed)` | Reação adicionada ou removida |
-| `ConnectionStateListener` | `onConnectionStateChanged(ConnectionState state, DisconnectCause cause, String detail)` | Mudança de estado da conexão |
-| `QrCodeListener` | `onQrCodeReceived(String qrCode)` | Novo QR Code disponível |
-| `GroupUpdateListener` | `onGroupUpdated(String groupJid, JsonNode updates)` | Metadados de grupo alterados |
-| `PresenceListener` | `onPresenceUpdated(String chatId, JsonNode presences)` | Presença (online/digitando) alterada |
-| `ErrorListener` | `onError(WhatsAppException error)` | Erro assíncrono reportado pelo SDK/bridge |
-
-```java
+client.addQrCodeListener(qr -> System.out.println(client.getQrCodeText()));
+client.addConnectionStateListener((state, cause, detail) -> System.out.println(state + " " + cause));
 client.addMessageListener(message -> {
-    System.out.println(message.senderId() + ": " + message.text());
-});
-
-client.addConnectionStateListener((state, cause, detail) -> {
-    if (state == ConnectionState.FAILED) {
-        // Backoff esgotado. O SDK CONTINUA tentando a cada reconnectCooldown:
-        // aqui e lugar de alertar um humano, nao de recriar o cliente.
-    }
-    if (cause == DisconnectCause.CONNECTION_REPLACED) {
-        // Outro cliente assumiu a conta. A credencial continua valida -
-        // NAO apague a sessao aqui. O bridge volta a tentar sozinho.
+    if (!message.isFromMe() && message.hasText()) {
+        client.sendText(message.chatId(), "Recebi: " + message.text());
     }
 });
 
-client.addErrorListener(error -> log.error("erro do SDK: {}", error.getMessage(), error));
-```
-
-Cada listener roda numa thread interna do SDK; exceções não tratadas lançadas por um listener são
-capturadas e logadas (nunca derrubam a thread de despacho nem propagam para outros listeners).
-Múltiplos listeners do mesmo tipo podem ser registrados — todos são chamados, na ordem de registro.
-
-`Message` é um record com os campos `messageId`, `instanceId`, `chatId`, `senderId`, `timestamp`
-(e `timestampAsInstant()`), `text`, `type` (`MessageType`), `isGroup`, `isFromMe`, `pushName`,
-`quotedMessage` e `rawData` (o `JsonNode` bruto do Baileys, para casos não cobertos pela
-abstração).
-
-## Mídia, contatos e grupos
-
-```java
-// Baixar mídia de uma mensagem recebida
-MediaContent media = client.downloadMedia(chatId, messageId).get();
-Files.write(Path.of("recebido.jpg"), media.data()); // media.mimetype() também disponível
-
-// Só a foto de perfil — uma consulta ao WhatsApp
-JsonNode foto = client.getProfilePicture("5511999999999@s.whatsapp.net").get();
-String url = foto.path("profilePictureUrl").asText(null);   // null quando não há foto
-
-// Contato completo — TRÊS consultas (ver o aviso abaixo)
-Contact contato = client.getContact("5511999999999@s.whatsapp.net").get();
-
-// Grupos
-Group grupo = client.getGroupMetadata(groupJid).get();
-List<Group> meusGrupos = client.listGroups().get();
-Group novo = client.createGroup("Time de Vendas", List.of(jid1, jid2)).get();
-
-client.updateGroupParticipants(groupJid, List.of(jid1),
-        WhatsAppClient.GroupParticipantAction.PROMOTE);   // ADD, REMOVE, PROMOTE, DEMOTE
-client.updateGroupSubject(groupJid, "Novo nome do grupo");
-client.updateGroupDescription(groupJid, "Nova descrição");
-client.leaveGroup(groupJid);
-String conviteUrl = client.getGroupInviteCode(groupJid).get();
-```
-
-> ### ⚠️ `getContact` faz três consultas — prefira `getProfilePicture`
->
-> `getContact(jid)` dispara `onWhatsApp` (o número existe?), `profilePictureUrl`
-> (a foto) e `fetchStatus` (o **recado pessoal** do contato). Numa tela que
-> mostra o avatar de uma lista de contatos isso vira uma varredura da agenda:
-> 200 contatos = 600 consultas em rajada, sondando existência de número e lendo
-> o recado pessoal de gente que a aplicação nem exibe.
->
-> Isso é leitura em massa de informação de terceiro, e o WhatsApp **suspende
-> contas** por esse comportamento — foi o que aconteceu com uma aplicação que
-> usa esta SDK. Se o objetivo é só exibir um avatar, use
-> `getProfilePicture(jid)`: uma consulta, só o dado que será mostrado. E guarde
-> o resultado: a foto de perfil não muda de minuto em minuto.
-
-## Múltiplas instâncias
-
-Cada `WhatsAppClient` é uma conta de WhatsApp independente. `instanceId` e `sessionDirectory`
-precisam ser únicos por instância **dentro da mesma JVM** — tentar reusar qualquer um dos dois
-lança `InstanceException` imediatamente na construção, antes mesmo do bridge ser iniciado:
-
-```java
-WhatsAppClient vendas = WhatsAppClient.builder()
-        .instanceId("vendas").sessionDirectory("./sessions/vendas").build();
-
-WhatsAppClient suporte = WhatsAppClient.builder()
-        .instanceId("suporte").sessionDirectory("./sessions/suporte").build();
-
-vendas.connect();
-suporte.connect();
-```
-
-Como cada instância sobe seu próprio processo bridge (veja [Arquitetura](#arquitetura)), uma
-queda no processo de `vendas` nunca afeta `suporte`. Veja
-[`examples/multi-instance`](examples/multi-instance) para um exemplo completo com N instâncias
-configuráveis por argumento de linha de comando.
-
-> A prevenção de conflito de `instanceId`/`sessionDirectory` é por JVM, não entre processos
-> diferentes — veja [Limitações conhecidas](#limitações-conhecidas).
-
-## Persistência de sessão e reconexão
-
-`sessionDirectory` é onde o Baileys persiste as credenciais de autenticação (via
-`useMultiFileAuthState`) — reiniciar a aplicação apontando para o mesmo diretório retoma a sessão
-sem exigir um novo QR Code, contanto que o WhatsApp não tenha invalidado a sessão nesse meio
-tempo. **Nunca commite esse diretório em controle de versão** (o `.gitignore` do projeto já
-exclui `sessions/` e `**/sessions/` por padrão).
-
-### Uma conta, um socket
-
-O adapter garante **no máximo um socket Baileys por instância**, e isso não é
-detalhe de implementação: dois sockets vivos na mesma conta fazem o servidor
-derrubar um com `connectionReplaced`, o que dispara outra reconexão, que abre
-outro socket — um ciclo em que a conta aparece para o WhatsApp como vários
-clientes web surgindo e sumindo.
-
-Três garantias sustentam isso:
-
-- **abertura serializada.** `openSocket()` espera três coisas antes de criar o
-  socket (limpeza de sessão invalidada, leitura das credenciais e a consulta da
-  versão do WhatsApp Web, que sozinha leva até 9s). Duas chamadas concorrentes
-  atravessavam essa janela juntas; agora compartilham a mesma promessa, e
-  `connect()` é no-op quando já existe socket ativo;
-- **listeners com número de geração.** Cada assinatura sabe se desfazer e
-  carrega a geração do socket em que nasceu. Antes, cada reconexão somava um
-  jogo novo de listeners e os antigos continuavam vivos — a mesma mensagem era
-  entregue N vezes, uma por reconexão acumulada;
-- **credenciais gravadas pelo escritor do próprio socket.** O listener de
-  `creds.update` usava um campo compartilhado que a troca de socket já tinha
-  reapontado, gravando as credenciais de um pela função do outro. Aparece depois
-  como "pediu QR do nada".
-
-### Acesso mínimo: o que este cliente não pede ao WhatsApp
-
-O socket é configurado para ler só o que a aplicação usa. Não é otimização — é
-o que separa um cliente de mensagens de um coletor de dados, e o WhatsApp
-suspende contas pela diferença:
-
-| opção | valor | efeito |
-|---|---|---|
-| `syncFullHistory` / `shouldSyncHistoryMessage` | `false` / `() => false` | nenhum histórico antigo é importado do celular |
-| `shouldIgnoreJid` | ignora `@broadcast` e `@newsletter` | o "Recado" de todos os contatos é descartado **antes de ser decifrado** |
-| `emitOwnEvents` | `false` | a mensagem que a aplicação envia não volta como evento para ser processada de novo |
-| `generateHighQualityLinkPreview` | `false` | não baixa a página de destino dos links |
-
-O adapter também **não assina `contacts.upsert`/`contacts.update`**: esse evento
-entrega a lista de contatos inteira da conta, e guardá-la seria acumular dado
-pessoal de terceiro sem uso. O `LidDirectory` aprende o par LID/telefone do
-próprio stanza da conversa (`learnLids`), que é tudo de que ele precisa.
-
-`messages.upsert` processa `notify` **e** `append`. `append` parece histórico e
-não é: é a mensagem que chegou enquanto o cliente estava offline. Descartá-la
-perderia respostas recebidas durante uma queda de conexão.
-
-A reconexão acontece em duas camadas:
-
-1. **Dentro do bridge**: o Baileys já trata sozinho a maioria das quedas transitórias
-   (`CONNECTION_LOST`, `WHATSAPP_RESTART`) sem intervenção do Java.
-2. **Entre Java e o bridge**: se a conexão WebSocket cair mas o processo bridge continuar vivo, o
-   SDK reconecta só o WebSocket e resincroniza o estado (rápido). Se o processo bridge morrer
-   (`BRIDGE_CRASH`), o SDK recria o processo inteiro, reabre a conexão e retoma a sessão do disco
-   — sem novo QR Code, pois o estado de autenticação já está persistido.
-
-O backoff é exponencial com jitter, limitado por `maxReconnectDelay` e por `maxReconnectAttempts`
-(padrão: 10 tentativas). **Esgotadas as tentativas, o SDK não desiste**: a instância é reportada como
-`ConnectionState.FAILED` — a aplicação precisa saber que o número está fora do ar — mas as tentativas
-continuam saindo a cada `reconnectCooldown` (padrão 5 minutos), indefinidamente, e a conexão volta
-sozinha quando a rede voltar.
-
-> Até a versão anterior o cliente parava de vez em `FAILED`, e era por esse caminho que um número
-> "desconectava e não voltava": a queda durava mais que as dez tentativas e só um restart da
-> aplicação o traria de volta. O intervalo é longo de propósito — reconectar sem parar é pior que não
-> reconectar, porque cada tentativa reapresenta um cliente web novo ao WhatsApp.
->
-> Para o comportamento antigo: `.reconnectCooldown(null)`.
-
-`DisconnectCause` distingue: `USER_LOGOUT` (logout explícito — precisa de novo QR),
-`CONNECTION_LOST` (falha transitória de rede), `WHATSAPP_RESTART` (o próprio WhatsApp pediu
-reinício), `AUTH_FAILURE` (credenciais rejeitadas), `CONNECTION_REPLACED` (outro cliente assumiu a
-conta), `BRIDGE_CRASH` (processo Node morreu inesperadamente) e `UNKNOWN`.
-
-> **`CONNECTION_REPLACED` não é logout, e a credencial continua válida.** Até a versão anterior o
-> `connectionReplaced` (440) do WhatsApp chegava como `USER_LOGOUT`, e toda aplicação que reage a
-> "deslogou" apagando a sessão transformava um conflito recuperável em repareamento forçado — o pior
-> movimento possível numa conta sob observação. Ao receber esta causa, **não apague nada**: o bridge
-> espera cinco minutos e tenta voltar sozinho, devagar o bastante para não começar uma guerra de
-> reconexão com quem assumiu.
-
-> **`AUTH_FAILURE` nem sempre apaga a sessão.** Um 403 (`forbidden`) significa "a conta está restrita
-> agora", não "esta credencial não vale": o diretório é preservado, e se a restrição passar a mesma
-> credencial volta a conectar. Já 401/500/411 descartam as credenciais, porque sem isso todo
-> `connect()` repetiria a mesma recusa sem nunca gerar um QR novo.
-
-## Tratamento de erros
-
-Toda falha do SDK é uma subclasse não verificada (`RuntimeException`) de `WhatsAppException`, com
-`instanceId()`, `errorCode()` (`BridgeErrorCode`) e `details()` quando disponíveis:
-
-```
-WhatsAppException
-├── ConnectionException        (NOT_CONNECTED, CONNECTION_FAILED)
-├── AuthenticationException    (AUTH_FAILED)
-├── TimeoutException           (TIMEOUT)
-├── MessageSendException       (SEND_FAILED, MEDIA_NOT_FOUND)
-├── InstanceException          (INSTANCE_NOT_FOUND, INSTANCE_ALREADY_EXISTS)
-├── UnsupportedFeatureException(UNSUPPORTED_FEATURE)
-└── BridgeException            (INVALID_TOKEN, PROTOCOL_VERSION_MISMATCH, INVALID_MESSAGE,
-                                 UNKNOWN_ACTION, INVALID_PAYLOAD, INTERNAL_ERROR, UNKNOWN)
-```
-
-```java
-client.sendText(chatId, "oi").exceptionally(ex -> {
-    if (ex.getCause() instanceof MessageSendException mse) {
-        log.warn("falha ao enviar para {}: {}", mse.instanceId().orElse("?"), mse.getMessage());
-    }
-    return null;
-});
-```
-
-Erros assíncronos que não são resposta direta de uma chamada (ex.: falha ao processar um evento
-recebido do bridge) chegam pelo `ErrorListener`. Nada é engolido silenciosamente — toda exceção
-carrega mensagem, causa original (quando aplicável) e o máximo de contexto disponível no momento
-da falha.
-
-## Configuração
-
-Todas as opções do `WhatsAppClient.builder()`:
-
-| Método | Obrigatório | Padrão | Descrição |
-|---|---|---|---|
-| `instanceId(String)` | Sim | — | Identificador único da instância nesta JVM |
-| `sessionDirectory(String\|Path)` | Sim | — | Diretório de persistência da sessão (único nesta JVM) |
-| `displayName(String)` | Não | padrão do bridge | Nome exibido em "Aparelhos conectados" |
-| `markOnlineOnConnect(boolean)` | Não | `false` | Marcar como "online" assim que conectar |
-| `minReconnectDelay(Duration)` | Não | 1s | Menor atraso entre tentativas de reconexão |
-| `maxReconnectDelay(Duration)` | Não | 30s | Maior atraso entre tentativas de reconexão |
-| `maxReconnectAttempts(int)` | Não | 10 | Tentativas do backoff exponencial antes de passar ao modo espaçado |
-| `reconnectCooldown(Duration)` | Não | 5min | Intervalo das tentativas depois que o backoff se esgota; `null` = desistir de vez |
-| `pacing(PacingOptions)` | Não | 4–12s, 10/min | Ritmo dos envios — ver [Ritmo e humanização](#ritmo-e-humanização) |
-| `humanization(HumanizationOptions)` | Não | digitando ligado, leitura `MANUAL` | Sinais de presença e azulzinho |
-| `logLevel(String)` | Não | `info` | Nível do log do processo bridge (`trace`…`fatal`) |
-| `nodeVersion(String)` | Não | versão LTS atual pinada pelo SDK | Versão do Node a baixar se necessário |
-| `bridgeHost(String)` | Não | `127.0.0.1` | **Avançado** — veja [Segurança](#segurança) |
-| `bridgePort(int)` | Não | porta efêmera do SO | Fixar uma porta local em vez de uma aleatória |
-
-Variáveis de ambiente/propriedades de sistema reconhecidas pelo SDK:
-
-| Nome | Tipo | Efeito |
-|---|---|---|
-| `ANGATU_WHATSAPP_HOME` | Variável de ambiente | Sobrescreve o diretório de cache (Node baixado, bridge instalado) |
-| `ANGATU_WHATSAPP_NODE_PATH` | Variável de ambiente | Força um executável Node.js específico (erro se inválido) |
-| `angatu.whatsapp.node.path` | Propriedade de sistema (`-D`) | Mesmo efeito que `ANGATU_WHATSAPP_NODE_PATH`, com prioridade maior |
-
-Lidas pelo **processo bridge** (repassadas pelo SDK, ou definidas no ambiente do processo Java):
-
-| Nome | Padrão | Efeito |
-|---|---|---|
-| `ANGATU_BRIDGE_LOG_LEVEL` | `info` | Nível do log do bridge; em `debug` saem também as repetições de ruído de protocolo. Prefira `.logLevel(...)` no builder |
-| `ANGATU_BRIDGE_IDLE_MS` | `120000` | Tempo sem nenhum cliente conectado antes de o bridge se encerrar sozinho. `0` desliga |
-| `ANGATU_BRIDGE_LEITURAS_POR_MIN` | `30` | Teto de consultas ao WhatsApp por minuto. `0` desliga |
-
-Sem essas variáveis, o cache fica em `%LOCALAPPDATA%\angatu-whatsapp-sdk` (Windows),
-`$XDG_CACHE_HOME/angatu-whatsapp-sdk` ou `~/.angatu-whatsapp-sdk` (Linux/macOS).
-
-## Segurança
-
-- O servidor WebSocket do bridge escuta apenas em `127.0.0.1` por padrão — não é acessível pela
-  rede.
-- Cada processo bridge recebe um token aleatório de 32 bytes (`SecureRandom`, base64url) gerado
-  pelo Java e nunca escrito em log; toda requisição/handshake é validada contra esse token.
-- O bridge valida a forma de toda mensagem recebida antes de processá-la; nenhuma mensagem aciona
-  execução arbitrária de comandos do sistema.
-- `bridgeHost(String)` existe para cenários avançados (ex.: bridge rodando em outro container na
-  mesma rede interna) — **não exponha essa porta além de loopback sem entender as implicações**:
-  qualquer processo capaz de alcançar o host/porta e de obter o token poderia enviar comandos
-  como se fosse a aplicação Java legítima.
-- Credenciais do WhatsApp (estado do Baileys) ficam apenas no `sessionDirectory`, em disco local —
-  o SDK nunca as envia a nenhum serviço externo.
-
-## Encerrando o cliente
-
-```java
-client.close(); // ou: try (WhatsAppClient client = ...) { ... }
-```
-
-`close()` é síncrono e idempotente: pede ao bridge para encerrar de forma organizada, espera a
-confirmação, força o encerramento do processo se necessário, e libera o `instanceId`/
-`sessionDirectory` para reuso. **Não há um shutdown hook da JVM registrado automaticamente** — se
-o processo Java for encerrado sem chamar `close()`, o processo bridge pode ficar órfão. Registre
-seu próprio hook, como em todos os exemplos deste projeto:
-
-```java
 Runtime.getRuntime().addShutdownHook(new Thread(client::close));
+client.connect().join();
 ```
 
-## CLI opcional
+- `connect()` termina quando a ponte aceitou a tentativa, **não** quando o WhatsApp autenticou. O
+  progresso real (`QR_PENDING`, `CONNECTED`, `FAILED`...) chega pelo `ConnectionStateListener`.
+- Todo envio devolve `CompletableFuture` e nunca trava quem chamou. O future termina quando a
+  mensagem de fato saiu, depois da sua vez na fila.
+- Os listeners de um cliente rodam em ordem, num virtual thread só dele. Trabalho pesado dentro de
+  um listener atrasa os próximos eventos daquele número: mande para outra thread.
 
-Um executável de linha de comando fino sobre a mesma API pública, útil para parear um número ou
-disparar uma mensagem avulsa sem escrever Java:
+### Parear com código em vez de QR
 
-```bash
-mvn -pl cli -am package
-java -jar cli/target/angatu-whatsapp-cli-1.0.0-SNAPSHOT.jar connect \
-    --instance-id meu-bot --session-dir ./sessions/meu-bot
+```java
+String code = client.requestPairingCode("5562999998888").join();   // ex.: "K7M2Q9XA"
+System.out.println("Digite no celular: " + code.substring(0, 4) + "-" + code.substring(4));
 ```
 
-Comandos disponíveis:
+No celular: WhatsApp > Aparelhos conectados > Conectar um aparelho > Conectar com número de
+telefone. O mesmo código continua válido enquanto o WhatsApp renova a conexão por baixo, que
+acontece a cada dois minutos durante o pareamento.
 
-| Comando | Uso |
+Sem leitura do QR nem do código, a tentativa para depois de 5 ciclos (cerca de 10 minutos) com
+`DisconnectCause.LOGIN_TIMEOUT`; chame `connect()` de novo para recomeçar. Ajuste com
+`maxLoginCycles(n)` no builder.
+
+### Reiniciar sem pedir QR de novo
+
+A sessão fica na pasta `sessionDirectory`. Enquanto ela existir, a aplicação volta conectada
+depois de reiniciar, sem QR. Para saber antes de conectar:
+
+```java
+SessionStatus status = WhatsAppClient.inspectSession(Path.of("/data/whatsapp/atendimento"));
+if (status.canResume()) {
+    // PAIRED: reconecta direto, número em status.phoneNumber()
+}
+```
+
+| Estado | Significa |
 |---|---|
-| `connect` | `--instance-id <id> --session-dir <dir> [--display-name <nome>] [--pairing-phone <numero>]` — conecta, exibe o QR Code (ASCII) ou código de pareamento, e permanece em execução até Ctrl+C |
-| `status` | `--instance-id <id> --session-dir <dir>` — conecta brevemente e imprime o estado atual |
-| `send` | `--instance-id <id> --session-dir <dir> --to <jid> --text <mensagem>` — envia uma mensagem e encerra |
-| `logout` | `--instance-id <id> --session-dir <dir>` — invalida a sessão |
+| `PAIRED` | Credencial completa; reconecta sem QR. |
+| `NOT_PAIRED` | Pasta nova ou sessão encerrada; vai pedir QR ou código. |
+| `PAIRING_INCOMPLETE` | Um pareamento começou e não terminou; a SDK descarta e recomeça o login. |
+| `CORRUPTED` | O `creds.json` está ilegível; se houver backup (`backupAvailable`), ele é restaurado ao conectar. |
 
-Cada comando inicia seu **próprio** processo bridge para o `--session-dir` informado — não execute
-dois comandos simultaneamente contra o mesmo diretório de sessão (disputariam o mesmo estado de
-autenticação em disco). O CLI é um consumidor comum do SDK, como qualquer aplicação Java: não é
-uma dependência do módulo `sdk`, e nunca é necessário para usar a biblioteca.
+A cada conexão aberta a SDK grava um backup da credencial (`creds.backup.json`). Ela só apaga a
+credencial quando o próprio WhatsApp a revoga (aparelho desconectado no celular).
 
-## Exemplos
+## Ritmo humano: a fila
 
-Depois de um `mvn clean install` na raiz (necessário uma vez, para o módulo `sdk` ficar disponível
-no repositório Maven local):
-
-```bash
-# Bot de eco de uma instância só, QR salvo como PNG
-mvn -pl examples/simple-bot exec:java
-
-# Várias instâncias na mesma aplicação (padrão: instance-a, instance-b)
-mvn -pl examples/multi-instance exec:java -Dexec.args="loja-1 loja-2"
+```text
+send*() / markRead() / getContact() ...
+        │
+        ▼
+ ┌──────────────────────────────┐   SQLite (tabela queuedinteractions)
+ │ InteractionQueue por número  │── uma linha por interação pendente
+ └──────────────────────────────┘
+        │  uma de cada vez, ≥ 500 ms entre stanzas
+        ▼
+ visto ─► "digitando..." ─► mensagem ─► intervalo aleatório ─► próxima
 ```
 
-(Sem `-am` aqui: encadear `-am` com um goal avulso como `exec:java`, em vez de uma fase do ciclo
-de vida, faz o Maven tentar rodá-lo em todo o subconjunto do reactor incluído por `-am` — inclusive
-no POM agregador, que não tem esse plugin configurado. Rodar `exec:java` sozinho, contra um único
-módulo, evita o problema.)
+- **Prioridade:** recusa de chamada > visto > presença > mensagens e ações > consultas > keep-alive.
+  Uma ligação é recusada mesmo com uma campanha de mil mensagens na fila.
+- **Limites padrão:** intervalo de 4 a 12 s entre mensagens, no máximo 10 mensagens e 30 consultas
+  por minuto. Uma interação que espera mais de 24 horas expira (`withMaxPendingAge`).
+- **Durável:** se o processo cair, o que estava pendente roda quando o número voltar. O que estava
+  saindo no instante da queda é descartado, porque mensagem duplicada é pior que mensagem perdida.
+- **Controle:** `pendingInteractions()`, `cancelInteraction(id)` e `clearQueue()`.
 
-Para uma referência exaustiva — todo método público, todo listener, todo builder de requisição,
-todo campo de cada modelo de dados, com um exemplo de código para cada um — veja
-[**EXAMPLES.md**](EXAMPLES.md). Esse documento foi escrito para servir tanto como guia para
-desenvolvedores quanto como referência precisa para outras IAs gerarem código correto contra
-esta API.
+```java
+client.setPacing(PacingOptions.defaults()
+        .withGap(Duration.ofSeconds(6), Duration.ofSeconds(20))
+        .withMaxSendsPerMinute(6));
+
+client.setHumanization(HumanizationOptions.defaults()
+        .withTyping(Duration.ofSeconds(2), Duration.ofSeconds(8))   // limites do "digitando..."
+        .withTypingSpeed(35)                                        // ms por caractere
+        .withReadReceipts(ReadReceiptMode.ON_REPLY)                 // visto ao responder
+        .withAlwaysOnline(true));                                   // online o tempo todo
+```
+
+| Recurso | Como |
+|---|---|
+| "Digitando..." com tempo configurável | automático em todo envio; `SendTextRequest.of(to, texto).withTyping(Duration.ofSeconds(5))` fixa o tempo de uma mensagem; `sendTyping(chat, duração)` mostra sem enviar nada |
+| Visto azul | `ReadReceiptMode.ON_REPLY` (padrão: marca ao responder), `AUTO` (marca sozinho após 1–4 s), `MANUAL` (`markRead(message)`, `markChatRead(chat)`) ou `OFF`. Marcar uma conversa cobre todas as mensagens não lidas dela num único recibo, como o celular faz |
+| Online permanente | `withAlwaysOnline(true)` (padrão). A SDK reafirma a presença a cada 4–6 minutos. Com `false`, a conta fica offline 30 s depois do último envio |
+| Recusar chamadas | `.calls(CallOptions.rejectAll().withReply("Não atendemos ligações, mande uma mensagem!"))`. A recusa sai depois de 2 a 5 s, como quem olha o celular antes |
+
+> [!NOTE]
+> Enquanto a conta está online no WhatsApp Web, o celular do dono deixa de receber notificação
+> das conversas. É o comportamento do próprio WhatsApp.
+
+## Botões e enquetes
+
+```java
+client.sendButtons(SendButtonsRequest.of(chat, "Confirma o horário de amanhã, 15h?",
+                Button.of("sim", "Confirmo"),
+                Button.of("nao", "Preciso remarcar"))
+        .withFooter("Clínica Exemplo"));
+
+client.addButtonListener(click -> {
+    // click.buttonId() = "sim" ou "nao"; click.chatId(); click.reply() é a mensagem da resposta
+});
+```
+
+- `ButtonStyle.NATIVE` (padrão): botões interativos, até 3. A resposta chega com o id do botão.
+- `ButtonStyle.TEXT`: menu numerado, até 10 opções, que qualquer versão do WhatsApp mostra. A
+  SDK guarda o menu e reconhece a resposta pelo número ("2", "2.", "2)") ou pelo texto da opção,
+  sem diferenciar maiúsculas e acentos. Use quando o aparelho do destinatário não exibir botões.
+- Botão interativo é recurso de conta comercial: numa conta pessoal ele chama mais atenção que um
+  menu em texto.
+
+```java
+client.sendPoll(chat, "Melhor dia para a entrega?", List.of("Segunda", "Quarta", "Sexta"), 1);
+client.addPollVoteListener(vote -> System.out.println(vote.voterId() + " votou " + vote.selectedOptions()));
+```
+
+## Referência rápida
+
+| Área | Métodos |
+|---|---|
+| Conexão | `connect`, `requestPairingCode`, `disconnect`, `logout`, `close`, `getConnectionState`, `isConnected`, `sessionStatus`, `inspectSession`, `getQrCode`, `getQrCodePng`, `getQrCodeText`, `bridgeStats` |
+| Mensagens | `sendText`, `sendImage`, `sendVideo`, `sendAudio`, `sendDocument`, `sendSticker`, `sendLocation`, `sendContact`, `sendButtons`, `sendPoll`, `forwardMessage`, `sendReaction`, `removeReaction`, `editMessage`, `deleteMessage`, `starMessage`, `downloadMedia` |
+| Presença e visto | `sendTyping`, `sendPresence`, `setOnline`, `subscribePresence`, `markRead`, `markChatRead`, `rejectCall` |
+| Contatos | `checkNumber`, `checkNumbers`, `contactExists`, `getContact`, `getProfilePicture`, `getContactStatus`, `getBusinessProfile`, `blockContact`, `unblockContact`, `getBlocklist` |
+| Conta | `getMe`, `updateProfileName`, `updateProfileStatus`, `updateProfilePicture`, `removeProfilePicture`, `getPrivacySettings`, `updatePrivacy` |
+| Conversas | `muteChat`, `unmuteChat`, `pinChat`, `archiveChat`, `markChatUnread`, `setDisappearingMessages` |
+| Grupos | `groupExists`, `getGroupMetadata`, `listGroups`, `createGroup`, `updateGroupParticipants`, `updateGroupSubject`, `updateGroupDescription`, `updateGroupPicture`, `setGroupAnnounceOnly`, `setGroupLocked`, `leaveGroup`, `getGroupInviteCode`, `revokeGroupInviteCode`, `getGroupInviteInfo`, `joinGroup` |
+| Eventos | `addMessageListener`, `addMessageUpdatedListener`, `addMessageDeletedListener`, `addReactionListener`, `addConnectionStateListener`, `addQrCodeListener`, `addGroupUpdateListener`, `addPresenceListener`, `addCallListener`, `addButtonListener`, `addPollVoteListener`, `addErrorListener` |
+| Fila | `pendingInteractions`, `cancelInteraction`, `clearQueue`, `setPacing`, `setHumanization`, `setCallOptions` |
+
+Exemplo de cada método em [EXAMPLES.md](EXAMPLES.md).
+
+> [!IMPORTANT]
+> Leitura em volume é o que mais derruba número: uma tela que buscava a foto de 200 contatos ao
+> abrir disparou 600 consultas em rajada e a conta foi suspensa. Prefira `checkNumber` (1 consulta,
+> com cache de 24 h) e `getProfilePicture` (1 consulta) a `getContact` (3 consultas), e guarde
+> localmente o que já buscou.
+
+## Em produção
+
+| O quê | Por quê |
+|---|---|
+| `sessionDirectory` num volume persistente (ex.: `/data/whatsapp/<id>`) | Sem isso, todo deploy pede QR de novo. Uma pasta por número, nunca compartilhada, nunca em NFS/SMB. A pasta é credencial: fora do git e da imagem. |
+| `ANGATU_DB_PATH=/data/database.db` | Onde fica a fila (o mesmo banco da AngatuLibraries, se a aplicação já usa). |
+| `ANGATU_WHATSAPP_HOME=/data/angatu-whatsapp` ou Node instalado na imagem | Senão o Node é baixado de novo a cada deploy. |
+| `ANGATU_WHATSAPP_NODE_PATH` | Força um Node específico. |
+| Chamar `close()` ao encerrar | Avisa a ponte para fechar o socket do WhatsApp com educação. Se o processo morrer sem isso, a ponte se encerra sozinha após 2 minutos sem cliente, e a próxima execução encerra a que tiver sobrado. |
+
+Configurações da ponte, valem para a JVM inteira (o primeiro cliente decide):
+
+```java
+WhatsAppClient.builder()
+        .bridge(options -> options.withMaxHeapMb(384).withLogLevel("warn"))
+```
+
+## Memória e estabilidade
+
+- Um processo Node para todos os números. Cada número a mais custa um socket e uma fila, não
+  outro runtime.
+- O Node sobe com `--optimize-for-size`, geração jovem pequena e teto de heap (512 MB, ajustável):
+  se algo fugir do controle, a ponte reinicia limpa em vez de estourar a memória do contêiner.
+- Mensagens recebidas ficam guardadas sem miniatura (300 por 30 minutos), só para citar e baixar
+  mídia; as enviadas ficam em disco, para atender pedido de reenvio.
+- Erros soltos dentro do Baileys não derrubam mais a ponte inteira.
+- `client.bridgeStats()` devolve RSS, heap e o tamanho de cada cache, para acompanhar ao longo dos
+  dias.
+
+## Arquitetura
+
+```text
+ Aplicação Java ──► WhatsAppClient (um por número) ──► InteractionQueue (SQLite, virtual thread)
+                          │                                    │
+                          └──────── BridgeHost (um por JVM) ◄──┘
+                                         │ WebSocket local + token
+                                         ▼
+                              Processo Node.js (ponte)
+                              Baileys 7 ── um socket por número ──► WhatsApp
+```
+
+A ponte só escuta em `127.0.0.1`, exige um token aleatório gerado a cada início e não recebe
+nada de fora da máquina.
+
+## Limitações
+
+- Não há sincronização de histórico, por escolha: só o que chega depois do início do cliente.
+- Citar, encaminhar e baixar mídia funciona para mensagens recebidas nos últimos 30 minutos (ou
+  enviadas nas últimas 12 horas).
+- Editar e apagar para todos só dentro da janela que o WhatsApp permite (cerca de 15 minutos).
+- Botões interativos dependem de o WhatsApp do destinatário exibi-los; o estilo `TEXT` sempre
+  funciona.
+
+## Migração da 1.x
+
+- Java 25, e Jackson e SLF4J saíram: dados chegam em records tipados (`MessageUpdate`,
+  `PresenceUpdate`, `GroupUpdate`, `Account`...) em vez de `JsonNode`.
+- Requests viraram records: `SendImageRequest.of(to, Path.of("foto.jpg")).withCaption("...")`.
+- Reações, edição e remoção recebem um `MessageRef` (`MessageRef.of(message)`).
+- `PacingOptions` e `HumanizationOptions` mudaram de forma (veja acima); o visto padrão agora é
+  `ON_REPLY` e a conta fica online por padrão.
+- `downloadMedia` grava num `Path` e devolve `MediaFile`, em vez de bytes na memória.
+- `displayName` virou `deviceName`; sem ele, o aparelho aparece como "Chrome (Windows)".
 
 ## Desenvolvimento
 
 ```bash
-git clone https://github.com/LuanVictorGit/AngatuWhatsappSDK.git
-cd angatu-whatsapp
-
-# Build completo (compila o bridge via npm install && npm run build, depois o Java)
-mvn clean install
+mvn install                                  # compila a ponte (precisa de npm) e roda os testes
+mvn install -Dskip.bridge.build              # usa a ponte já empacotada no repositório
+java -jar cli/target/angatu-whatsapp-cli-2.0.0-SNAPSHOT.jar status --session-dir ./sessoes/teste
 ```
 
-Requer Node.js/npm no ambiente de build (não no runtime dos consumidores — veja
-[Requisitos](#requisitos)). Para iterar só no bridge:
-
-```bash
-cd bridge
-npm install
-npm run typecheck   # tsc --noEmit
-npm run dev          # roda direto do TypeScript via tsx, sem empacotar
-npm run build         # gera dist/bridge.mjs (o que o build Maven também faz)
-```
-
-> Depois de qualquer mudança manual no bridge (fora do `mvn clean install` completo), rode
-> `npm run build` **e então** `mvn -pl sdk compile -Dskip.bridge.build=true` — o segundo passo
-> copia o `bridge.mjs` recém-gerado para `sdk/target/classes/bridge/`, que é de onde o SDK
-> realmente o lê em tempo de execução/teste. `npm run build` sozinho não atualiza essa cópia.
-
-`-Dskip.bridge.build=true` pula os profiles `build-bridge-windows`/`build-bridge-unix` (que rodam
-`npm install`/`npm run build`) e reaproveita o que já está em `sdk/src/main/resources/bridge/` —
-útil para iterar rápido no código Java sem esperar o build do bridge a cada vez.
-
-## Como testar
-
-```bash
-mvn test                       # todos os módulos
-mvn -pl sdk test                # só o sdk
-mvn -pl cli test                # só o cli
-```
-
-O módulo `sdk` cobre, sem depender de uma conta real de WhatsApp:
-
-- `ProtocolCodecTest` — round-trip de codificação/decodificação de cada tipo de mensagem do
-  protocolo, e rejeição de entrada malformada.
-- `BridgeExceptionTranslatorTest` — todo `BridgeErrorCode` mapeado para o tipo de exceção correto.
-- `NodeVersionTest` — parsing de versão do Node (`node --version`, texto de banner, entradas
-  inválidas).
-- `InstanceRegistryTest` — detecção de conflito de `instanceId`/`sessionDirectory`.
-- `MessageTest` / `ContactTest` / `GroupTest` — mapeamento de JSON do bridge para os modelos
-  públicos, incluindo os nomes de campo nativos do Baileys que `Group` deliberadamente preserva
-  (`desc`, `creation`).
-- `BridgeConnectionTest` — handshake, heartbeat, timeout, requisição/resposta, eventos e queda de
-  conexão, contra um **mock do bridge** (`MockBridgeServer`, WebSocket RFC 6455 implementado à mão
-  sobre socket bloqueante — veja [Decisões de arquitetura](#decisões-de-arquitetura) para o porquê
-  de não usar a própria classe de servidor da biblioteca WebSocket aqui).
-- `WhatsAppClientLifecycleTest` — ciclo de vida de recursos: que `connect()` reaproveita o processo
-  e o WebSocket que já existirem (o ciclo `disconnect()` → `connect()` **não** sobe um segundo
-  processo Node), que uma orquestração de conexão já em andamento recusa chamadas concorrentes em
-  vez de criar um processo por chamada, que o conjunto de presenças assinadas tem teto, e que uma
-  construção recusada por `InstanceRegistry` não deixa a thread da fila de envio órfã.
-
-O módulo `cli` cobre o parser de argumentos e o renderizador de QR Code em ASCII (incluindo, depois
-de um bug real encontrado durante o desenvolvimento, que a saída é estritamente ASCII — veja a
-seção de decisões de arquitetura sobre `stdout.encoding` no Windows).
-
-Testes de integração real Java↔Bridge↔WhatsApp (com um número de telefone de verdade) não fazem
-parte da suíte automatizada — foram verificados manualmente durante o desenvolvimento deste
-projeto (conexão, QR Code, autenticação, troca de mensagens, causas de desconexão) e podem ser
-repetidos a qualquer momento com o CLI (`connect`) ou os exemplos.
-
-### Verificação manual de vazamento de recursos
-
-Duas coisas dependem de um processo bridge de verdade e por isso ficam fora da suíte — subir Node a
-cada execução deixaria os testes lentos e dependentes do ambiente. Valem uma passada manual sempre
-que a orquestração de conexão de `WhatsAppClient` for mexida:
-
-```bash
-# 1. Rajada de connect() concorrente logo após construir o cliente:
-#    só UM processo node pode subir.
-ps aux | grep -c '[b]ridge.mjs'
-
-# 2. Crash do bridge e recuperação, algumas vezes seguidas: o número de
-#    threads da JVM não pode crescer a cada ciclo (é o shutdown hook do
-#    processo antigo que vazava aqui).
-kill -9 <pid-do-node>
-jcmd <pid-java> Thread.print | grep -c '^"'
-
-# 3. Com autoSubscribePresence ligado, trocando de conversa por 30+ minutos:
-#    o heap tem de estabilizar, não crescer linearmente.
-jcmd <pid-java> GC.heap_info
-```
-
-O lado Node tem a verificação equivalente para `BaileysAdapter.destroy()` (o temporizador de
-manutenção do cache de mensagens e os contadores de ruído de protocolo): criar uma instância,
-chamar `destroy()` e confirmar que nenhum handle `Timeout` sobrou em
-`process._getActiveHandles()`.
-
-## Como publicar
-
-### Maven Central
-
-1. Conta no [Central Portal](https://central.sonatype.com/) com o `groupId` `com.angatusistemas`
-   verificado, e uma chave GPG para assinar os artefatos.
-2. Configure `~/.m2/settings.xml` com um `<server>` de id `central` contendo o token do Central
-   Portal, e sua chave GPG disponível para o `maven-gpg-plugin`.
-3. Atualize `<version>` no `pom.xml` raiz (e nos módulos) removendo o sufixo `-SNAPSHOT`.
-4. Rode:
-
-   ```bash
-   mvn clean deploy -Prelease
-   ```
-
-   O profile `release` (inerte em builds normais) anexa sources e javadoc, assina tudo com GPG e
-   publica via `central-publishing-maven-plugin`.
-
-### JitPack (alternativa sem conta no Central)
-
-Nenhum passo de publicação necessário além de dar push de uma tag no GitHub:
-
-```bash
-git tag v1.0.0
-git push origin v1.0.0
-```
-
-O JitPack builda sob demanda na primeira vez que alguém declara a dependência (veja
-[Instalação](#instalação)).
-
-## Decisões de arquitetura
-
-Registradas aqui porque cada uma foi uma mudança deliberada em relação ao plano inicial mais
-óbvio, descoberta durante o desenvolvimento real deste projeto — não escolhas arbitrárias.
-
-**`HttpURLConnection` em vez de `java.net.http.HttpClient` para baixar o Node.js.**
-`NodeRuntimeDownloader` usa a API HTTP clássica, não a `HttpClient` moderna do JDK. Motivo:
-construir um `HttpClient`/`WebSocket` builtin abre um `java.nio.channels.Selector` internamente, e
-em determinados ambientes Windows restritos/sandboxed isso falha com
-`IOException: Unable to establish loopback connection` (mecanismo interno de wakeup do
-`Selector` tentando abrir um socket de domínio Unix local, que o ambiente rejeita) — reproduzido e
-confirmado durante o desenvolvimento, inclusive forçando explicitamente o
-`WindowsSelectorProvider` legado. `HttpURLConnection` usa I/O bloqueante clássico e não tem essa
-dependência.
-
-**`Java-WebSocket` (`org.java-websocket`) em vez do `java.net.http.WebSocket` builtin para o
-cliente real Java↔Bridge.** Mesma causa raiz do item anterior — o cliente WebSocket builtin do JDK
-também depende de `Selector.open()`. Como esse cliente carrega todo o tráfego Java↔Bridge, esse
-risco não valia a pena para um ambiente que pode ser tão restrito quanto o observado durante o
-desenvolvimento. `Java-WebSocket` usa sockets bloqueantes clássicos e funciona nesses ambientes.
-
-**Mock do bridge em testes implementado à mão sobre `ServerSocket`, não sobre
-`org.java_websocket.server.WebSocketServer`.** A mesma limitação de `Selector` também afeta a
-classe de *servidor* do Java-WebSocket (ela também chama `Selector.open()` internamente). Como o
-bridge real sempre atua como servidor nessa conexão, `MockBridgeServer` implementa o suficiente do
-RFC 6455 (handshake HTTP Upgrade, frames de texto/close/ping-pong, mascaramento) manualmente sobre
-`java.net.ServerSocket` bloqueante para os testes de `BridgeConnectionTest` rodarem de forma
-determinística nesses mesmos ambientes.
-
-**Um processo bridge por `WhatsAppClient`, não um processo compartilhado por JVM.** Veja
-[Arquitetura](#arquitetura) — troca deliberada de mais processos Node por isolamento de falhas
-entre instâncias.
-
-**CLI renderiza o QR Code em blocos ASCII (`#`/espaço), não em caracteres Unicode de bloco
-(`█`).** Descoberto durante a verificação manual do comando `connect`: no Windows, a propriedade
-`stdout.encoding` da JVM segue o *codepage* nativo do console (tipicamente `Cp1252`) mesmo quando
-a saída está redirecionada (não é um console interativo de verdade) — e `Cp1252` não representa
-`U+2588`, então cada módulo do QR virava um `?` literal. ASCII puro tem representação idêntica e
-sem ambiguidade em qualquer codepage/terminal, então a saída do QR não depende de nenhuma
-configuração de codificação da máquina do usuário.
-
-## Ritmo e humanização
-
-Quem conecta um número por Baileys assume o risco de banimento. Boa parte desse risco não vem do
-volume em si, mas do **padrão**: mensagens saindo em paralelo, no mesmo milissegundo, sem nenhum
-sinal de presença, de um número que fica online 24 horas por dia. Esse conjunto é indistinguível de
-robô, e o SDK já sai configurado para não produzi-lo.
-
-### O que acontece em todo envio, por padrão
-
-1. o envio entra numa **fila com uma thread por instância** — nada sai em paralelo, venha de onde
-   vier na aplicação;
-2. espera-se um intervalo **aleatório de 4 a 12 segundos** desde o último envio que deu certo;
-3. confere-se o **teto de 10 por minuto**, em janela deslizante;
-4. publica-se `composing` ("digitando...") por um tempo proporcional ao texto — 25 ms por caractere,
-   entre 3 e 9 segundos, com jitter — renovado a cada 8 s, porque o WhatsApp apaga o indicador
-   sozinho em ~10 s;
-5. a mensagem sai;
-6. publica-se `paused` e depois `unavailable`, devolvendo o número ao estado offline.
-
-O passo 6 não é detalhe. Para publicar "digitando..." o cliente precisa se declarar disponível, e um
-número que fica **online o tempo todo** é justamente um dos padrões que identificam automação. Ele só
-aparece online nos segundos do envio.
-
-Dois detalhes que valem a pena conhecer, porque falham em silêncio:
-
-- **a espera não depende da presença.** Se a publicação falhar, a pausa acontece do mesmo jeito.
-  Voltar na hora seria o pior dos dois mundos: sem o indicador *e* sem a pausa;
-- **a conta precisa ter nome de perfil.** O Baileys recusa `available`/`unavailable` quando
-  `creds.me.name` está vazio, e o "digitando..." simplesmente não aparece. O bridge avisa no log.
-
-### Configurando
-
-```java
-WhatsAppClient client = WhatsAppClient.builder()
-        .instanceId("vendas")
-        .sessionDirectory(Path.of("wa-sessions/vendas"))
-        .pacing(PacingOptions.builder()
-                .minDelay(Duration.ofSeconds(6))
-                .maxDelay(Duration.ofSeconds(20))
-                .maxPerMinute(6)
-                .build())
-        .humanization(HumanizationOptions.builder()
-                .readReceipts(ReadReceiptMode.ON_REPLY)
-                .build())
-        .build();
-```
-
-| Opção de `HumanizationOptions` | Padrão | O que faz |
-|---|---|---|
-| `typing` | ligado | "digitando..." proporcional ao texto |
-| `typingMsPerChar` / `typingMin` / `typingMax` | 25 ms / 3 s / 9 s | duração do indicador |
-| `recording` | ligado | "gravando áudio..." em envio de áudio/PTT |
-| `presenceAroundSend` | ligado | `available` antes, `unavailable` depois |
-| `onlineHoldAfterSend` | 0 s | quanto tempo segue online após enviar |
-| `readReceipts` | `MANUAL` | o "azulzinho" — ver abaixo |
-| `readDelay` | 1–4 s | atraso antes de marcar como lida |
-| `autoSubscribePresence` | desligado | receber o "digitando..." **do contato** |
-
-### O "azulzinho" (`ReadReceiptMode`)
-
-| Modo | Comportamento |
-|---|---|
-| `OFF` | nunca marca nada como lido |
-| `MANUAL` (padrão) | só quando a aplicação chama `markRead`/`markChatRead` |
-| `ON_REPLY` | marca a conversa como lida logo **antes** de responder — leu, digitou, respondeu |
-| `AUTO` | marca toda mensagem recebida, após `readDelay` |
-
-`MANUAL` é o padrão apenas porque não muda o comportamento de quem já usava o SDK. Para um bot que
-de fato responde, **`ON_REPLY` é o modo recomendado**.
-
-> Se a conta estiver com "confirmações de leitura" desligada na privacidade do celular, a marcação é
-> aceita mas o remetente não vê o azul. Isso não depende do SDK.
-
-### Acompanhando a fila
-
-```java
-client.pendingSends();        // o que ainda não saiu
-client.cancelSend(id);        // cancela um item — inclusive o que só espera o intervalo
-client.clearQueue();          // esvazia a fila
-client.setPacing(outro);      // troca o ritmo em tempo de execução
-```
-
-`cancelSend` alcança também o envio que a fila já pegou mas que ainda está esperando: com até 12
-segundos de intervalo, um "parar" que só mexesse na fila deixaria a próxima mensagem sair mesmo
-assim — justamente o que o operador acabou de pedir para não acontecer.
-
-### Se a sua aplicação já controla o ritmo
-
-Duas camadas se somam. Para desligar a daqui:
-
-```java
-.pacing(PacingOptions.desligado())
-.humanization(HumanizationOptions.desligado())
-```
-
-`PacingOptions.desligado()` tira a **espera**, nunca a serialização: mesmo assim os envios de uma
-instância continuam saindo um de cada vez.
-
-### Leitura: o que de fato derruba uma conta
-
-Vale dizer com todas as letras, porque é contraintuitivo: **a suspensão que motivou boa parte deste
-desenho não veio de envio, veio de leitura.** Uma tela que pedia a foto de perfil de 200 conversas ao
-abrir disparava, via `getContact`, até 600 consultas em rajada logo após conectar — sondando
-existência de número e lendo o recado pessoal de gente com quem ninguém estava conversando. Do ponto
-de vista do servidor, isso é indistinguível de raspagem de agenda.
-
-- use **`checkNumber(numero)`** (uma consulta, com cache de 24 h/6 h) para saber se um número existe;
-- use **`getProfilePicture(jid)`** (uma consulta) quando quiser só o avatar;
-- **`getContact(jid)` custa três consultas** (existência + foto + recado pessoal) e pesa três no
-  orçamento. Use só quando precisar mesmo das três;
-- há um **teto de 30 consultas por minuto** no bridge (`ANGATU_BRIDGE_LEITURAS_POR_MIN`); estourado,
-  a consulta é recusada com erro tipado em vez de virar mais uma requisição ao WhatsApp;
-- a regra geral que vale a pena adotar: **a tela lê do seu banco, o WhatsApp é consultado quando
-  chega uma mensagem ou quando o usuário pede explicitamente.**
-
-## Limitações conhecidas
-
-- **Baileys não é oficial** (veja o aviso no topo deste README) — risco de banimento em uso
-  automatizado é inerente à abordagem, não a este SDK especificamente.
-- **Um processo Node.js por instância conectada** — custo de recursos que cresce linearmente com
-  o número de contas de WhatsApp simultâneas na mesma aplicação. Não recomendado, no desenho
-  atual, para centenas/milhares de instâncias na mesma JVM.
-- **A trava de sessão é um arquivo no sistema de arquivos local.** Ela impede dois processos na
-  mesma máquina, mas não cobre duas máquinas apontando para o mesmo diretório por rede (NFS/SMB),
-  onde a exclusão do `O_EXCL` não é confiável. Não compartilhe um diretório de sessão por rede.
-- **Download do Node.js verificado apenas por SHA-256** obtido do próprio `nodejs.org` no momento
-  do download (mesmo modelo de confiança de ferramentas como nvm/volta/fnm) — não há verificação
-  de assinatura GPG independente.
-- **Extração do tarball do Node em Linux/macOS depende do binário `tar` do sistema** estar no
-  `PATH` (Windows usa o executável standalone `node.exe`, sem extração).
-- **Sem sincronização de histórico de conversas** — o SDK expõe eventos em tempo real e consultas
-  pontuais (contato, grupo, mídia de uma mensagem específica), não uma sincronização completa do
-  histórico de chats como um cliente WhatsApp Web faz ao conectar.
-- **O ritmo embutido protege o padrão de envio, não o conteúdo.** A fila garante que nada sai em
-  paralelo e que há intervalo entre mensagens, mas o SDK não tem como saber se o texto é bem-vindo:
-  mandar a mesma mensagem não solicitada para milhares de desconhecidos derruba a conta em qualquer
-  cadência. Ver [Ritmo e humanização](#ritmo-e-humanização).
-- **`close()` gracioso depende do WebSocket ainda estar alcançável.** No Windows,
-  `Process.destroy()` não aciona um handler de sinal no processo filho (ao contrário de Unix) —
-  por isso o encerramento organizado é feito pedindo `shutdown` pelo próprio WebSocket antes de
-  qualquer tentativa de matar o processo; se a conexão já estiver morta, o encerramento cai direto
-  para o término forçado do processo.
-- **Fluxo de código de pareamento menos testado que o de QR Code** em verificação manual real
-  (veja [Conectando e QR Code](#conectando-e-qr-code)).
-
-## Próximas melhorias recomendadas
-
-- Modo opcional de processo bridge compartilhado entre várias instâncias na mesma JVM, para casos
-  de uso com um número grande de contas simultâneas (o bridge já suporta múltiplas instâncias por
-  processo — falta expor essa opção no lado Java).
-- Sincronização/consulta de histórico de conversas.
-- Verificação de assinatura GPG (além do SHA-256 atual) para os binários do Node.js baixados.
-- Imagem Docker de referência com Node.js pré-instalado, para ambientes que preferem não usar o
-  download automático.
-- Starter para Spring Boot (auto-configuração de `WhatsAppClient` a partir de `application.yml`).
-- Ampliar a verificação manual do fluxo de código de pareamento com mais números/operadoras reais.
+Os testes nunca conectam um número. O `BridgeHostTest` sobe a ponte real (quando há Node na
+máquina) e conversa com ela sem tocar no WhatsApp.
 
 ## Licença
 
-[Apache License 2.0](LICENSE).
+Apache 2.0 — veja [LICENSE](LICENSE). Feito por [Angatu Sistemas](https://angatusistemas.com.br).
